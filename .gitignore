@@ -1,0 +1,88 @@
+# ============================================
+# 桌宠1.0 - Git Ignore
+# ============================================
+
+# --- Python cache ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Python bundled runtime (huge, not source code) ---
+vits-simple-api-windows-cpu-v0.6.16/py310/
+vits-simple-api-windows-cpu-v0.6.16/py*/
+py*/
+python*/
+
+# --- PyTorch model weights (too large for GitHub, 100MB+ each) ---
+*.pth
+*.pt
+*.pkl
+*.pickle
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+
+# --- Archive files (binary/large) ---
+*.zip
+*.7z
+*.rar
+*.tar.gz
+*.tar
+
+# --- Pre-trained BERT/emotional/hubert models ---
+**/data/bert/*/
+**/data/emotional/*/
+**/data/hubert/*/
+
+# --- Compiled binaries ---
+*.dll
+*.so
+*.dylib
+*.lib
+*.a
+*.exe
+*.o
+*.obj
+
+# --- C++ build artifacts ---
+build/
+cmake-build-*/
+out/
+moc_*.cpp
+ui_*.h
+qrc_*.cpp
+Makefile
+CMakeFiles/
+CMakeCache.txt
+
+# --- IDE / editors ---
+.vs/
+.idea/
+*.user
+*.pro.user*
+*.suo
+*.sln
+*.vcxproj
+*.vcxproj.filters
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*~
+
+# --- Logs & temp ---
+*.log
+tmp/
+temp/
+*.tmp
+*.swp
+*.swo
+
+# --- Claude /AI config ---
+.claude/
+
+# --- Generated docs ---
+*.docx
