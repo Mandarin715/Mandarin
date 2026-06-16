@@ -1,0 +1,41 @@
+# Large binary files
+*.zip
+*.exe
+*.lnk
+*.pth
+*.dll
+*.lib
+*.a
+*.dylib
+*.ttf
+*.png
+*.jpg
+*.jpeg
+
+# Python runtime (huge)
+vits-simple-api-windows-cpu-v0.6.16/
+
+# Build artifacts
+build/
+dist/
+__pycache__/
+*.pyc
+*.obj
+*.o
+*.moc
+*.ui_qmake
+Makefile
+*.pro.user
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Qt specific
+moc_*.cpp
+ui_*.h
+qrc_*.cpp
