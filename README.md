@@ -69,7 +69,7 @@
 
 ### Step 1：安装
 
-1. 在 [Release](https://github.com/Mandarin715/ZcChat2/releases) 下载最新版本
+1. 在 [Release](https://github.com/Mandarin715/ZcChat2/releases) 中的安装程序标签里下载最新版本
 2. 运行 ZcChat2
 
 ### Step 2：导入角色
