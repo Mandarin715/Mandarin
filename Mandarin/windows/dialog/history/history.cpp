@@ -60,6 +60,26 @@ void history::addChildWindow(int historyIndex, const QString &name, const QStrin
     layout->addWidget(newChild);
 }
 
+/*滚动历史记录*/
+void history::scrollHistory(int delta)
+{
+    QScrollBar *bar = ui->scrollArea->verticalScrollBar();
+    if (bar)
+        bar->setValue(bar->value() - delta);
+}
+
+bool history::isHistoryAtTop() const
+{
+    QScrollBar *bar = ui->scrollArea->verticalScrollBar();
+    return bar && bar->value() <= bar->minimum();
+}
+
+bool history::isHistoryAtBottom() const
+{
+    QScrollBar *bar = ui->scrollArea->verticalScrollBar();
+    return bar && bar->value() >= bar->maximum();
+}
+
 /*圆角边框*/
 void history::paintEvent(QPaintEvent *event)
 {

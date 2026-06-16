@@ -3,86 +3,126 @@
  <class>SettingChild_ScreenCapture</class>
  <widget class="QWidget" name="SettingChild_ScreenCapture">
   <property name="geometry">
-   <rect>
-    <x>0</x>
-    <y>0</y>
-    <width>889</width>
-    <height>645</height>
-   </rect>
+   <rect><x>0</x><y>0</y><width>889</width><height>645</height></rect>
   </property>
-  <property name="windowTitle">
-   <string>Form</string>
-  </property>
+  <property name="windowTitle"><string>Form</string></property>
   <layout class="QVBoxLayout" name="verticalLayout">
-   <property name="leftMargin">
-    <number>12</number>
-   </property>
-   <property name="rightMargin">
-    <number>12</number>
-   </property>
+   <property name="leftMargin"><number>12</number></property>
+   <property name="rightMargin"><number>12</number></property>
    <item>
     <widget class="ElaBreadcrumbBar" name="BreadcrumbBar" native="true"/>
    </item>
    <item>
     <widget class="ZcStackedWidget" name="stackedWidget">
-     <property name="currentIndex">
-      <number>0</number>
-     </property>
+     <property name="currentIndex"><number>0</number></property>
      <widget class="QWidget" name="page_Main">
       <layout class="QVBoxLayout" name="verticalLayout_2">
-       <property name="leftMargin">
-        <number>0</number>
-       </property>
-       <property name="topMargin">
-        <number>0</number>
-       </property>
-       <property name="rightMargin">
-        <number>0</number>
-       </property>
-       <property name="bottomMargin">
-        <number>0</number>
-       </property>
+       <property name="leftMargin"><number>0</number></property>
+       <property name="topMargin"><number>0</number></property>
+       <property name="rightMargin"><number>0</number></property>
+       <property name="bottomMargin"><number>0</number></property>
        <item>
         <widget class="ElaText" name="label_Setting">
-         <property name="font">
-          <font>
-           <pointsize>10</pointsize>
-          </font>
-         </property>
-         <property name="text">
-          <string>设置</string>
-         </property>
+         <property name="font"><font><pointsize>10</pointsize></font></property>
+         <property name="text"><string>功能开关</string></property>
         </widget>
        </item>
        <item>
-       <widget class="ElaScrollPageArea" name="widget_ScreenCaptureEnable" native="true">
-         <property name="toolTip">
-          <string>开启后可通过按钮或关键词触发屏幕截图分析</string>
-         </property>
-         <layout class="QHBoxLayout" name="horizontalLayout" stretch="1,1">
-          <property name="leftMargin">
-           <number>15</number>
-          </property>
-          <property name="rightMargin">
-           <number>15</number>
-          </property>
+        <widget class="ElaScrollPageArea" name="widget_ScreenCaptureEnable" native="true">
+         <property name="toolTip"><string>开启后可通过按钮或关键词触发屏幕截图分析</string></property>
+         <layout class="QHBoxLayout" name="horizontalLayout_Enable" stretch="1,1">
+          <property name="leftMargin"><number>15</number></property>
+          <property name="rightMargin"><number>15</number></property>
           <item>
            <widget class="ElaText" name="label_Enable">
-            <property name="font">
-             <font>
-              <pointsize>12</pointsize>
-             </font>
-            </property>
-            <property name="text">
-             <string>启用屏幕捕获分析</string>
-            </property>
+            <property name="font"><font><pointsize>12</pointsize></font></property>
+            <property name="text"><string>启用屏幕捕获分析</string></property>
            </widget>
           </item>
           <item>
-           <widget class="ElaToggleSwitch" name="ToggleSwitch_ScreenCaptureEnable" native="true">
-            <property name="toolTip">
-             <string>启用后，桌宠可以通过截图看到你的屏幕内容</string>
-            </property>
+           <widget class="ElaToggleSwitch" name="ToggleSwitch_ScreenCaptureEnable" native="true"/>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="ElaText" name="label_ApiTitle">
+         <property name="font"><font><pointsize>10</pointsize></font></property>
+         <property name="text"><string>API 配置（独立于对话模型）</string></property>
+        </widget>
+       </item>
+       <item>
+        <widget class="ElaScrollPageArea" name="widget_Server" native="true">
+         <layout class="QHBoxLayout" name="horizontalLayout_Server" stretch="1,2">
+          <property name="leftMargin"><number>15</number></property>
+          <property name="rightMargin"><number>15</number></property>
+          <item>
+           <widget class="ElaText" name="label_Server">
+            <property name="font"><font><pointsize>12</pointsize></font></property>
+            <property name="text"><string>服务商</string></property>
+           </widget>
+          </item>
+          <item>
+           <widget class="ElaComboBox" name="comboBox_ServerSelect"/>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="ElaScrollPageArea" name="widget_ApiKey" native="true">
+         <layout class="QHBoxLayout" name="horizontalLayout_ApiKey" stretch="1,2">
+          <property name="leftMargin"><number>15</number></property>
+          <property name="rightMargin"><number>15</number></property>
+          <item>
+           <widget class="ElaText" name="label_ApiKey">
+            <property name="font"><font><pointsize>12</pointsize></font></property>
+            <property name="text"><string>API Key</string></property>
+           </widget>
+          </item>
+          <item>
+           <widget class="ElaLineEdit" name="lineEdit_ApiKey">
+            <property name="toolTip"><string>用于屏幕识别的 API Key（与对话模型分开）</string></property>
+            <property name="echoMode"><enum>QLineEdit::PasswordEchoOnEdit</enum></property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="ElaScrollPageArea" name="widget_Model" native="true">
+         <layout class="QHBoxLayout" name="horizontalLayout_Model" stretch="1,2">
+          <property name="leftMargin"><number>15</number></property>
+          <property name="rightMargin"><number>15</number></property>
+          <item>
+           <widget class="ElaText" name="label_Model">
+            <property name="font"><font><pointsize>12</pointsize></font></property>
+            <property name="text"><string>模型</string></property>
+           </widget>
+          </item>
+          <item>
+           <widget class="ElaComboBox" name="comboBox_ModelSelect">
+            <property name="toolTip"><string>视觉模型名称，可直接输入</string></property>
+            <property name="editable"><bool>true</bool></property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="ElaScrollPageArea" name="widget_BaseUrl" native="true">
+         <layout class="QHBoxLayout" name="horizontalLayout_BaseUrl" stretch="1,2">
+          <property name="leftMargin"><number>15</number></property>
+          <property name="rightMargin"><number>15</number></property>
+          <item>
+           <widget class="ElaText" name="label_BaseUrl">
+            <property name="font"><font><pointsize>12</pointsize></font></property>
+            <property name="text"><string>Base URL</string></property>
+           </widget>
+          </item>
+          <item>
+           <widget class="ElaLineEdit" name="lineEdit_BaseUrl">
+            <property name="toolTip"><string>自定义API地址，仅"Custom"模式需要填写</string></property>
+            <property name="placeholderText"><string>https://api.moonshot.cn/v1</string></property>
            </widget>
           </item>
          </layout>
@@ -90,29 +130,16 @@
        </item>
        <item>
         <widget class="ElaText" name="label_Desc">
-         <property name="font">
-          <font>
-           <pointsize>9</pointsize>
-          </font>
-         </property>
-         <property name="text">
-          <string>启用后，对话栏会出现"看看屏幕"按钮。输入"帮我看看""截图"等关键词也会自动触发屏幕分析。分析结果会作为上下文提供给AI，让她更好地理解你当前在做什么。</string>
-         </property>
-         <property name="wordWrap">
-          <bool>true</bool>
-         </property>
+         <property name="font"><font><pointsize>9</pointsize></font></property>
+         <property name="text"><string>提示：Kimi 推荐模型 moonshot-v1-8k-vision-preview，OpenAI 推荐 gpt-4o-mini。API Key 与对话模型分开配置，互不影响。</string></property>
+         <property name="wordWrap"><bool>true</bool></property>
         </widget>
        </item>
        <item>
         <spacer name="verticalSpacer">
-         <property name="orientation">
-          <enum>Qt::Vertical</enum>
-         </property>
+         <property name="orientation"><enum>Qt::Vertical</enum></property>
          <property name="sizeHint" stdset="0">
-          <size>
-           <width>20</width>
-           <height>40</height>
-          </size>
+          <size><width>20</width><height>40</height></size>
          </property>
         </spacer>
        </item>
@@ -123,34 +150,13 @@
   </layout>
  </widget>
  <customwidgets>
-  <customwidget>
-   <class>ElaBreadcrumbBar</class>
-   <extends>QWidget</extends>
-   <header location="global">ElaBreadcrumbBar.h</header>
-   <container>1</container>
-  </customwidget>
-  <customwidget>
-   <class>ElaText</class>
-   <extends>QLabel</extends>
-   <header location="global">ElaText.h</header>
-  </customwidget>
-  <customwidget>
-   <class>ElaScrollPageArea</class>
-   <extends>QWidget</extends>
-   <header location="global">ElaScrollPageArea.h</header>
-   <container>1</container>
-  </customwidget>
-  <customwidget>
-   <class>ZcStackedWidget</class>
-   <extends>QStackedWidget</extends>
-   <header location="global">ZcStackedWidget.h</header>
-   <container>1</container>
-  </customwidget>
-  <customwidget>
-   <class>ElaToggleSwitch</class>
-   <extends>QWidget</extends>
-   <header location="global">ElaToggleSwitch.h</header>
-  </customwidget>
+  <customwidget><class>ElaBreadcrumbBar</class><extends>QWidget</extends><header>ElaBreadcrumbBar.h</header><container>1</container></customwidget>
+  <customwidget><class>ElaText</class><extends>QLabel</extends><header>ElaText.h</header></customwidget>
+  <customwidget><class>ElaScrollPageArea</class><extends>QWidget</extends><header>ElaScrollPageArea.h</header><container>1</container></customwidget>
+  <customwidget><class>ZcStackedWidget</class><extends>QStackedWidget</extends><header>ZcStackedWidget.h</header><container>1</container></customwidget>
+  <customwidget><class>ElaToggleSwitch</class><extends>QWidget</extends><header>ElaToggleSwitch.h</header></customwidget>
+  <customwidget><class>ElaComboBox</class><extends>QComboBox</extends><header>ElaComboBox.h</header></customwidget>
+  <customwidget><class>ElaLineEdit</class><extends>QLineEdit</extends><header>ElaLineEdit.h</header></customwidget>
  </customwidgets>
  <resources/>
  <connections/>

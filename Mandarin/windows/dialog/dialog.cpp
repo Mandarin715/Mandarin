@@ -1665,7 +1665,7 @@ void Dialog::captureAndAnalyzeScreen()
         return;
     }
 
-    const QString imageBase64 = QString::fromLatin1(jpegData.toBase64());
+    const QByteArray imageBase64 = jpegData.toBase64();
     const QString userMessage = m_lastUserInput.isEmpty()
         ? QStringLiteral("帮我看看屏幕上的内容")
         : m_lastUserInput;
@@ -1678,35 +1678,45 @@ void Dialog::captureAndAnalyzeScreen()
 void Dialog::analyzeScreenWithVision(const QByteArray &imageBase64,
                                       const QString &userMessage)
 {
-    // 读取AI配置
-    ZcJsonLib charConfig(ReadCharacterUserConfigPath());
-    QString serverSelect = charConfig.value("serverSelect").toString();
-    if (serverSelect.isEmpty())
-        serverSelect = QStringLiteral("DeepSeek");
-
+    // 读取屏幕捕获专用API配置（独立于对话模型）
     ZcJsonLib config(JsonSettingPath);
+    const QString serverSelect =
+        config.value("screenCapture/Server", "Kimi").toString();
     const QString apiKey =
-        config.value("llm/" + serverSelect + "/ApiKey").toString();
-    const QString model = charConfig.value("modelSelect").toString();
+        config.value("screenCapture/ApiKey").toString();
+    const QString model =
+        config.value("screenCapture/Model", "moonshot-v1-8k-vision-preview").toString();
+
+    if (apiKey.isEmpty())
+    {
+        qWarning() << "Vision API: no API key configured for screen capture";
+        doSubmitCurrentInput(userMessage);
+        return;
+    }
 
     // 确定API端点
     QString apiUrl;
-    if (serverSelect == "OpenAI")
+    if (serverSelect == "Kimi")
+        apiUrl = QStringLiteral("https://api.moonshot.cn/v1/chat/completions");
+    else if (serverSelect == "OpenAI")
         apiUrl = QStringLiteral("https://api.openai.com/v1/chat/completions");
-    else if (serverSelect == "DeepSeek")
-        apiUrl = QStringLiteral("https://api.deepseek.com/v1/chat/completions");
     else if (serverSelect == "Custom")
     {
         const QString baseUrl =
-            config.value("llm/Custom/BaseUrl").toString().trimmed();
+            config.value("screenCapture/BaseUrl").toString().trimmed();
         if (baseUrl.isEmpty())
         {
             qWarning() << "Vision API: Custom server selected but no BaseUrl configured";
-            handleVisionError(
-                QStringLiteral("请先在设置中配置自定义服务器的BaseUrl"));
+            doSubmitCurrentInput(userMessage);
             return;
         }
         apiUrl = baseUrl + "/v1/chat/completions";
+    }
+    else
+    {
+        qWarning() << "Vision API: unknown server" << serverSelect;
+        doSubmitCurrentInput(userMessage);
+        return;
     }
 
     // 构建多模态消息
@@ -1724,7 +1734,7 @@ void Dialog::analyzeScreenWithVision(const QByteArray &imageBase64,
     imagePart["type"] = "image_url";
     QJsonObject imageUrlObj;
     imageUrlObj["url"] =
-        QStringLiteral("data:image/jpeg;base64,") + imageBase64;
+        QStringLiteral("data:image/jpeg;base64,") + QString::fromLatin1(imageBase64);
     imagePart["image_url"] = imageUrlObj;
     content.append(imagePart);
 
@@ -1746,7 +1756,8 @@ void Dialog::analyzeScreenWithVision(const QByteArray &imageBase64,
     body["max_tokens"] = 500;
     body["stream"] = false;
 
-    QNetworkRequest request(QUrl(apiUrl));
+    QUrl url(apiUrl);
+    QNetworkRequest request(url);
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
     request.setRawHeader("Authorization", ("Bearer " + apiKey).toUtf8());
 
@@ -1763,9 +1774,9 @@ void Dialog::analyzeScreenWithVision(const QByteArray &imageBase64,
 
                 if (reply->error() != QNetworkReply::NoError)
                 {
-                    qWarning() << "Vision API error:" << reply->errorString();
-                    handleVisionError(
-                        QStringLiteral("屏幕分析失败：") + reply->errorString());
+                    qWarning() << "Vision API error:" << reply->errorString()
+                               << "- falling back to text-only mode";
+                    doSubmitCurrentInput(userMessage);
                     return;
                 }
 
@@ -1787,9 +1798,9 @@ void Dialog::analyzeScreenWithVision(const QByteArray &imageBase64,
 
                 if (visionResult.isEmpty())
                 {
-                    qWarning() << "Vision API returned empty content";
-                    handleVisionError(
-                        QStringLiteral("(未能识别屏幕内容，可能是模型不支持视觉功能)"));
+                    qWarning() << "Vision API returned empty content"
+                               << "- falling back to text-only mode";
+                    doSubmitCurrentInput(userMessage);
                     return;
                 }
 

@@ -79,18 +79,18 @@ int main(int argc, char *argv[])
     qputenv("QT_QPA_PLATFORM", "xcb");
 #endif
     QApplication a(argc, argv);
-#ifdef Q_OS_MACOS
-    // Keep QLabel text readable when macOS switches to dark mode.
+
+    // Keep text readable on all platforms when system uses dark mode.
     QPalette labelPalette = a.palette();
     labelPalette.setColor(QPalette::WindowText, QColor(20, 20, 20));
     QApplication::setPalette(labelPalette, "QLabel");
 
-    // Keep QTextEdit text/placeholder readable in dark mode.
     QPalette textEditPalette = a.palette();
     textEditPalette.setColor(QPalette::Text, QColor(20, 20, 20));
     textEditPalette.setColor(QPalette::PlaceholderText, QColor(120, 120, 120));
     QApplication::setPalette(textEditPalette, "QTextEdit");
 
+#ifdef Q_OS_MACOS
     CopyDefaultConfigIfMissing();
 #endif
     a.setQuitOnLastWindowClosed(false);

@@ -16,6 +16,9 @@ class history : public QWidget
     explicit history(QWidget *parent = nullptr);
     void addChildWindow(int historyIndex, const QString &name, const QString &msg);
     void clearHistory();
+    void scrollHistory(int delta);
+    bool isHistoryAtTop() const;
+    bool isHistoryAtBottom() const;
     ~history();
 
   signals:
