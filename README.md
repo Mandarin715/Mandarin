@@ -69,7 +69,7 @@
 
 ### Step 1：安装
 
-1. 在 [Release](https://github.com/Mandarin715/ZcChat2/releases) 中的安装程序标签里下载最新版本
+1. 在 [Release](https://github.com/Mandarin715/ZcChat2/releases)里下载最新版本
 2. 运行 ZcChat2
 
 ### Step 2：导入角色
@@ -109,6 +109,7 @@
 记忆数据存储在 `Documents/ZcChat2/Character/UserConfig/<角色名>/memory.json`，在后续对话中自动注入系统提示词，让角色越来越了解你。
 
 > 记忆提取在后台异步完成，不影响对话响应速度。
+> 以后会加入更多新功能，具体进度可看开头部分
 
 ---
 
