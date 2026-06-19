@@ -58,40 +58,37 @@
 - [x] 对话长期记忆
 - [x] 语音唤醒
 - [x] 连续对话
+- [x] 屏幕识别
 - [ ] 本地应用调用
 ---
 
 ## 🚀 快速入门
 
-### Step 1：安装
+### Step 1：下载 & 启动
 
-1. 在 [Release](https://github.com/Mandarin715/ZcChat2/releases)里下载最新版本
-2. 运行 ZcChat2
+1. 在 [Release](https://github.com/Mandarin715/ZcChat2/releases) 下载最新 `ZcChat2-v*-portable.zip`
+2. 解压到任意目录
+3. 双击 `启动.bat`，桌宠直接启动
 
-### Step 2：导入角色
+### Step 2：（可选）语音功能
 
-1. 在 [角色分享](https://github.com/Zao-chen/ZcChat2/discussions/categories/%E8%A7%92%E8%89%B2%E5%88%86%E4%BA%AB) 下载喜欢的角色包
-2. 右键系统托盘图标打开设置
-3. 进入「角色设置 → 选中角色」点击「导入」
+> 仅文字对话可跳过此步。
 
-### Step 3：配置对话模型
+1. 下载 [vits-simple-api](https://github.com/Artrajz/vits-simple-api/releases)（Windows CPU 版本）
+2. 解压到桌宠目录下的 `vits-simple-api/` 文件夹
+3. 将角色语音模型放入 `vits-simple-api/models/`
+4. 重新双击 `启动.bat`，脚本自动检测并开启语音模式
 
-1. 在「对话模型」中选择 LLM 服务商并填入 API Key
-2. 点击「获取」测试可用性并加载模型列表
-3. 在「角色设置 → 运行配置 → 对话模型」中选择模型
+### Step 3：配置 API Key
 
-### Step 4：（可选）配置语音合成
+1. 右键系统托盘图标 → 设置
+2. 「对话模型」→ 选择服务商 → 填入 API Key → 点击「获取」
+3. （语音输入需）「语音输入设置」→ 填入百度语音识别 API Key
 
-1. 安装并启动 [vits-simple-api](https://github.com/Artrajz/vits-simple-api/blob/main/README_zh.md)
-2. 将服务地址填入设置页（默认 `http://localhost:23456`）
-3. 点击「获取」测试并加载模型列表
-4. 在角色运行配置中选择 TTS 模型
+### Step 4：导入角色
 
-### Step 5：（可选）配置语音输入
-
-1. 在 [百度智能云控制台](https://console.bce.baidu.com/ai-engine/old/#/ai/speech/app/list) 创建短语音识别应用
-2. 将 API Key 和 Secret Key 填入设置页
-3. 在「语音输入」中按需配置
+1. 在 [角色分享](https://github.com/Zao-chen/ZcChat2/discussions/categories/%E8%A7%92%E8%89%B2%E5%88%86%E4%BA%AB) 下载角色包
+2. 设置 → 角色设置 → 导入
 
 ---
 
