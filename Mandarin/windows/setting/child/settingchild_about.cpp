@@ -34,13 +34,13 @@ SettingChild_About::SettingChild_About(QWidget *parent)
     /*初始化页面*/
     ui->label_version->setText(" v" + m_localVersion);
 
-    ui->pushButton->setUrl("https://github.com/Zao-chen/ZcChat2");
+    ui->pushButton->setUrl("https://github.com/Mandarin715/Mandarin");
     //沿用旧版ZcChat的GitHub图标
     ui->pushButton->setCardPixmap(QPixmap(":/res/img/ico/github-mark.svg"));
     ui->pushButton->setTitle("GitHub");
     ui->pushButton->setSubTitle("项目主页、源码、Release 和文档入口");
 
-    ui->pushButton_2->setUrl("https://github.com/Zao-chen/ZcChat2/issues/new/choose");
+    ui->pushButton_2->setUrl("https://github.com/Mandarin715/Mandarin/issues/new/choose");
     //沿用旧版ZcChat的Issue图标
     ui->pushButton_2->setCardPixmap(QPixmap(":/res/img/ico/circle-dot-regular.svg"));
     ui->pushButton_2->setTitle("Issue");
@@ -64,7 +64,7 @@ SettingChild_About::SettingChild_About(QWidget *parent)
         m_releaseInfoLoaded = true; //标记已加载，防止重复请求
         //异步获取GitHub发布列表
         QNetworkReply *reply = m_manager->get(QNetworkRequest(
-            QUrl("https://api.github.com/repos/Zao-chen/ZcChat2/releases")));
+            QUrl("https://api.github.com/repos/Mandarin715/Mandarin/releases")));
         connect(reply, &QNetworkReply::finished, this,
                 [this, reply]()
                 { handleReleaseInfoReply(reply); }); });

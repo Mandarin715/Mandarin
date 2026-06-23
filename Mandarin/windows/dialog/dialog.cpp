@@ -671,6 +671,14 @@ void Dialog::ReloadAIConfig()
 
     //读取当前角色的模型选择
     QString modelSelect = CharConfig.value("modelSelect").toString();
+    if (modelSelect.isEmpty())
+    {
+        // 新用户未选择模型时，根据服务商使用默认模型
+        if (serverSelect == "DeepSeek")
+            modelSelect = "deepseek-v4-pro";
+        else if (serverSelect == "OpenAI")
+            modelSelect = "gpt-4o-mini";
+    }
     ai->setModel(modelSelect);
 
     loadContextHistory();
