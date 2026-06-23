@@ -27,6 +27,8 @@ SettingChild_Speech::SettingChild_Speech(QWidget *parent)
     ui->ToggleSwitch_GlobalHotkeyEnable->setIsToggled(globalHotkeyEnable);
     ui->ToggleSwitch_WakeWordEnable->setIsToggled(
         config.value("speechInput/WakeWord/Enable", false).toBool());
+    ui->spinBox_WakeWordSensitivity->setValue(
+        config.value("speechInput/WakeWord/Sensitivity", 0.25).toDouble());
     ui->keyBinder_GlobalHotkey->setBinderKeyText(
         config.value("speechInput/GlobalHotkey/BinderText").toString());
     ui->keyBinder_GlobalHotkey->setNativeVirtualBinderKey(
@@ -212,6 +214,15 @@ void SettingChild_Speech::on_ToggleSwitch_WakeWordEnable_toggled(bool checked)
 {
     ZcJsonLib config(JsonSettingPath);
     config.setValue("speechInput/WakeWord/Enable", checked);
+    emit speechConfigChanged();
+}
+
+/*唤醒灵敏度调整*/
+void SettingChild_Speech::on_spinBox_WakeWordSensitivity_valueChanged(
+    double value)
+{
+    ZcJsonLib config(JsonSettingPath);
+    config.setValue("speechInput/WakeWord/Sensitivity", value);
     emit speechConfigChanged();
 }
 

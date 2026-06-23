@@ -28,6 +28,7 @@ class SettingChild_Speech : public QWidget
     void on_ToggleSwitch_ContinuousHotkeyEnable_toggled(bool checked);
     void on_spinBox_ContinuousAudioDelay_valueChanged(int value);
     void on_ToggleSwitch_WakeWordEnable_toggled(bool checked);
+    void on_spinBox_WakeWordSensitivity_valueChanged(double value);
     void on_lineEdit_BaiduApiKey_textChanged(const QString &arg1);
     void on_lineEdit_BaiduSecretKey_textChanged(const QString &arg1);
     void on_keyBinder_GlobalHotkey_binderKeyTextChanged(QString binderKeyText);

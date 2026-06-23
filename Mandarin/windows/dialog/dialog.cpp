@@ -749,8 +749,11 @@ void Dialog::ReloadSpeechInputConfig()
     // 语音唤醒
     const bool wakeWordEnabled =
         config.value("speechInput/WakeWord/Enable", false).toBool();
-    if (wakeWordEnabled && !m_wakeWordEnabled)
-        startWakeWord();
+    if (wakeWordEnabled)
+    {
+        stopWakeWord();   // 先停旧检测器（释放旧灵敏度配置）
+        startWakeWord();  // 用最新灵敏度重建
+    }
     else if (!wakeWordEnabled && m_wakeWordEnabled)
         stopWakeWord();
     m_wakeWordEnabled = wakeWordEnabled;
