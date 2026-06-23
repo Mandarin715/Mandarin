@@ -94,9 +94,7 @@ static int findNextSentenceEnd(const QString &text, int start)
         const QChar ch = text.at(i);
         if (ch == QChar('.') || ch == QChar('!') || ch == QChar('?') ||
             ch == QChar('\n') || ch == QStringLiteral("。").at(0) ||
-            ch == QStringLiteral("！").at(0) || ch == QStringLiteral("？").at(0) ||
-            ch == QStringLiteral("、").at(0) || ch == QStringLiteral("；").at(0) ||
-            ch == QChar(';'))
+            ch == QStringLiteral("！").at(0) || ch == QStringLiteral("？").at(0))
             return i;
     }
     return -1;
@@ -1503,7 +1501,7 @@ bool Dialog::isAllVitsDone() const
 /*录音文件路径*/
 QString Dialog::speechRecordFilePath() const
 {
-    return QDir(QDir::tempPath()).filePath("Mandarin/speech_input.m4a");
+    return QDir(QDir::tempPath()).filePath("Mandarin/speech_input.pcm");
 }
 
 /*获取百度 Token*/
@@ -1581,7 +1579,7 @@ QString Dialog::recognizeSpeechFromFile(const QString &filePath)
     if (audioData.isEmpty())
         return QString();
 
-    //沿用旧项目的百度短语音识别请求格式，直接提交 m4a 的 Base64 数据
+    //沿用旧项目的百度短语音识别请求格式，直接提交 PCM 的 Base64 数据
     QJsonObject payload{
         {"format", "pcm"},
         {"rate", 16000},
