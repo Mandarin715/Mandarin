@@ -4,7 +4,7 @@
   原项目地址：https://github.com/Zao-chen/ZcChat2
 -->
 
-# ZcChat2 — AI 桌面宠物
+# Mandarin — AI 桌面宠物
 
 🌟 一个模仿 Galgame 演出效果的 AI 桌宠
 
