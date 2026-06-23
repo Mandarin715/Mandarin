@@ -11,8 +11,6 @@
 <img width="1045" height="593" alt="screenshot" src="https://github.com/user-attachments/assets/49439b92-308f-4ecd-b8cc-a1538153752c" />
 
 [![GitHub Release](https://img.shields.io/github/v/release/Mandarin715/ZcChat2?color=22c55e&style=for-the-badge)](https://github.com/Mandarin715/ZcChat2/releases)
-[![GitHub License](https://img.shields.io/github/license/Mandarin715/ZcChat2?color=ef4444&style=for-the-badge)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-6366f1?style=for-the-badge)]()
 
 
 ---
