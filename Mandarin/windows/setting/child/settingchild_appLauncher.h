@@ -3,10 +3,22 @@
 
 #include <QWidget>
 
+class ElaScrollPageArea;
+class ElaText;
+class QLineEdit;
+class QPushButton;
+
 namespace Ui
 {
 class SettingChild_AppLauncher;
 }
+
+struct AppCommandCard
+{
+    ElaScrollPageArea *area = nullptr;
+    QLineEdit *keywordEdit = nullptr;
+    QLineEdit *pathEdit = nullptr;
+};
 
 class SettingChild_AppLauncher : public QWidget
 {
@@ -23,13 +35,16 @@ class SettingChild_AppLauncher : public QWidget
     void on_BreadcrumbBar_breadcrumbClicked(QString breadcrumb,
                                             QStringList lastBreadcrumbList);
     void on_pushButton_Add_clicked();
-    void on_pushButton_Delete_clicked();
 
   private:
     Ui::SettingChild_AppLauncher *ui;
+    QList<AppCommandCard> m_cards;
+
+    void addCard(const QString &keyword = QString(),
+                 const QString &path = QString());
+    void removeCard(int index);
+    void saveAll();
     void loadFromConfig();
-    void saveToConfig();
-    void refreshTable();
 };
 
 #endif //SETTINGCHILD_APPLAUNCHER_H

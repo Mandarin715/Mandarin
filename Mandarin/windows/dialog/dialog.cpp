@@ -322,6 +322,17 @@ Dialog::Dialog(QWidget *parent)
                     }
                     tryStartNextVitsPlayback();
 
+                    // VITS 全部播放完毕后切回默认立绘
+                    {
+                        const bool allDone = isAllVitsDone();
+                        if (allDone && !m_isSpeechRecording && !m_isSpeechRecognizing)
+                        {
+                            QTimer::singleShot(m_continuousAudioDelayMs, this, [this]() {
+                                emit requestSetCharTachie("default");
+                            });
+                        }
+                    }
+
                     // 连续对话模式：全部VITS播完后自动开始下一轮录音
                     if (m_continuousMode)
                     {
@@ -515,6 +526,17 @@ Dialog::Dialog(QWidget *parent)
                     }
                 }
                 emit requestSetCharTachie(mood); //提取心情并发出信号
+
+                // VITS 播放完毕/无语音时，延迟切回默认立绘
+                {
+                    const bool allDone = isAllVitsDone();
+                    if (allDone && !m_isSpeechRecording && !m_isSpeechRecognizing)
+                    {
+                        QTimer::singleShot(m_continuousAudioDelayMs, this, [this]() {
+                            emit requestSetCharTachie("default");
+                        });
+                    }
+                }
 
                 //历史记录写入
                 const QString capturedUserInput = m_lastUserInput;

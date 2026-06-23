@@ -19,60 +19,25 @@
     </widget>
    </item>
    <item>
-    <widget class="ElaScrollPageArea" name="widget_TableArea" native="true">
-     <property name="toolTip"><string>输入含关键词的文本时自动启动对应应用，不触发AI对话</string></property>
-     <layout class="QVBoxLayout" name="verticalLayout_Table">
-      <property name="leftMargin"><number>8</number></property>
-      <property name="rightMargin"><number>8</number></property>
-      <property name="topMargin"><number>8</number></property>
-      <property name="bottomMargin"><number>8</number></property>
-      <item>
-       <widget class="QTableWidget" name="tableWidget_Commands">
-        <property name="columnCount"><number>3</number></property>
-        <property name="selectionBehavior"><enum>QAbstractItemView::SelectRows</enum></property>
-        <property name="selectionMode"><enum>QAbstractItemView::SingleSelection</enum></property>
-        <property name="alternatingRowColors"><bool>true</bool></property>
-        <property name="minimumHeight"><number>200</number></property>
-        <attribute name="horizontalHeaderVisible"><bool>true</bool></attribute>
-        <attribute name="verticalHeaderVisible"><bool>false</bool></attribute>
-        <column>
-         <property name="text"><string>序号</string></property>
-         <property name="width"><number>50</number></property>
-        </column>
-        <column>
-         <property name="text"><string>关键词</string></property>
-         <property name="width"><number>200</number></property>
-        </column>
-        <column>
-         <property name="text"><string>应用路径</string></property>
-        </column>
-       </widget>
-      </item>
-      <item>
-       <layout class="QHBoxLayout" name="horizontalLayout_Buttons">
-        <item>
-         <widget class="QPushButton" name="pushButton_Add">
-          <property name="text"><string>添加</string></property>
-          <property name="minimumWidth"><number>80</number></property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QPushButton" name="pushButton_Delete">
-          <property name="text"><string>删除选中</string></property>
-          <property name="minimumWidth"><number>80</number></property>
-         </widget>
-        </item>
-        <item>
-         <spacer name="horizontalSpacer_Buttons">
-          <property name="orientation"><enum>Qt::Horizontal</enum></property>
-          <property name="sizeHint" stdset="0">
-           <size><width>40</width><height>20</height></size>
-          </property>
-         </spacer>
-        </item>
-       </layout>
-      </item>
-     </layout>
+    <widget class="QScrollArea" name="scrollArea">
+     <property name="widgetResizable"><bool>true</bool></property>
+     <property name="frameShape"><enum>QFrame::NoFrame</enum></property>
+     <widget class="QWidget" name="scrollContent">
+      <property name="geometry"><rect><x>0</x><y>0</y><width>855</width><height>100</height></rect></property>
+      <layout class="QVBoxLayout" name="verticalLayout_Cards">
+       <property name="leftMargin"><number>0</number></property>
+       <property name="rightMargin"><number>0</number></property>
+       <property name="topMargin"><number>0</number></property>
+       <property name="bottomMargin"><number>0</number></property>
+       <property name="spacing"><number>8</number></property>
+      </layout>
+     </widget>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPushButton" name="pushButton_Add">
+     <property name="text"><string>+ 添加应用</string></property>
+     <property name="minimumHeight"><number>32</number></property>
     </widget>
    </item>
    <item>
@@ -95,7 +60,6 @@
  <customwidgets>
   <customwidget><class>ElaBreadcrumbBar</class><extends>QWidget</extends><header>ElaBreadcrumbBar.h</header><container>1</container></customwidget>
   <customwidget><class>ElaText</class><extends>QLabel</extends><header>ElaText.h</header></customwidget>
-  <customwidget><class>ElaScrollPageArea</class><extends>QWidget</extends><header>ElaScrollPageArea.h</header><container>1</container></customwidget>
  </customwidgets>
  <resources/>
  <connections/>
