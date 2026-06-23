@@ -110,9 +110,6 @@
 
 | 项目 | 说明 |
 |------|------|
-| [Zao-chen/ZcAILib](https://github.com/Zao-chen/ZcAILib) | 高性能 Qt AI 请求库 |
-| [Zao-chen/ZcWidgetTools](https://github.com/Zao-chen/ZcWidgetTools) | ElaWidgetTools 扩展 |
-| [Zao-chen/ZcJsonLib](https://github.com/Zao-chen/ZcJsonLib) | 轻量 JSON 键值库 |
 | [Liniyous/ElaWidgetTools](https://github.com/Liniyous/ElaWidgetTools) | Fluent UI for Qt |
 | [Artrajz/vits-simple-api](https://github.com/Artrajz/vits-simple-api) | VITS 语音合成 |
 | [Qt](https://www.qt.io/) | 跨平台 C++ 框架 |
