@@ -1311,6 +1311,9 @@ void Dialog::startSpeechRecordingFromHotkey()
         m_isSpeechRecognizing)
         return;
 
+    // 停止语音唤醒，释放麦克风给录音使用
+    stopWakeWord();
+
 #ifdef Q_OS_MACOS
     auto *app = QCoreApplication::instance();
     if (app)
@@ -1414,6 +1417,9 @@ void Dialog::stopSpeechRecording()
     }
 
     m_isSpeechRecording = false;
+
+    // 录音结束后重新开启语音唤醒（如果之前被 onWakeWordDetected 停止了）
+    startWakeWord();
 
     // 没有捕获到有效音频（太短）
     const int minBytes = 16000 * 2 * 1; // 至少1秒（16kHz, 16-bit, mono）
@@ -2390,6 +2396,9 @@ void Dialog::onWakeWordDetected(const QString &keyword)
         return;
     if (m_isSpeechRecording || m_isSpeechRecognizing)
         return;
+
+    // 停止唤醒检测，释放麦克风给录音使用
+    stopWakeWord();
 
     // 恢复输入状态（AI回复残留文字清除）
     ui->textEdit->setEnabled(true);
