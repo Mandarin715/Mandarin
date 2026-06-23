@@ -15,7 +15,7 @@ MainWindow::MainWindow(Dialog *dialog, Tachie *tachie, QWidget *parent)
     : ElaWindow(parent), ui(new Ui::MainWindow)
 {
     /*初始化窗口*/
-    setWindowTitle("ZcChat2");
+    setWindowTitle("Mandarin");
     setUserInfoCardVisible(false);
 
     /*创建窗口*/

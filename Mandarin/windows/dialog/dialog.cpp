@@ -1313,7 +1313,7 @@ void Dialog::startSpeechRecordingFromHotkey()
 
         if (status == Qt::PermissionStatus::Denied)
         {
-            const QString msg = QStringLiteral("麦克风权限未开启，请在系统设置中允许 ZcChat2 使用麦克风");
+            const QString msg = QStringLiteral("麦克风权限未开启，请在系统设置中允许 Mandarin 使用麦克风");
             ui->textEdit->setText(msg);
             QTimer::singleShot(2500, this, [this, msg]() {
                 if (ui->textEdit->toPlainText() == msg)
@@ -1339,7 +1339,7 @@ void Dialog::startSpeechRecordingFromHotkey()
                                        else
                                        {
                                            const QString errMsg = QStringLiteral(
-                                               "麦克风权限未开启，请在系统设置中允许 ZcChat2 使用麦克风");
+                                               "麦克风权限未开启，请在系统设置中允许 Mandarin 使用麦克风");
                                            ui->textEdit->setText(errMsg);
                                            QTimer::singleShot(2500, this, [this, errMsg]() {
                                                if (ui->textEdit->toPlainText() == errMsg)
@@ -1489,7 +1489,7 @@ bool Dialog::isAllVitsDone() const
 /*录音文件路径*/
 QString Dialog::speechRecordFilePath() const
 {
-    return QDir(QDir::tempPath()).filePath("ZcChat2/speech_input.m4a");
+    return QDir(QDir::tempPath()).filePath("Mandarin/speech_input.m4a");
 }
 
 /*获取百度 Token*/

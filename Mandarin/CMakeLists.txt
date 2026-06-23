@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(ZcChat2 VERSION 1.6.0 LANGUAGES CXX)
+project(Mandarin VERSION 1.6.0 LANGUAGES CXX)
 
 if(APPLE)
     set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "Build universal binaries")
@@ -16,8 +16,8 @@ configure_file(
 
 # 配置 .iss 安装脚本，传递版本号
 configure_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/installer/ZcChat2.iss.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/ZcChat2.iss"
+    "${CMAKE_CURRENT_SOURCE_DIR}/installer/Mandarin.iss.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/Mandarin.iss"
 )
 
 set(CMAKE_AUTOUIC ON)
@@ -123,7 +123,7 @@ set(PROJECT_SOURCES
 )
 
 if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
-    qt_add_executable(ZcChat2
+    qt_add_executable(Mandarin
         MANUAL_FINALIZATION
         ${PROJECT_SOURCES}
         windows/dialog/dialog.h windows/dialog/dialog.cpp windows/dialog/dialog.ui
@@ -149,18 +149,18 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
 
     )
 # Define target properties for Android with Qt 6 as:
-#    set_property(TARGET ZcChat2 APPEND PROPERTY QT_ANDROID_PACKAGE_SOURCE_DIR
+#    set_property(TARGET Mandarin APPEND PROPERTY QT_ANDROID_PACKAGE_SOURCE_DIR
 #                 ${CMAKE_CURRENT_SOURCE_DIR}/android)
 # For more information, see https://doc.qt.io/qt-6/qt-add-executable.html#target-creation
 else()
     if(ANDROID)
-        add_library(ZcChat2 SHARED
+        add_library(Mandarin SHARED
             ${PROJECT_SOURCES}
         )
 # Define properties for Android with Qt 5 after find_package() calls as:
 #    set(ANDROID_PACKAGE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/android")
     else()
-        add_executable(ZcChat2
+        add_executable(Mandarin
             ${PROJECT_SOURCES}
         )
     endif()
@@ -169,7 +169,7 @@ endif()
 
 # 添加头文件路径
 # 1. 统一的头文件路径 (合并原本分散在两处的路径)
-target_include_directories(ZcChat2 PRIVATE
+target_include_directories(Mandarin PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}
     ${ZCAILIB_INCLUDE_DIR}
@@ -181,7 +181,7 @@ target_include_directories(ZcChat2 PRIVATE
 )
 
 # 2. 公共库链接 (全平台通用)
-target_link_libraries(ZcChat2 PRIVATE
+target_link_libraries(Mandarin PRIVATE
     Qt${QT_VERSION_MAJOR}::Widgets
     Qt${QT_VERSION_MAJOR}::Network
     Qt${QT_VERSION_MAJOR}::Multimedia
@@ -190,7 +190,7 @@ target_link_libraries(ZcChat2 PRIVATE
 )
 
 if(APPLE)
-    target_link_libraries(ZcChat2 PRIVATE
+    target_link_libraries(Mandarin PRIVATE
         "${ZCAILIB_MAC_LIB}"
         "${ZCJSONLIB_MAC_LIB}"
         "${ZCWIDGETTOOLS_MAC_LIB}"
@@ -199,9 +199,9 @@ if(APPLE)
         "-framework CoreServices"
     )
 
-    set_target_properties(ZcChat2 PROPERTIES
+    set_target_properties(Mandarin PROPERTIES
         MACOSX_BUNDLE TRUE
-        MACOSX_BUNDLE_BUNDLE_NAME "ZcChat2"
+        MACOSX_BUNDLE_BUNDLE_NAME "Mandarin"
         MACOSX_BUNDLE_GUI_IDENTIFIER "com.zaochen.zcchat2"
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/cmake/MacOSXBundleInfo.plist.in"
         BUILD_RPATH "@executable_path/../Frameworks"
@@ -216,12 +216,12 @@ if(APPLE)
     endforeach()
 
     if(ZCCHAT2_MAC_DYLIBS)
-        add_custom_command(TARGET ZcChat2 POST_BUILD
+        add_custom_command(TARGET Mandarin POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory
-                "$<TARGET_BUNDLE_DIR:ZcChat2>/Contents/Frameworks"
+                "$<TARGET_BUNDLE_DIR:Mandarin>/Contents/Frameworks"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 ${ZCCHAT2_MAC_DYLIBS}
-                "$<TARGET_BUNDLE_DIR:ZcChat2>/Contents/Frameworks"
+                "$<TARGET_BUNDLE_DIR:Mandarin>/Contents/Frameworks"
             VERBATIM
         )
     endif()
@@ -229,7 +229,7 @@ endif()
 
 # 3. Windows 专用链接
 if(WIN32)
-    target_link_libraries(ZcChat2 PRIVATE
+    target_link_libraries(Mandarin PRIVATE
         ${ZCAILIB_WIN_LIB}
         ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/sherpa-onnx/lib/sherpa-onnx-cxx-api.lib
         ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ElaWidgetTools/lib/elawidgettools.lib
@@ -237,22 +237,22 @@ if(WIN32)
         ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ZcJsonLib/lib/ZcJsonLib.lib
     )
 
-    add_custom_command(TARGET ZcChat2 POST_BUILD
+    add_custom_command(TARGET Mandarin POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${ZCAILIB_WIN_DLL}
-            $<TARGET_FILE_DIR:ZcChat2>/ZcAiLib.dll
+            $<TARGET_FILE_DIR:Mandarin>/ZcAiLib.dll
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/sherpa-onnx/bin/sherpa-onnx-cxx-api.dll
-            $<TARGET_FILE_DIR:ZcChat2>
+            $<TARGET_FILE_DIR:Mandarin>
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/sherpa-onnx/bin/sherpa-onnx-c-api.dll
-            $<TARGET_FILE_DIR:ZcChat2>
+            $<TARGET_FILE_DIR:Mandarin>
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/sherpa-onnx/bin/onnxruntime.dll
-            $<TARGET_FILE_DIR:ZcChat2>
+            $<TARGET_FILE_DIR:Mandarin>
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/sherpa-onnx/bin/onnxruntime_providers_shared.dll
-            $<TARGET_FILE_DIR:ZcChat2>
+            $<TARGET_FILE_DIR:Mandarin>
     )
 endif()
 
@@ -263,7 +263,7 @@ if(UNIX AND NOT APPLE)
         find_package(Qt5 REQUIRED COMPONENTS X11Extras)
     endif()
 
-    target_link_libraries(ZcChat2 PRIVATE
+    target_link_libraries(Mandarin PRIVATE
         ${X11_LIBRARIES}
         ${X11_Xext_LIB}
         $<$<STREQUAL:${QT_VERSION_MAJOR},5>:Qt5::X11Extras>
@@ -273,18 +273,18 @@ if(UNIX AND NOT APPLE)
         "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ElaWidgetTools/lib/libElaWidgetTools.a"
     )
     
-    set_target_properties(ZcChat2 PROPERTIES
+    set_target_properties(Mandarin PROPERTIES
         INSTALL_RPATH "$ORIGIN/3rdparty/ZcJsonLib/lib:$ORIGIN/3rdparty/ZcAILib/lib:$ORIGIN/3rdparty/ZcWidgetTools/lib:$ORIGIN/3rdparty/ElaWidgetTools/lib"
     )
 endif()
 
 include(GNUInstallDirs)
-install(TARGETS ZcChat2
+install(TARGETS Mandarin
     BUNDLE DESTINATION .
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
 if(QT_VERSION_MAJOR EQUAL 6)
-    qt_finalize_executable(ZcChat2)
+    qt_finalize_executable(Mandarin)
 endif()

@@ -9,6 +9,7 @@
 
 #include <QApplication>
 #include <QColor>
+#include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QPalette>
@@ -33,20 +34,41 @@ void CopyDefaultConfigIfMissing()
     if (documentsRoot.isEmpty())
         return;
 
-    const QString targetRoot = QDir(documentsRoot).filePath("ZcChat2");
+    // 从旧版 ZcChat2 迁移配置到 Mandarin
+    const QString oldRoot = QDir(documentsRoot).filePath("ZcChat2");
+    const QString targetRoot = QDir(documentsRoot).filePath("Mandarin");
+    if (QDir(oldRoot).exists() && !QDir(targetRoot).exists())
+    {
+        // 递归复制整个旧目录到新位置
+        QDir().mkpath(targetRoot);
+        QDirIterator it(oldRoot, QDir::NoDotAndDotDot | QDir::AllEntries,
+                        QDirIterator::Subdirectories);
+        while (it.hasNext())
+        {
+            it.next();
+            const QString relPath =
+                QDir(oldRoot).relativeFilePath(it.filePath());
+            const QString dstPath = QDir(targetRoot).filePath(relPath);
+            if (it.fileInfo().isDir())
+                QDir().mkpath(dstPath);
+            else
+                QFile::copy(it.filePath(), dstPath);
+        }
+    }
+
     const QString targetIni = QDir(targetRoot).filePath("config.ini");
     if (QFile::exists(targetIni))
         return;
 
     const DefaultConfigEntry entries[] = {
-        {":/default_config/ZcChat2/config.ini", "config.ini"},
-        {":/default_config/ZcChat2/Plugin/Anime/Basic Animation Package.json",
+        {":/default_config/Mandarin/config.ini", "config.ini"},
+        {":/default_config/Mandarin/Plugin/Anime/Basic Animation Package.json",
          "Plugin/Anime/Basic Animation Package.json"},
-        {":/default_config/ZcChat2/Character/Assets/test/config.json",
+        {":/default_config/Mandarin/Character/Assets/test/config.json",
          "Character/Assets/test/config.json"},
-        {":/default_config/ZcChat2/Character/Assets/test/Tachie/default.png",
+        {":/default_config/Mandarin/Character/Assets/test/Tachie/default.png",
          "Character/Assets/test/Tachie/default.png"},
-        {":/default_config/ZcChat2/Character/UserConfig/test/config.json",
+        {":/default_config/Mandarin/Character/UserConfig/test/config.json",
          "Character/UserConfig/test/config.json"},
     };
 
@@ -95,7 +117,7 @@ int main(int argc, char *argv[])
 #endif
     a.setQuitOnLastWindowClosed(false);
 
-    QCoreApplication::setApplicationName("ZcChat2");
+    QCoreApplication::setApplicationName("Mandarin");
     QCoreApplication::setApplicationVersion(APP_VERSION);
     QCoreApplication::setOrganizationName("MyOrganization");
 
@@ -117,7 +139,7 @@ int main(int argc, char *argv[])
     /*托盘*/
     QSystemTrayIcon tray;
     tray.setIcon(QIcon(":/res/img/logo/logo.png"));
-    tray.setToolTip("ZcChat2");
+    tray.setToolTip("Mandarin");
     ElaMenu trayMenu;
     QAction *actionSettings = trayMenu.addAction("设置");
     QAction *actionQuit = trayMenu.addAction("退出");

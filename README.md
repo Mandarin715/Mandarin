@@ -1,16 +1,16 @@
 [README.md](https://github.com/user-attachments/files/28984655/README.md)
 <!--
-  注意：这是 ZcChat2 的个人分支版本，由 Mandarin715 维护。
+  注意：这是 Mandarin（原名 ZcChat2）的个人分支版本，由 Mandarin715 维护。
   原项目地址：https://github.com/Zao-chen/ZcChat2
 -->
 
-# ZcChat2 — AI 桌面宠物
+# Mandarin — AI 桌面宠物
 
 🌟 一个模仿 Galgame 演出效果的 AI 桌宠
 
 <img width="1045" height="593" alt="screenshot" src="https://github.com/user-attachments/assets/49439b92-308f-4ecd-b8cc-a1538153752c" />
 
-[![GitHub Release](https://img.shields.io/github/v/release/Mandarin715/ZcChat2?color=22c55e&style=for-the-badge)](https://github.com/Mandarin715/ZcChat2/releases)
+[![GitHub Release](https://img.shields.io/github/v/release/Mandarin715/Mandarin?color=22c55e&style=for-the-badge)](https://github.com/Mandarin715/Mandarin/releases)
 
 
 ---
@@ -55,7 +55,7 @@
 
 ### Step 1：下载 & 启动
 
-1. 在 [Release](https://github.com/Mandarin715/ZcChat2/releases) 下载最新 `ZcChat2-v*-portable.zip`
+1. 在 [Release](https://github.com/Mandarin715/Mandarin/releases) 下载最新 `Mandarin-v*-portable.zip`
 2. 解压到任意目录
 3. 双击 `启动.bat`，桌宠直接启动
 
@@ -65,7 +65,7 @@
 
 1. 下载 [vits-simple-api](https://github.com/Artrajz/vits-simple-api/releases)（Windows CPU 版本）
 2. 解压到桌宠目录下的 `vits-simple-api/` 文件夹
-3. 在 [Release](https://github.com/Mandarin715/ZcChat2/releases) 下载 `SomeGalActor_Vits.zip`（语音模型）
+3. 在 [Release](https://github.com/Mandarin715/Mandarin/releases) 下载 `SomeGalActor_Vits.zip`（语音模型）
 4. 解压到 `vits-simple-api/models/SomeGalActor_Vits/`
 5. 重新双击 `启动.bat`，脚本自动检测并开启语音模式
 
@@ -77,10 +77,10 @@
 
 ### Step 4：导入角色
 
-1. 在 [Release](https://github.com/Mandarin715/ZcChat2/releases) 下载角色包（如 Atri.zip）
+1. 在 [Release](https://github.com/Mandarin715/Mandarin/releases) 下载角色包（如 Atri.zip）
 2. 设置 → 角色设置 → 导入
 
-> 更多角色可在 [Discussions](https://github.com/Mandarin715/ZcChat2/discussions) 分享和获取
+> 更多角色可在 [Discussions](https://github.com/Mandarin715/Mandarin/discussions) 分享和获取
 
 ---
 
@@ -89,7 +89,7 @@
 欢迎任何形式的贡献：
 
 - **提交 PR** — 改进代码、修复 Bug、新增功能
-- **报告问题** — 通过 [Issues](https://github.com/Mandarin715/ZcChat2/issues) 提交 Bug 或功能建议
+- **报告问题** — 通过 [Issues](https://github.com/Mandarin715/Mandarin/issues) 提交 Bug 或功能建议
 - **分享角色** — 在 [Discussions](https://github.com/Zao-chen/ZcChat2/discussions/categories/%E8%A7%92%E8%89%B2%E5%88%86%E4%BA%AB) 分享自创角色
 - **Star ⭐** — 觉得有用就点个 Star 吧
 

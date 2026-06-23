@@ -46,7 +46,7 @@ SettingChild_About::SettingChild_About(QWidget *parent)
     ui->pushButton_2->setTitle("Issue");
     ui->pushButton_2->setSubTitle("反馈 Bug、需求和使用问题");
 
-    ui->pushButton_3->setUrl(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/ZcChat2/log.txt");
+    ui->pushButton_3->setUrl(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/Mandarin/log.txt");
     //沿用旧版ZcChat的软件日志图标
     ui->pushButton_3->setCardPixmap(QPixmap(":/res/img/ico/file-solid.svg"));
     ui->pushButton_3->setTitle("软件日志");

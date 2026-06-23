@@ -1,19 +1,19 @@
 <!--
-  注意：这是 ZcChat2 的个人分支版本，由 Mandarin715 维护。
+  注意：这是 Mandarin（原名 ZcChat2）的个人分支版本，由 Mandarin715 维护。
   原项目地址：https://github.com/Zao-chen/ZcChat2
 -->
 
 > [!NOTE]
 > 📱 ZcChat2 的 [移动端版本](https://github.com/Zao-chen/ZcChat2ForMobile) 已同步上线！
 
-# ZcChat2 — AI 桌面宠物
+# Mandarin — AI 桌面宠物
 
-🌟 一个模仿 Galgame 演出效果的 AI 桌宠，基于 [ZcChat](https://github.com/Zao-chen/ZcChat) 的重制版，由 [Mandarin715](https://github.com/Mandarin715) 维护并持续扩展。
+🌟 一个模仿 Galgame 演出效果的 AI 桌宠，基于 [ZcChat](https://github.com/Zao-chen/ZcChat) 的重制版（原项目 ZcChat2），由 [Mandarin715](https://github.com/Mandarin715) 维护并持续扩展。
 
 <img width="1045" height="593" alt="screenshot" src="https://github.com/user-attachments/assets/49439b92-308f-4ecd-b8cc-a1538153752c" />
 
-[![GitHub Release](https://img.shields.io/github/v/release/Mandarin715/ZcChat2?color=22c55e&style=for-the-badge)](https://github.com/Mandarin715/ZcChat2/releases)
-[![GitHub License](https://img.shields.io/github/license/Mandarin715/ZcChat2?color=ef4444&style=for-the-badge)](LICENSE)
+[![GitHub Release](https://img.shields.io/github/v/release/Mandarin715/Mandarin?color=22c55e&style=for-the-badge)](https://github.com/Mandarin715/Mandarin/releases)
+[![GitHub License](https://img.shields.io/github/license/Mandarin715/Mandarin?color=ef4444&style=for-the-badge)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-6366f1?style=for-the-badge)]()
 
 > 本项目是 [Zao-chen/ZcChat2](https://github.com/Zao-chen/ZcChat2) 的独立分支，在原有功能基础上增加了长期记忆等特性。上游项目的文档与社区资源同样适用于本分支。
@@ -71,8 +71,8 @@
 
 ### Step 1：安装
 
-1. 在 [Release](https://github.com/Mandarin715/ZcChat2/releases) 下载最新版本
-2. 运行 ZcChat2
+1. 在 [Release](https://github.com/Mandarin715/Mandarin/releases) 下载最新版本
+2. 运行 Mandarin
 
 ### Step 2：导入角色
 
@@ -108,7 +108,7 @@
 - **用户个人信息** — 名字、喜好、习惯、职业等，以键值对形式存储
 - **求助历史** — 用户曾寻求的帮助/建议，保留最近 20 条摘要
 
-记忆数据存储在 `Documents/ZcChat2/Character/UserConfig/<角色名>/memory.json`，在后续对话中自动注入系统提示词，让角色越来越了解你。
+记忆数据存储在 `Documents/Mandarin/Character/UserConfig/<角色名>/memory.json`，在后续对话中自动注入系统提示词，让角色越来越了解你。
 
 > 记忆提取在后台异步完成，不影响对话响应速度。
 
@@ -119,7 +119,7 @@
 欢迎任何形式的贡献：
 
 - **提交 PR** — 改进代码、修复 Bug、新增功能
-- **报告问题** — 通过 [Issues](https://github.com/Mandarin715/ZcChat2/issues) 提交 Bug 或功能建议
+- **报告问题** — 通过 [Issues](https://github.com/Mandarin715/Mandarin/issues) 提交 Bug 或功能建议
 - **分享角色** — 在 [Discussions](https://github.com/Zao-chen/ZcChat2/discussions/categories/%E8%A7%92%E8%89%B2%E5%88%86%E4%BA%AB) 分享自创角色
 - **Star ⭐** — 觉得有用就点个 Star 吧
 

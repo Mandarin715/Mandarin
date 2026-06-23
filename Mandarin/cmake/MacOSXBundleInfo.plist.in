@@ -40,6 +40,6 @@
 	<true/>
 
 	<key>NSMicrophoneUsageDescription</key>
-	<string>ZcChat2 需要使用麦克风来录制语音输入并进行语音识别。</string>
+	<string>Mandarin 需要使用麦克风来录制语音输入并进行语音识别。</string>
 </dict>
 </plist>
