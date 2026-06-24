@@ -90,7 +90,7 @@ elseif(EXISTS "${ZCAILIB_EXTERNAL_ROOT}/build/Release/ZcAiLib.lib" AND EXISTS "$
 endif()
 
 if(APPLE)
-    function(zcchat2_pick_mac_lib out_var dylib_path static_path)
+    function(mandarin_pick_mac_lib out_var dylib_path static_path)
         if(EXISTS "${dylib_path}")
             set(${out_var} "${dylib_path}" PARENT_SCOPE)
         elseif(EXISTS "${static_path}")
@@ -100,16 +100,16 @@ if(APPLE)
         endif()
     endfunction()
 
-    zcchat2_pick_mac_lib(ZCAILIB_MAC_LIB
+    mandarin_pick_mac_lib(ZCAILIB_MAC_LIB
         "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ZcAILib/lib/libZcAiLib.dylib"
         "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ZcAILib/lib/libZcAiLib.a")
-    zcchat2_pick_mac_lib(ZCJSONLIB_MAC_LIB
+    mandarin_pick_mac_lib(ZCJSONLIB_MAC_LIB
         "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ZcJsonLib/lib/libZcJsonLib.dylib"
         "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ZcJsonLib/lib/libZcJsonLib.a")
-    zcchat2_pick_mac_lib(ZCWIDGETTOOLS_MAC_LIB
+    mandarin_pick_mac_lib(ZCWIDGETTOOLS_MAC_LIB
         "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ZcWidgetTools/lib/libZcWidgetTools.dylib"
         "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ZcWidgetTools/lib/libZcWidgetTools.a")
-    zcchat2_pick_mac_lib(ELAWIDGETTOOLS_MAC_LIB
+    mandarin_pick_mac_lib(ELAWIDGETTOOLS_MAC_LIB
         "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ElaWidgetTools/lib/libElaWidgetTools.dylib"
         "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ElaWidgetTools/lib/libElaWidgetTools.a")
 endif()
@@ -202,25 +202,25 @@ if(APPLE)
     set_target_properties(Mandarin PROPERTIES
         MACOSX_BUNDLE TRUE
         MACOSX_BUNDLE_BUNDLE_NAME "Mandarin"
-        MACOSX_BUNDLE_GUI_IDENTIFIER "com.zaochen.zcchat2"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "com.mandarin715.mandarin"
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/cmake/MacOSXBundleInfo.plist.in"
         BUILD_RPATH "@executable_path/../Frameworks"
         INSTALL_RPATH "@executable_path/../Frameworks"
     )
 
-    set(ZCCHAT2_MAC_DYLIBS "")
+    set(MANDARIN_MAC_DYLIBS "")
     foreach(mac_lib ${ZCAILIB_MAC_LIB} ${ZCJSONLIB_MAC_LIB} ${ZCWIDGETTOOLS_MAC_LIB} ${ELAWIDGETTOOLS_MAC_LIB})
         if(mac_lib MATCHES "\\.dylib$")
-            list(APPEND ZCCHAT2_MAC_DYLIBS "${mac_lib}")
+            list(APPEND MANDARIN_MAC_DYLIBS "${mac_lib}")
         endif()
     endforeach()
 
-    if(ZCCHAT2_MAC_DYLIBS)
+    if(MANDARIN_MAC_DYLIBS)
         add_custom_command(TARGET Mandarin POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory
                 "$<TARGET_BUNDLE_DIR:Mandarin>/Contents/Frameworks"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                ${ZCCHAT2_MAC_DYLIBS}
+                ${MANDARIN_MAC_DYLIBS}
                 "$<TARGET_BUNDLE_DIR:Mandarin>/Contents/Frameworks"
             VERBATIM
         )
@@ -252,6 +252,15 @@ if(WIN32)
             $<TARGET_FILE_DIR:Mandarin>
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/sherpa-onnx/bin/onnxruntime_providers_shared.dll
+            $<TARGET_FILE_DIR:Mandarin>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ElaWidgetTools/bin/elawidgettools.dll
+            $<TARGET_FILE_DIR:Mandarin>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ZcWidgetTools/bin/ZcWidgetTools.dll
+            $<TARGET_FILE_DIR:Mandarin>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ZcJsonLib/bin/ZcJsonLib.dll
             $<TARGET_FILE_DIR:Mandarin>
     )
 endif()

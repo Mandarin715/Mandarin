@@ -76,7 +76,7 @@ Mandarin/
 
 ### 提交流程
 
-1. [Fork](https://github.com/Zao-chen/ZcChat2/fork)仓库
+1. [Fork](https://github.com/Mandarin715/Mandarin/fork)仓库
 2. 创建分支，推荐使用 `类型/描述` 的命名方式
 3. 完成修改和提交
-4. 提交 [Pull requests ](https://github.com/Zao-chen/ZcChat2/pulls)
+4. 提交 [Pull requests ](https://github.com/Mandarin715/Mandarin/pulls)

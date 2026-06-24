@@ -5,6 +5,7 @@
 
 #include <QDir>
 #include <QFile>
+#include <QUrl>
 #include <QFileInfo>
 #include <QHeaderView>
 #include <QJsonArray>
@@ -35,19 +36,19 @@ SettingChild_About::SettingChild_About(QWidget *parent)
     ui->label_version->setText(" v" + m_localVersion);
 
     ui->pushButton->setUrl("https://github.com/Mandarin715/Mandarin");
-    //沿用旧版ZcChat的GitHub图标
+    //GitHub图标
     ui->pushButton->setCardPixmap(QPixmap(":/res/img/ico/github-mark.svg"));
     ui->pushButton->setTitle("GitHub");
     ui->pushButton->setSubTitle("项目主页、源码、Release 和文档入口");
 
     ui->pushButton_2->setUrl("https://github.com/Mandarin715/Mandarin/issues/new/choose");
-    //沿用旧版ZcChat的Issue图标
+    //Issue图标
     ui->pushButton_2->setCardPixmap(QPixmap(":/res/img/ico/circle-dot-regular.svg"));
     ui->pushButton_2->setTitle("Issue");
     ui->pushButton_2->setSubTitle("反馈 Bug、需求和使用问题");
 
-    ui->pushButton_3->setUrl(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/Mandarin/log.txt");
-    //沿用旧版ZcChat的软件日志图标
+    ui->pushButton_3->setUrl(QUrl::fromLocalFile(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/Mandarin/log.txt").toString());
+    //软件日志图标
     ui->pushButton_3->setCardPixmap(QPixmap(":/res/img/ico/file-solid.svg"));
     ui->pushButton_3->setTitle("软件日志");
     ui->pushButton_3->setSubTitle("用于排查运行问题的本地日志文件");

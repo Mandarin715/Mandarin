@@ -7,6 +7,7 @@
 #include <QJsonObject>
 #include <QMoveEvent>
 #include <QStringList>
+#include <QTimer>
 #include <QWidget>
 
 class QAudioOutput;
