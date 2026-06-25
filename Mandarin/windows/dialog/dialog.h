@@ -2,6 +2,7 @@
 #define DIALOG_H
 
 #include "AiProvider.h"
+#include <QDateTime>
 #include <QEvent>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -103,7 +104,7 @@ class Dialog : public QWidget
     // 连续对话模式独立快捷键
     bool m_continuousHotkeyEnabled = false;
     quint32 m_continuousHotkeyNativeKey = 0;
-    int m_continuousAudioDelayMs = 2500;
+    int m_continuousAudioDelayMs = 800;
     bool m_continuousMode = false;
     QTimer *m_continuousSilenceTimer = nullptr;
     void enterContinuousMode();
@@ -117,6 +118,9 @@ class Dialog : public QWidget
     bool m_vitsRequestInFlight = false;
     QNetworkAccessManager *m_vitsManager = nullptr;
     QMediaPlayer *m_vitsPlayer = nullptr;
+    QString m_cachedVitsApiUrl;
+    QString m_cachedVitsModel;
+    QString m_cachedVitsSpeaker;
     QAudioOutput *m_vitsAudioOutput = nullptr;
     QTemporaryFile *m_vitsTempFile = nullptr;
     void tryStartNextVitsPlayback();
@@ -156,6 +160,13 @@ class Dialog : public QWidget
     void initWakeWord();
     void startWakeWord();
     void stopWakeWord();
+    // 百度Token缓存
+    QString m_cachedBaiduToken;
+    QDateTime m_baiduTokenExpiry;
+    // 上下文历史延迟写入
+    QTimer *m_contextSaveTimer = nullptr;
+    bool m_contextDirty = false;
+    void scheduleContextSave();
     void onWakeWordDetected(const QString &keyword);
     // 应用调用
     QJsonArray m_cachedAppCommands;

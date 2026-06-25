@@ -239,6 +239,25 @@ void Dialog::saveContextHistory() const
     contextConfig.setValue("history", QJsonValue(historyArray));
 }
 
+void Dialog::scheduleContextSave()
+{
+    m_contextDirty = true;
+    if (!m_contextSaveTimer)
+    {
+        m_contextSaveTimer = new QTimer(this);
+        m_contextSaveTimer->setSingleShot(true);
+        m_contextSaveTimer->setInterval(2000);
+        connect(m_contextSaveTimer, &QTimer::timeout, this, [this]() {
+            if (m_contextDirty)
+            {
+                saveContextHistory();
+                m_contextDirty = false;
+            }
+        });
+    }
+    m_contextSaveTimer->start();
+}
+
 /*停止当前对话的残留状态*/
 void Dialog::stopPendingConversationState()
 {
@@ -282,12 +301,13 @@ Dialog::Dialog(QWidget *parent)
     ai = new AiProvider(this);
     ai->setStreamEnabled(true);
 
-    // 流式显示防抖定时器：合并50ms内的chunk再更新UI
+    // 流式显示定时器：100ms固定间隔更新，不再被快速chunk重置
     m_streamDisplayTimer = new QTimer(this);
-    m_streamDisplayTimer->setSingleShot(true);
-    m_streamDisplayTimer->setInterval(50);
+    m_streamDisplayTimer->setSingleShot(false);
+    m_streamDisplayTimer->setInterval(100);
     connect(m_streamDisplayTimer, &QTimer::timeout, this, [this]() {
-        ui->textEdit->setText(m_streamDisplayedChinese);
+        if (!m_streamDisplayedChinese.isEmpty())
+            ui->textEdit->setText(m_streamDisplayedChinese);
     });
 
     /*Vits初始化*/
@@ -349,7 +369,7 @@ Dialog::Dialog(QWidget *parent)
     ReloadAIConfig();
     ReloadGeneralConfig();
     ReloadSpeechInputConfig();
-    initWakeWord();
+    QTimer::singleShot(100, this, &Dialog::initWakeWord); // 延迟加载ONNX模型，不阻塞首帧
 
     // 轮询定时器：每100ms读取音频+检测语音活动，25帧(2.5秒)无声音自动停止
     m_silencePollTimer = new QTimer(this);
@@ -419,8 +439,7 @@ Dialog::Dialog(QWidget *parent)
     ReloadContinuousHotkeyConfig();
     ReloadScreenCaptureConfig();
     ReloadAppLauncherConfig();
-    loadContextHistory();
-    loadMemory();
+    // loadContextHistory/loadMemory 已在 ReloadAIConfig() 中调用，不重复
 
     //接收分块回复
     connect(ai, &AiProvider::replyChunkReceived, [=](const QString &chunk)
@@ -445,8 +464,8 @@ Dialog::Dialog(QWidget *parent)
                     chinesePartial != m_streamDisplayedChinese)
                 {
                     m_streamDisplayedChinese = chinesePartial;
-                    // 防抖：50ms内的chunk合并后再更新UI
-                    m_streamDisplayTimer->start();
+                    if (!m_streamDisplayTimer->isActive())
+                        m_streamDisplayTimer->start();
                 }
 
                 /*第二个分隔符处理*/
@@ -533,7 +552,7 @@ Dialog::Dialog(QWidget *parent)
                     m_lastUserInput.clear();
                 }
                 appendHistoryLine(QStringLiteral("角色：") + chineseReply);
-                saveContextHistory();
+                scheduleContextSave();
 
                 // 延迟提取记忆：让VITS语音合成请求先发出，避免争抢网络
                 if (!capturedUserInput.isEmpty())
@@ -887,7 +906,7 @@ void Dialog::rewindToHistoryIndex(int historyIndex)
     //先停掉当前会话残留，再把历史截断到目标位置
     stopPendingConversationState();
     m_contextHistory = m_contextHistory.mid(0, historyIndex + 1);
-    saveContextHistory();
+    scheduleContextSave();
 
     const QString selectedLine = m_contextHistory.at(historyIndex);
     if (selectedLine.startsWith(QStringLiteral("用户：")))
@@ -923,7 +942,7 @@ void Dialog::deleteHistoryItem(int historyIndex)
         return;
 
     m_contextHistory.removeAt(historyIndex);
-    saveContextHistory();
+    scheduleContextSave();
 
     // 刷新历史窗口
     if (historyWin && isHistoryOpen)
@@ -1017,26 +1036,15 @@ void Dialog::tryStartNextVitsRequest()
     if (text.isEmpty())
         return;
 
-    /*请求地址构建*/
-    //获取地址
-    ZcJsonLib config(JsonSettingPath);
-    QString apiUrl = config.value("vits/ApiUrl").toString();
-    //获取选中模型
-    ZcJsonLib charConfig(ReadCharacterUserConfigPath());
-    QString modelAndSpeaker = charConfig.value("vitsMasSelect").toString();
-    QString model =
-        modelAndSpeaker.section(" - ", 0, 0).trimmed().toLower(); //提取模型名
-    QString speaker =
-        modelAndSpeaker.section(" - ", 2, 2).trimmed(); //提取说话人
-    //构建请求 URL，对文本进行 URL 编码
-    QString urlString = QString(apiUrl + "/voice/%2?id=%3&text=%1")
-                            .arg(QString(QUrl::toPercentEncoding(text)))
-                            .arg(QString(QUrl::toPercentEncoding(model)))
-                            .arg(QString(QUrl::toPercentEncoding(speaker)));
-    qInfo() << "语音合成请求到" << modelAndSpeaker;
-
+    /*请求地址构建（使用缓存配置，避免每句话重复读文件）*/
+    QString urlString =
+        QString(m_cachedVitsApiUrl + "/voice/%2?id=%3&text=%1")
+            .arg(QString(QUrl::toPercentEncoding(text)))
+            .arg(QString(QUrl::toPercentEncoding(m_cachedVitsModel)))
+            .arg(QString(QUrl::toPercentEncoding(m_cachedVitsSpeaker)));
     m_vitsRequestInFlight = true;
     QNetworkRequest request(urlString);
+    request.setTransferTimeout(15000); // 15秒超时，防止VITS挂死
     //发送 GET 请求
     QNetworkReply *reply = m_vitsManager->get(request);
     //连接信号处理响应
@@ -1234,6 +1242,11 @@ skipPromptBuild:
     ZcJsonLib config(JsonSettingPath);
     m_streamVitsSentenceSplitEnabled =
         config.value("vits/SentenceSplit", true).toBool();
+    // 缓存VITS配置，避免每句话重复读文件
+    m_cachedVitsApiUrl = config.value("vits/ApiUrl").toString();
+    QString modelAndSpeaker = charConfig.value("vitsMasSelect").toString();
+    m_cachedVitsModel = modelAndSpeaker.section(" - ", 0, 0).trimmed().toLower();
+    m_cachedVitsSpeaker = modelAndSpeaker.section(" - ", 2, 2).trimmed();
     m_streamRawReply.clear();
     m_streamDisplayedChinese.clear();
     m_streamSynthCursor = 0;
@@ -1448,7 +1461,7 @@ void Dialog::stopSpeechRecording()
     ui->textEdit->setEnabled(true);
     ui->textEdit->setText(recognizedText);
     if (ui->checkBox_autoInput->isChecked() || m_continuousMode)
-        submitCurrentInput();
+        QTimer::singleShot(600, this, &Dialog::submitCurrentInput); // 600ms预览窗口
 }
 
 /*连续对话模式：进入*/
@@ -1503,6 +1516,14 @@ QString Dialog::requestBaiduAccessToken(const QString &apiKey,
     if (apiKey.trimmed().isEmpty() || secretKey.trimmed().isEmpty())
         return QString();
 
+    // 缓存Token：30天有效期，避免每次语音识别都请求OAuth
+    if (!m_cachedBaiduToken.isEmpty() &&
+        m_baiduTokenExpiry.isValid() &&
+        QDateTime::currentDateTime() < m_baiduTokenExpiry)
+    {
+        return m_cachedBaiduToken;
+    }
+
     QNetworkAccessManager manager;
     QUrl url("https://aip.baidubce.com/oauth/2.0/token");
     QUrlQuery query;
@@ -1529,6 +1550,12 @@ QString Dialog::requestBaiduAccessToken(const QString &apiKey,
                 reply->deleteLater();
                 loop.quit(); });
     loop.exec();
+    // 缓存获取到的Token，30天有效期（百度默认）
+    if (!accessToken.isEmpty())
+    {
+        m_cachedBaiduToken = accessToken;
+        m_baiduTokenExpiry = QDateTime::currentDateTime().addDays(29);
+    }
     return accessToken;
 }
 
@@ -2299,7 +2326,7 @@ void Dialog::compressContextHistory()
                 {
                     m_contextHistory.prepend(
                         QStringLiteral("角色：[对话摘要] ") + summary);
-                    saveContextHistory();
+                    scheduleContextSave();
                 }
                 else
                 {

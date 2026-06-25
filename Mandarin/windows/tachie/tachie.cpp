@@ -269,7 +269,7 @@ void Tachie::TryPlayAnimationForAction(const QString &actionName)
 
             QVariantAnimation *moveAnim = new QVariantAnimation(seq);
             moveAnim->setDuration(durationMs);
-            moveAnim->setEasingCurve(QEasingCurve::Linear);
+            moveAnim->setEasingCurve(QEasingCurve::InOutQuad);
             moveAnim->setStartValue(0.0);
             moveAnim->setEndValue(1.0);
             connect(moveAnim, &QVariantAnimation::valueChanged, this,
@@ -295,7 +295,7 @@ void Tachie::TryPlayAnimationForAction(const QString &actionName)
             QPropertyAnimation *opacityAnim =
                 new QPropertyAnimation(this, "windowOpacity", seq);
             opacityAnim->setDuration(durationMs);
-            opacityAnim->setEasingCurve(QEasingCurve::Linear);
+            opacityAnim->setEasingCurve(QEasingCurve::InOutQuad);
             opacityAnim->setStartValue(step.from);
             opacityAnim->setEndValue(step.to);
             seq->addAnimation(opacityAnim);
@@ -306,7 +306,7 @@ void Tachie::TryPlayAnimationForAction(const QString &actionName)
         {
             QVariantAnimation *scaleAnim = new QVariantAnimation(seq);
             scaleAnim->setDuration(durationMs);
-            scaleAnim->setEasingCurve(QEasingCurve::Linear);
+            scaleAnim->setEasingCurve(QEasingCurve::InOutQuad);
             scaleAnim->setStartValue(step.scaleFrom);
             scaleAnim->setEndValue(step.scaleTo);
 
