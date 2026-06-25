@@ -78,8 +78,6 @@ class Dialog : public QWidget
     /*主逻辑*/
     void initWindow();
     //历史
-    void handleWheelUp();
-    void handleWheelDown();
     void loadContextHistory(); //加载上下文历史
     void saveContextHistory() const;
     void stopPendingConversationState();

@@ -178,17 +178,6 @@ void Dialog::ReloadGeneralConfig()
     }
 }
 
-/*打开关闭历史记录*/
-void Dialog::handleWheelUp()
-{
-    if (!isHistoryOpen)
-        ui->pushButton_history->click();
-}
-void Dialog::handleWheelDown()
-{
-    if (isHistoryOpen)
-        ui->pushButton_history->click();
-}
 
 /*加载上下文历史*/
 void Dialog::loadContextHistory()
@@ -966,26 +955,12 @@ void Dialog::moveEvent(QMoveEvent *event)
 /*滚动窗口*/
 void Dialog::wheelEvent(QWheelEvent *event)
 {
-    if (event->angleDelta().y() > 0)
-        handleWheelUp();
-    else if (event->angleDelta().y() < 0)
-        handleWheelDown();
     QWidget::wheelEvent(event);
 }
 
 /*拦截普通的滚动*/
 bool Dialog::eventFilter(QObject *watched, QEvent *event)
 {
-    if ((watched == ui->textEdit || watched == ui->textEdit->viewport()) &&
-        event->type() == QEvent::Wheel)
-    {
-        QWheelEvent *wheelEvent = static_cast<QWheelEvent *>(event);
-        if (wheelEvent->angleDelta().y() > 0)
-            handleWheelUp();
-        else if (wheelEvent->angleDelta().y() < 0)
-            handleWheelDown();
-        return true;
-    }
     return QWidget::eventFilter(watched, event);
 }
 
