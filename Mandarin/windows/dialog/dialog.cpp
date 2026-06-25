@@ -961,6 +961,16 @@ void Dialog::wheelEvent(QWheelEvent *event)
 /*拦截普通的滚动*/
 bool Dialog::eventFilter(QObject *watched, QEvent *event)
 {
+    if ((watched == ui->textEdit || watched == ui->textEdit->viewport()) &&
+        event->type() == QEvent::Wheel && isHistoryOpen)
+    {
+        QWheelEvent *wheelEvent = static_cast<QWheelEvent *>(event);
+        if (wheelEvent->angleDelta().y() < 0)
+        {
+            ui->pushButton_history->click();
+            return true;
+        }
+    }
     return QWidget::eventFilter(watched, event);
 }
 
