@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(Mandarin VERSION 1.6.0 LANGUAGES CXX)
+project(Mandarin VERSION 1.6.2 LANGUAGES CXX)
 
 if(APPLE)
     set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "Build universal binaries")
