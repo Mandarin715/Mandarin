@@ -1,46 +1,94 @@
-# Large binary files
-*.zip
-*.exe
-*.lnk
-*.pth
-*.dll
-*.lib
-*.a
-*.dylib
-*.ttf
-*.png
-*.jpg
-*.jpeg
+# This file is used to ignore files which are generated
+# ----------------------------------------------------------------------------
 
-# Python runtime (huge)
-vits-simple-api-windows-cpu-v0.6.16/
-
-# Build artifacts
-build/
-build2/
-dist/
-__pycache__/
-*.pyc
-*.obj
-*.o
+*~
+*.autosave
+*.core
 *.moc
-*.ui_qmake
-Makefile
-*.pro.user
-
-# IDE
-.vscode/
-.idea/
-
-# OS
+*.o
+*.obj
+*.orig
+*.rej
+*.so
+*.so.*
+*_pch.h.cpp
+*_resource.rc
+*.qm
+.#*
+*.*#
+core
+!core/
+tags
 .DS_Store
-Thumbs.db
-
-# Qt specific
+.directory
+*.debug
+Makefile*
+*.prl
+*.app
 moc_*.cpp
 ui_*.h
 qrc_*.cpp
+Thumbs.db
+*.res
+*.rc
+/.qmake.cache
+/.qmake.stash
+
+# qtcreator generated files
+*.pro.user*
+*.qbs.user*
+CMakeLists.txt.user*
+
+# xemacs temporary files
+*.flc
+
+# Vim temporary files
+.*.swp
+
+# Visual Studio generated files
+*.ib_pdb_index
+*.idb
+*.ilk
+*.pdb
+*.sln
+*.suo
+*.vcproj
+*vcproj.*.*.user
+*.ncb
+*.sdf
+*.opensdf
+*.vcxproj
+*vcxproj.*
+
+# MinGW generated files
+*.Debug
+*.Release
+
+# Python byte code
+*.pyc
+
+# Binaries
+# --------
+*.exe
+
+# Directories with generated files
+.moc/
+.obj/
+.pch/
+.rcc/
+.uic/
+/build*/
+
+#clangd cache/index
+.cache/
+.cache/clangd/
+.cache/clangd/index/
+.vscode/
+# VITS service (external dependency)
+vits-simple-api*/
+
+# Temp files
 _temp_bak/
-_temp_bak/
-实验报告*.docx
-~.docx
+
+# Office temp files
+~$*.docx
