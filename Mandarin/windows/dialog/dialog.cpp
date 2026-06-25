@@ -971,24 +971,41 @@ void Dialog::moveEvent(QMoveEvent *event)
     QWidget::moveEvent(event);
 }
 
-/*滚动窗口*/
+/*滚动窗口：滚轮驱动自定义滚动条，实现聊天内容滚动*/
 void Dialog::wheelEvent(QWheelEvent *event)
 {
-    QWidget::wheelEvent(event);
+    const int delta = event->angleDelta().y();
+    if (delta != 0)
+    {
+        int newVal = ui->verticalScrollBar->value() - delta / 120;
+        ui->verticalScrollBar->setValue(newVal);
+    }
+    event->accept();
 }
 
 /*拦截普通的滚动*/
 bool Dialog::eventFilter(QObject *watched, QEvent *event)
 {
     if ((watched == ui->textEdit || watched == ui->textEdit->viewport()) &&
-        event->type() == QEvent::Wheel && isHistoryOpen)
+        event->type() == QEvent::Wheel)
     {
-        QWheelEvent *wheelEvent = static_cast<QWheelEvent *>(event);
-        if (wheelEvent->angleDelta().y() < 0)
+        if (isHistoryOpen)
         {
-            ui->pushButton_history->click();
-            return true;
+            QWheelEvent *wheelEvent = static_cast<QWheelEvent *>(event);
+            if (wheelEvent->angleDelta().y() < 0)
+            {
+                ui->pushButton_history->click();
+                return true;
+            }
         }
+        // 将滚轮转为自定义滚动条值，实现内容滚动
+        const int delta = static_cast<QWheelEvent *>(event)->angleDelta().y();
+        if (delta != 0)
+        {
+            int newVal = ui->verticalScrollBar->value() - delta / 120;
+            ui->verticalScrollBar->setValue(newVal);
+        }
+        return true;
     }
     return QWidget::eventFilter(watched, event);
 }

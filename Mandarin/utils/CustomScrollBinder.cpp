@@ -55,4 +55,13 @@ CustomScrollBinder::CustomScrollBinder(
                 QSignalBlocker blocker(m_customScrollBar);
                 m_customScrollBar->setValue(value / m_scale);
             });
+
+    //自定义滚动条 → textEdit（支持滚轮驱动）
+    connect(m_customScrollBar, &QScrollBar::valueChanged, this,
+            [=](int value)
+            {
+                const QSignalBlocker blocker(scroll);
+                scroll->setValue(value * m_scale);
+                m_textEdit->viewport()->update();
+            });
 }
