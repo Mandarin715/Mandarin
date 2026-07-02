@@ -100,6 +100,19 @@ static int findNextSentenceEnd(const QString &text, int start)
     return -1;
 }
 
+// 需要附加本地城市名的查询关键词
+static const QStringList kLocationDependentKeywords = {
+    QStringLiteral("天气"), QStringLiteral("新闻"), QStringLiteral("附近"),
+    QStringLiteral("本地"), QStringLiteral("周边"), QStringLiteral("今天"),
+    QStringLiteral("今日"), QStringLiteral("现在"), QStringLiteral("当前"),
+    QStringLiteral("实时"), QStringLiteral("房价"), QStringLiteral("招聘"),
+    QStringLiteral("外卖"), QStringLiteral("快递"), QStringLiteral("美食"),
+    QStringLiteral("医院"), QStringLiteral("银行"), QStringLiteral("药店"),
+    QStringLiteral("超市"), QStringLiteral("商场"), QStringLiteral("电影院"),
+    QStringLiteral("理发"), QStringLiteral("加油"), QStringLiteral("停车"),
+    QStringLiteral("景点"), QStringLiteral("酒店"),
+};
+
 /*窗口的绘制*/
 void Dialog::paintEvent(QPaintEvent *event)
 {
@@ -323,7 +336,15 @@ Dialog::Dialog(QWidget *parent)
             {
                 m_searchInFlight = false;
                 if (summary.isEmpty())
+                {
+                    // 防御：摘要为空时回退到纯文本对话，避免UI卡死
+                    if (!m_pendingSearchUserMessage.isEmpty())
+                    {
+                        doSubmitCurrentInput(m_pendingSearchUserMessage);
+                        m_pendingSearchUserMessage.clear();
+                    }
                     return;
+                }
                 // 搜索完成，将结果注入上下文并提交
                 doSubmitWithSearchContext(m_pendingSearchUserMessage, summary);
                 m_pendingSearchUserMessage.clear();
@@ -462,6 +483,7 @@ Dialog::Dialog(QWidget *parent)
     connect(m_continuousSilenceTimer, &QTimer::timeout, this, [this]() {
         qDebug() << "Continuous mode: 2-min silence timeout, exiting";
         exitContinuousMode();
+        setVisible(false);
     });
 
     ReloadContinuousHotkeyConfig();
@@ -823,6 +845,10 @@ void Dialog::ReloadContinuousHotkeyConfig()
 /*显示历史记录*/
 void Dialog::on_pushButton_history_clicked()
 {
+    // 重置静默计时器（历史记录也是交互）
+    if (m_continuousMode)
+        m_continuousSilenceTimer->start();
+
     if (!historyWin)
     {
         historyWin = new history(this);
@@ -1199,35 +1225,29 @@ bool Dialog::submitCurrentInput()
     }
 
     // 联网搜索关键词检测
-    qDebug() << "[Search] check - enabled:" << m_searchEnabled
-             << "providerEnabled:" << m_searchProvider->isEnabled()
-             << "input:" << userInput;
     if (m_searchEnabled && m_searchProvider->isEnabled())
     {
         const QStringList triggers = searchTriggerKeywords();
         bool searchTriggered = false;
-        QString matchedKw;
         for (const QString &kw : triggers)
         {
             if (userInput.contains(kw, Qt::CaseInsensitive))
             {
                 searchTriggered = true;
-                matchedKw = kw;
                 break;
             }
         }
-        qDebug() << "[Search] triggered:" << searchTriggered
-                 << "matched:" << matchedKw;
         if (searchTriggered)
         {
             const QString searchQuery = extractSearchQuery(userInput);
-            qDebug() << "[Search] query extracted:" << searchQuery;
-            if (!searchQuery.isEmpty())
+            // 如果提取的查询就是触发词本身（如只输入"搜索"），降级为普通对话
+            if (!searchQuery.isEmpty() &&
+                !searchTriggerKeywords().contains(searchQuery))
             {
                 m_lastUserInput = userInput;
                 ui->textEdit->setText(
                     QStringLiteral("正在搜索：%1……").arg(searchQuery));
-                executeSearch(searchQuery, userInput, false);
+                executeSearch(searchQuery, userInput);
                 return true;
             }
         }
@@ -2165,7 +2185,7 @@ void Dialog::ReloadAppLauncherConfig()
 /*屏幕捕获触发关键词*/
 QStringList Dialog::screenCaptureTriggerKeywords()
 {
-    return {
+    static const QStringList triggers = {
         QStringLiteral("看看屏幕"),   QStringLiteral("看下屏幕"),
         QStringLiteral("看一下屏幕"), QStringLiteral("看一眼屏幕"),
         QStringLiteral("帮我看看"),   QStringLiteral("帮我看看这个"),
@@ -2180,12 +2200,13 @@ QStringList Dialog::screenCaptureTriggerKeywords()
         QStringLiteral("看到了什么"), QStringLiteral("扫一眼"),
         QStringLiteral("识别屏幕"),
     };
+    return triggers;
 }
 
 /*联网搜索触发关键词*/
 QStringList Dialog::searchTriggerKeywords()
 {
-    return {
+    static const QStringList triggers = {
         QStringLiteral("搜索一下"), QStringLiteral("帮我搜"),
         QStringLiteral("帮我查查"), QStringLiteral("帮我查一下"),
         QStringLiteral("帮我查"),   QStringLiteral("帮我找"),
@@ -2196,6 +2217,7 @@ QStringList Dialog::searchTriggerKeywords()
         QStringLiteral("上网搜"),   QStringLiteral("搜搜看"),
         QStringLiteral("网上查查"), QStringLiteral("百度一下"),
     };
+    return triggers;
 }
 
 /*从用户输入中提取搜索查询内容（去掉触发关键词和语气助词）*/
@@ -2258,12 +2280,14 @@ QString Dialog::extractSearchQuery(const QString &userInput)
 }
 
 /*执行联网搜索*/
-void Dialog::executeSearch(const QString &query, const QString &userMessage,
-                           bool isAutoSearch)
+void Dialog::executeSearch(const QString &query, const QString &userMessage)
 {
-    Q_UNUSED(isAutoSearch)
     if (m_searchInFlight)
+    {
+        // 上一次搜索仍在进行中，降级为普通对话
+        doSubmitCurrentInput(userMessage);
         return;
+    }
 
     m_searchInFlight = true;
     m_pendingSearchUserMessage = userMessage;
@@ -2274,6 +2298,9 @@ void Dialog::executeSearch(const QString &query, const QString &userMessage,
 void Dialog::doSubmitWithSearchContext(const QString &userMessage,
                                        const QString &searchSummary)
 {
+    // 保存原始用户输入用于历史记录，避免搜索上下文污染对话历史
+    m_lastUserInput = userMessage;
+
     const QString enhancedInput =
         userMessage +
         QStringLiteral("\n\n[联网搜索结果]：\n") +
@@ -2365,6 +2392,7 @@ void Dialog::analyzeScreenWithVision(const QByteArray &imageBase64,
     if (apiKey.isEmpty())
     {
         qWarning() << "Vision API: no API key configured for screen capture";
+        m_visionInFlight = false;
         doSubmitCurrentInput(userMessage);
         return;
     }
@@ -2382,6 +2410,7 @@ void Dialog::analyzeScreenWithVision(const QByteArray &imageBase64,
         if (baseUrl.isEmpty())
         {
             qWarning() << "Vision API: Custom server selected but no BaseUrl configured";
+            m_visionInFlight = false;
             doSubmitCurrentInput(userMessage);
             return;
         }
@@ -2390,6 +2419,7 @@ void Dialog::analyzeScreenWithVision(const QByteArray &imageBase64,
     else
     {
         qWarning() << "Vision API: unknown server" << serverSelect;
+        m_visionInFlight = false;
         doSubmitCurrentInput(userMessage);
         return;
     }
@@ -2487,8 +2517,9 @@ void Dialog::analyzeScreenWithVision(const QByteArray &imageBase64,
 
                 // 自动联网搜索：屏幕捕获后根据分析结果搜索上下文
                 if (m_searchEnabled && m_searchAutoSearch &&
-                    m_searchProvider->isEnabled())
+                    m_searchProvider->isEnabled() && !m_searchInFlight)
                 {
+                    m_searchInFlight = true;
                     // 用视觉分析结果作为搜索查询
                     QString searchQuery = visionResult;
                     // 限制搜索查询长度（最多取前80字作为查询）
@@ -2568,7 +2599,6 @@ void Dialog::classifyAndSearch(const QString &userInput)
                 m_classifierInFlight = false;
 
                 const QString trimmed = reply.trimmed();
-                qDebug() << "[Classifier] reply:" << trimmed;
 
                 if (trimmed.startsWith("YES", Qt::CaseInsensitive))
                 {
@@ -2585,23 +2615,8 @@ void Dialog::classifyAndSearch(const QString &userInput)
                         // 仅当查询涉及本地信息时自动附加城市
                         if (!m_cachedLocation.isEmpty())
                         {
-                            static const QStringList kLocationKeywords = {
-                                QStringLiteral("天气"), QStringLiteral("新闻"),
-                                QStringLiteral("附近"), QStringLiteral("本地"),
-                                QStringLiteral("周边"), QStringLiteral("今天"),
-                                QStringLiteral("今日"), QStringLiteral("现在"),
-                                QStringLiteral("当前"), QStringLiteral("实时"),
-                                QStringLiteral("房价"), QStringLiteral("招聘"),
-                                QStringLiteral("外卖"), QStringLiteral("快递"),
-                                QStringLiteral("美食"), QStringLiteral("医院"),
-                                QStringLiteral("银行"), QStringLiteral("药店"),
-                                QStringLiteral("超市"), QStringLiteral("商场"),
-                                QStringLiteral("电影院"), QStringLiteral("理发"),
-                                QStringLiteral("加油"), QStringLiteral("停车"),
-                                QStringLiteral("景点"), QStringLiteral("酒店"),
-                            };
                             bool needsLocation = false;
-                            for (const QString &kw : kLocationKeywords)
+                            for (const QString &kw : kLocationDependentKeywords)
                             {
                                 if (searchQuery.contains(kw))
                                 {
@@ -2628,10 +2643,9 @@ void Dialog::classifyAndSearch(const QString &userInput)
                             }
                         }
 
-                        qDebug() << "[Classifier] auto-search:" << searchQuery;
                         ui->textEdit->setText(
                             QStringLiteral("正在搜索：%1……").arg(searchQuery));
-                        executeSearch(searchQuery, userInput, false);
+                        executeSearch(searchQuery, userInput);
                         return;
                     }
                 }
@@ -2657,6 +2671,7 @@ void Dialog::fetchLocation()
     QNetworkRequest request(
         QUrl("https://api.ip.sb/geoip"));
     request.setRawHeader("Accept", "application/json");
+    request.setTransferTimeout(5000); // 5秒超时
     QNetworkReply *reply = m_locationManager->get(request);
 
     connect(reply, &QNetworkReply::finished, this,
@@ -2667,7 +2682,7 @@ void Dialog::fetchLocation()
                 {
                     // 备选：尝试 ip-api.com
                     QNetworkRequest fallbackReq(
-                        QUrl("http://ip-api.com/json/?lang=zh-CN&fields=country,regionName,city,district"));
+                        QUrl("https://ip-api.com/json/?lang=zh-CN&fields=country,regionName,city,district"));
                     QNetworkReply *fallback = m_locationManager->get(fallbackReq);
                     connect(fallback, &QNetworkReply::finished, this,
                             [this, fallback]()
@@ -2864,19 +2879,21 @@ void Dialog::onWakeWordDetected(const QString &keyword)
     if (m_isSpeechRecording || m_isSpeechRecognizing)
         return;
 
-    // 停止唤醒检测，释放麦克风给录音使用
-    stopWakeWord();
-
-    // 恢复输入状态（AI回复残留文字清除）
-    ui->textEdit->setEnabled(true);
-    ui->pushButton_next->hide();
-    ui->textEdit->clear();
-
+    // 全部延迟到下一事件循环，避免在 audio callback 栈中 stop/delete
     QMetaObject::invokeMethod(
         this,
         [this]()
         {
-            startSpeechRecordingFromHotkey();
+            if (m_isSpeechRecording || m_isSpeechRecognizing)
+                return;
+            stopWakeWord();
+            // 隐藏状态下自动弹出聊天栏
+            if (!isVisible())
+                ToggleVisible();
+            ui->textEdit->setEnabled(true);
+            ui->pushButton_next->hide();
+            ui->textEdit->clear();
+            enterContinuousMode();
         },
         Qt::QueuedConnection);
 }

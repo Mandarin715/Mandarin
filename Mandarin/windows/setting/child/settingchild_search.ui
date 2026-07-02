@@ -156,7 +156,6 @@
   <customwidget><class>ElaScrollPageArea</class><extends>QWidget</extends><header>ElaScrollPageArea.h</header><container>1</container></customwidget>
   <customwidget><class>ZcStackedWidget</class><extends>QStackedWidget</extends><header>ZcStackedWidget.h</header><container>1</container></customwidget>
   <customwidget><class>ElaToggleSwitch</class><extends>QWidget</extends><header>ElaToggleSwitch.h</header></customwidget>
-  <customwidget><class>ElaComboBox</class><extends>QComboBox</extends><header>ElaComboBox.h</header></customwidget>
   <customwidget><class>ElaLineEdit</class><extends>QLineEdit</extends><header>ElaLineEdit.h</header></customwidget>
  </customwidgets>
  <resources/>

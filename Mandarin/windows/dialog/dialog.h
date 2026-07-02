@@ -196,8 +196,7 @@ class Dialog : public QWidget
     bool m_searchAutoSearch = false;
     bool m_searchInFlight = false;
     QString m_pendingSearchUserMessage;
-    void executeSearch(const QString &query, const QString &userMessage,
-                       bool isAutoSearch);
+    void executeSearch(const QString &query, const QString &userMessage);
     static QStringList searchTriggerKeywords();
     static QString extractSearchQuery(const QString &userInput);
     void doSubmitWithSearchContext(const QString &userMessage,
