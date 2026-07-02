@@ -8,6 +8,7 @@
 #include "child/settingchild_plugin.h"
 #include "child/settingchild_appLauncher.h"
 #include "child/settingchild_screenCapture.h"
+#include "child/settingchild_search.h"
 #include "child/settingchild_speech.h"
 #include "child/settingchild_vits.h"
 
@@ -29,6 +30,9 @@ MainWindow::MainWindow(Dialog *dialog, Tachie *tachie, QWidget *parent)
         new SettingChild_ScreenCapture(this);
     settingchild_screenCaptureWin->show();
     addPageNode("屏幕捕获", settingchild_screenCaptureWin, ElaIconType::Camera);
+    SettingChild_Search *settingchild_searchWin = new SettingChild_Search(this);
+    settingchild_searchWin->show();
+    addPageNode("联网搜索", settingchild_searchWin, ElaIconType::MagnifyingGlass);
     SettingChild_Speech *settingchild_speechWin = new SettingChild_Speech(this);
     settingchild_speechWin->show();
     addPageNode("语音输入", settingchild_speechWin, ElaIconType::Microphone);
@@ -70,6 +74,9 @@ MainWindow::MainWindow(Dialog *dialog, Tachie *tachie, QWidget *parent)
     connect(settingchild_screenCaptureWin,
             &SettingChild_ScreenCapture::screenCaptureConfigChanged,
             dialog, &Dialog::ReloadScreenCaptureConfig); //刷新屏幕捕获配置
+    connect(settingchild_searchWin,
+            &SettingChild_Search::searchConfigChanged,
+            dialog, &Dialog::ReloadSearchConfig); //刷新联网搜索配置
     connect(settingchild_speechWin, &SettingChild_Speech::speechConfigChanged,
             dialog, &Dialog::ReloadSpeechInputConfig); //刷新语音输入配置
     connect(settingchild_speechWin, &SettingChild_Speech::speechConfigChanged,

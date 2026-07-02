@@ -268,7 +268,7 @@ void Dialog::stopPendingConversationState()
     m_streamVitsEnabled = false;
     m_streamSynthCursor = 0;
     m_vitsPendingTexts.clear();
-    m_vitsRequestInFlight = false;
+    m_vitsInFlightCount = 0;
 
     for (QTemporaryFile *file : m_vitsReadyFiles)
     {
@@ -313,6 +313,34 @@ Dialog::Dialog(QWidget *parent)
     /*Vits初始化*/
     m_vitsManager = new QNetworkAccessManager(this);
     m_visionManager = new QNetworkAccessManager(this);
+    /*联网搜索初始化*/
+    m_searchProvider = new SearchProvider(this);
+    /*IP 定位初始化*/
+    m_locationManager = new QNetworkAccessManager(this);
+    fetchLocation();
+    connect(m_searchProvider, &SearchProvider::searchCompleted, this,
+            [this](const QList<SearchResult> &, const QString &summary)
+            {
+                m_searchInFlight = false;
+                if (summary.isEmpty())
+                    return;
+                // 搜索完成，将结果注入上下文并提交
+                doSubmitWithSearchContext(m_pendingSearchUserMessage, summary);
+                m_pendingSearchUserMessage.clear();
+            });
+    connect(m_searchProvider, &SearchProvider::searchFailed, this,
+            [this](const QString &error)
+            {
+                m_searchInFlight = false;
+                qWarning() << "Search failed:" << error
+                           << "- falling back to text-only mode";
+                // 搜索失败，回退到纯文本对话
+                if (!m_pendingSearchUserMessage.isEmpty())
+                {
+                    doSubmitCurrentInput(m_pendingSearchUserMessage);
+                    m_pendingSearchUserMessage.clear();
+                }
+            });
     m_vitsPlayer = new QMediaPlayer(this);
     m_vitsAudioOutput = new QAudioOutput(this);
     m_vitsPlayer->setAudioOutput(m_vitsAudioOutput);
@@ -348,7 +376,7 @@ Dialog::Dialog(QWidget *parent)
                                  << "| recording:" << m_isSpeechRecording
                                  << "| recognizing:" << m_isSpeechRecognizing
                                  << "| readyFiles:" << m_vitsReadyFiles.size()
-                                 << "| reqInFlight:" << m_vitsRequestInFlight;
+                                 << "| inFlight:" << m_vitsInFlightCount;
                         if (allDone && !m_isSpeechRecording && !m_isSpeechRecognizing)
                         {
                             qDebug() << "Continuous mode: VITS stopped, waiting"
@@ -571,8 +599,7 @@ Dialog::Dialog(QWidget *parent)
                     qDebug() << "[Continuous] replyReceived | allDone:" << allDone
                              << "| recording:" << m_isSpeechRecording
                              << "| recognizing:" << m_isSpeechRecognizing
-                             << "| readyFiles:" << m_vitsReadyFiles.size()
-                             << "| reqInFlight:" << m_vitsRequestInFlight;
+                                 << "| inFlight:" << m_vitsInFlightCount;
                     if (allDone && !m_isSpeechRecording && !m_isSpeechRecognizing)
                     {
                         qDebug() << "Continuous mode: no VITS audio, starting next recording";
@@ -689,6 +716,7 @@ void Dialog::ReloadAIConfig()
 
     loadContextHistory();
     loadMemory();
+    ReloadSearchConfig();
 }
 
 /*重载语音输入配置*/
@@ -1041,12 +1069,12 @@ void Dialog::VitsGetAndPlay(QString text)
     tryStartNextVitsRequest();
 }
 
-/*启动下一个Vits请求*/
+/*启动下一个Vits请求（支持最多2路并发合成）*/
 void Dialog::tryStartNextVitsRequest()
 {
     if (!m_vitsManager || !m_vitsPlayer)
         return;
-    if (m_vitsRequestInFlight || m_vitsPendingTexts.isEmpty())
+    if (m_vitsInFlightCount >= kVitsMaxConcurrent || m_vitsPendingTexts.isEmpty())
         return;
 
     const QString text = m_vitsPendingTexts.takeFirst();
@@ -1059,7 +1087,7 @@ void Dialog::tryStartNextVitsRequest()
             .arg(QString(QUrl::toPercentEncoding(text)))
             .arg(QString(QUrl::toPercentEncoding(m_cachedVitsModel)))
             .arg(QString(QUrl::toPercentEncoding(m_cachedVitsSpeaker)));
-    m_vitsRequestInFlight = true;
+    m_vitsInFlightCount++;
     QNetworkRequest request(urlString);
     request.setTransferTimeout(15000); // 15秒超时，防止VITS挂死
     //发送 GET 请求
@@ -1067,7 +1095,7 @@ void Dialog::tryStartNextVitsRequest()
     //连接信号处理响应
     QObject::connect(reply, &QNetworkReply::finished, this, [this, reply]()
                      {
-                         m_vitsRequestInFlight = false;
+                         m_vitsInFlightCount--;
 
                          if (reply->error() == QNetworkReply::NoError)
                          {
@@ -1092,7 +1120,7 @@ void Dialog::tryStartNextVitsRequest()
                          }
 
                          reply->deleteLater();
-                         //当前请求结束后立即尝试合成下一句，实现“合成前置”。
+                         // 当前请求结束后立即尝试启动更多并发合成
                          tryStartNextVitsRequest(); });
 }
 
@@ -1170,6 +1198,41 @@ bool Dialog::submitCurrentInput()
         }
     }
 
+    // 联网搜索关键词检测
+    qDebug() << "[Search] check - enabled:" << m_searchEnabled
+             << "providerEnabled:" << m_searchProvider->isEnabled()
+             << "input:" << userInput;
+    if (m_searchEnabled && m_searchProvider->isEnabled())
+    {
+        const QStringList triggers = searchTriggerKeywords();
+        bool searchTriggered = false;
+        QString matchedKw;
+        for (const QString &kw : triggers)
+        {
+            if (userInput.contains(kw, Qt::CaseInsensitive))
+            {
+                searchTriggered = true;
+                matchedKw = kw;
+                break;
+            }
+        }
+        qDebug() << "[Search] triggered:" << searchTriggered
+                 << "matched:" << matchedKw;
+        if (searchTriggered)
+        {
+            const QString searchQuery = extractSearchQuery(userInput);
+            qDebug() << "[Search] query extracted:" << searchQuery;
+            if (!searchQuery.isEmpty())
+            {
+                m_lastUserInput = userInput;
+                ui->textEdit->setText(
+                    QStringLiteral("正在搜索：%1……").arg(searchQuery));
+                executeSearch(searchQuery, userInput, false);
+                return true;
+            }
+        }
+    }
+
     // 应用调用关键词检测
     if (!m_cachedAppCommands.isEmpty())
     {
@@ -1189,6 +1252,14 @@ bool Dialog::submitCurrentInput()
                 return true;
             }
         }
+    }
+
+    // AI 搜索意图分类：无显式关键词时，让 AI 判断是否需要搜索
+    if (m_searchEnabled && m_searchProvider->isEnabled() &&
+        !m_classifierInFlight)
+    {
+        classifyAndSearch(userInput);
+        return true;
     }
 
     return doSubmitCurrentInput(userInput);
@@ -1231,6 +1302,11 @@ bool Dialog::doSubmitCurrentInput(const QString &userInput)
     if (!memoryContext.isEmpty())
         systemPrompt += memoryContext + QStringLiteral("\n\n");
 
+    // 注入位置信息
+    if (!m_cachedLocation.isEmpty())
+        systemPrompt += QStringLiteral("用户当前所在地：") + m_cachedLocation +
+                        QStringLiteral("\n\n");
+
     if (!characterPrompt.isEmpty())
         systemPrompt += QStringLiteral("角色设定：") + characterPrompt +
                         QStringLiteral("\n请始终保持该设定进行回复。\n\n");
@@ -1242,7 +1318,7 @@ bool Dialog::doSubmitCurrentInput(const QString &userInput)
         nameListStr + "\n" +
         QStringLiteral("2. 中文是桌宠此刻想表达的内容\n"
                        "3. 日语是中文内容的对应翻译\n"
-                       "4. 输出中不能有多余内容或解释，严格用“|”分隔\n\n"
+                       "4. 输出中不能有多余内容或解释，严格用\"|\"分隔\n\n"
                        "示例输出：\n"
                        "快乐|今天的天气真好呀！|今日はいい天気ですね！\n"
                        "生气|为什么一直打扰我！|なんでずっと邪魔するの！");
@@ -1274,7 +1350,7 @@ skipPromptBuild:
             file->deleteLater();
     }
     m_vitsReadyFiles.clear();
-    m_vitsRequestInFlight = false;
+    m_vitsInFlightCount = 0;
     if (m_vitsTempFile)
     {
         m_vitsTempFile->deleteLater();
@@ -1515,7 +1591,7 @@ void Dialog::exitContinuousMode()
 /*检查所有VITS音频是否播放完毕*/
 bool Dialog::isAllVitsDone() const
 {
-    return m_vitsReadyFiles.isEmpty() && !m_vitsRequestInFlight &&
+    return m_vitsReadyFiles.isEmpty() && m_vitsInFlightCount == 0 &&
            (!m_vitsPlayer ||
             m_vitsPlayer->playbackState() == QMediaPlayer::StoppedState);
 }
@@ -2051,6 +2127,33 @@ void Dialog::ReloadScreenCaptureConfig()
     ui->pushButton_screenCapture->setEnabled(m_screenCaptureEnabled);
 }
 
+/*重载联网搜索配置*/
+void Dialog::ReloadSearchConfig()
+{
+    ZcJsonLib config(JsonSettingPath);
+    m_searchEnabled = config.value("search/Enable", false).toBool();
+    m_searchAutoSearch = config.value("search/AutoSearch", true).toBool();
+
+    const QString apiKey = config.value("search/ApiKey").toString();
+    const QString secretKey = config.value("search/SecretKey").toString();
+    QString baseUrl = config.value("search/BaseUrl").toString();
+    // 如果未配置，默认使用百度千帆 AI 搜索
+    if (baseUrl.isEmpty())
+        baseUrl = QStringLiteral(
+            "https://qianfan.baidubce.com/v2/ai_search/web_search");
+
+    m_searchProvider->setEnabled(m_searchEnabled);
+    m_searchProvider->setApiKey(apiKey);
+    m_searchProvider->setSecretKey(secretKey);
+    m_searchProvider->setBaseUrl(baseUrl);
+
+    qDebug() << "[Search] Config reloaded - enabled:" << m_searchEnabled
+             << "autoSearch:" << m_searchAutoSearch
+             << "apiKey:" << (apiKey.isEmpty() ? "(empty)" : "(set)")
+             << "secretKey:" << (secretKey.isEmpty() ? "(empty)" : "(set)")
+             << "baseUrl:" << baseUrl;
+}
+
 /*应用调用配置重载*/
 void Dialog::ReloadAppLauncherConfig()
 {
@@ -2063,27 +2166,121 @@ void Dialog::ReloadAppLauncherConfig()
 QStringList Dialog::screenCaptureTriggerKeywords()
 {
     return {
-        QStringLiteral("看看屏幕"),
-        QStringLiteral("看下屏幕"),
-        QStringLiteral("帮我看看"),
-        QStringLiteral("看看这个"),
-        QStringLiteral("看下这个"),
-        QStringLiteral("看看这是什么"),
-        QStringLiteral("看看这是啥"),
-        QStringLiteral("看看我在干什么"),
-        QStringLiteral("看看我在干嘛"),
-        QStringLiteral("看这是什么"),
-        QStringLiteral("看这是啥"),
-        QStringLiteral("截图"),
-        QStringLiteral("屏幕截图"),
-        QStringLiteral("截屏"),
-        QStringLiteral("看屏幕"),
-        QStringLiteral("帮我看看这个"),
-        QStringLiteral("你可以看看"),
-        QStringLiteral("瞧瞧屏幕"),
-        QStringLiteral("瞧瞧这个"),
-        QStringLiteral("看到什么"),
+        QStringLiteral("看看屏幕"),   QStringLiteral("看下屏幕"),
+        QStringLiteral("看一下屏幕"), QStringLiteral("看一眼屏幕"),
+        QStringLiteral("帮我看看"),   QStringLiteral("帮我看看这个"),
+        QStringLiteral("看看这个"),   QStringLiteral("看下这个"),
+        QStringLiteral("看看这是什么"), QStringLiteral("看看这是啥"),
+        QStringLiteral("看看我在干什么"), QStringLiteral("看看我在干嘛"),
+        QStringLiteral("看这是什么"), QStringLiteral("看这是啥"),
+        QStringLiteral("截图"),       QStringLiteral("屏幕截图"),
+        QStringLiteral("截屏"),       QStringLiteral("看屏幕"),
+        QStringLiteral("你可以看看"), QStringLiteral("瞧瞧屏幕"),
+        QStringLiteral("瞧瞧这个"),   QStringLiteral("看到什么"),
+        QStringLiteral("看到了什么"), QStringLiteral("扫一眼"),
+        QStringLiteral("识别屏幕"),
     };
+}
+
+/*联网搜索触发关键词*/
+QStringList Dialog::searchTriggerKeywords()
+{
+    return {
+        QStringLiteral("搜索一下"), QStringLiteral("帮我搜"),
+        QStringLiteral("帮我查查"), QStringLiteral("帮我查一下"),
+        QStringLiteral("帮我查"),   QStringLiteral("帮我找"),
+        QStringLiteral("帮我找找"), QStringLiteral("找一下"),
+        QStringLiteral("搜一下"),   QStringLiteral("搜一搜"),
+        QStringLiteral("查一下"),   QStringLiteral("查一查"),
+        QStringLiteral("查查"),     QStringLiteral("搜索"),
+        QStringLiteral("上网搜"),   QStringLiteral("搜搜看"),
+        QStringLiteral("网上查查"), QStringLiteral("百度一下"),
+    };
+}
+
+/*从用户输入中提取搜索查询内容（去掉触发关键词和语气助词）*/
+QString Dialog::extractSearchQuery(const QString &userInput)
+{
+    QString query = userInput.trimmed();
+
+    // 先去掉触发关键词，取触发词后的内容
+    const QStringList triggers = searchTriggerKeywords();
+    for (const QString &kw : triggers)
+    {
+        const int kwPos = query.indexOf(kw);
+        if (kwPos >= 0)
+        {
+            const QString after =
+                query.mid(kwPos + kw.length()).trimmed();
+            if (!after.isEmpty())
+            {
+                query = after;
+                break; // 只匹配第一个触发词
+            }
+            else
+            {
+                // 触发词在末尾，取触发词前面的内容
+                const QString before = query.left(kwPos).trimmed();
+                if (!before.isEmpty())
+                    query = before;
+                break;
+            }
+        }
+    }
+
+    // 去掉常见的语气助词/填充词前缀
+    const QStringList fillerWords = {
+        QStringLiteral("一下"),   QStringLiteral("一哈"),
+        QStringLiteral("一下下"), QStringLiteral("下"),
+        QStringLiteral("这个"),   QStringLiteral("那个"),
+        QStringLiteral("什么是"), QStringLiteral("是什么"),
+        QStringLiteral("什么叫"), QStringLiteral("有没有"),
+        QStringLiteral("是谁"),   QStringLiteral("什么样"),
+        QStringLiteral("为什么"),
+    };
+    for (const QString &fw : fillerWords)
+    {
+        if (query.startsWith(fw))
+        {
+            query = query.mid(fw.length()).trimmed();
+            break;
+        }
+    }
+
+    // 去掉开头的标点符号和空格
+    while (!query.isEmpty() &&
+           (query.at(0).isPunct() || query.at(0).isSpace()))
+    {
+        query = query.mid(1).trimmed();
+    }
+
+    return query;
+}
+
+/*执行联网搜索*/
+void Dialog::executeSearch(const QString &query, const QString &userMessage,
+                           bool isAutoSearch)
+{
+    Q_UNUSED(isAutoSearch)
+    if (m_searchInFlight)
+        return;
+
+    m_searchInFlight = true;
+    m_pendingSearchUserMessage = userMessage;
+    m_searchProvider->search(query);
+}
+
+/*将搜索结果注入用户消息并提交对话*/
+void Dialog::doSubmitWithSearchContext(const QString &userMessage,
+                                       const QString &searchSummary)
+{
+    const QString enhancedInput =
+        userMessage +
+        QStringLiteral("\n\n[联网搜索结果]：\n") +
+        searchSummary +
+        QStringLiteral("\n请基于以上搜索结果来理解和回复用户的问题。");
+
+    doSubmitCurrentInput(enhancedInput);
 }
 
 /*截取屏幕并编码为JPEG base64*/
@@ -2203,6 +2400,7 @@ void Dialog::analyzeScreenWithVision(const QByteArray &imageBase64,
     textPart["type"] = "text";
     textPart["text"] = QStringLiteral(
         "请分析这张屏幕截图的内容，用中文简要描述你能看到什么。"
+        "如果涉及具体的游戏、软件、网站、影视作品或知名内容，请明确指出其名称。"
         "如果屏幕上有代码，请说明代码的大致功能和结构。"
         "如果屏幕上有对话框、网页或文档，请总结其内容。"
         "请简洁直接，200字以内。");
@@ -2287,7 +2485,242 @@ void Dialog::analyzeScreenWithVision(const QByteArray &imageBase64,
                     QStringLiteral("\n\n[当前屏幕截图的分析结果]：") +
                     visionResult;
 
-                doSubmitCurrentInput(enhancedInput);
+                // 自动联网搜索：屏幕捕获后根据分析结果搜索上下文
+                if (m_searchEnabled && m_searchAutoSearch &&
+                    m_searchProvider->isEnabled())
+                {
+                    // 用视觉分析结果作为搜索查询
+                    QString searchQuery = visionResult;
+                    // 限制搜索查询长度（最多取前80字作为查询）
+                    if (searchQuery.length() > 80)
+                        searchQuery = searchQuery.left(80);
+                    m_pendingSearchUserMessage = enhancedInput;
+                    m_searchProvider->search(searchQuery);
+                    // 搜索完成后会通过 searchCompleted 信号回调
+                    // doSubmitWithSearchContext 将合并结果并提交
+                }
+                else
+                {
+                    doSubmitCurrentInput(enhancedInput);
+                }
+            });
+}
+
+/*AI搜索意图分类：判断是否需要联网搜索*/
+void Dialog::classifyAndSearch(const QString &userInput)
+{
+    m_classifierInFlight = true;
+
+    // 用轻量分类器判断是否需要搜索
+    AiProvider *classifier = new AiProvider(this);
+    classifier->setStreamEnabled(false);
+
+    // 复用当前AI配置
+    ZcJsonLib charConfig(ReadCharacterUserConfigPath());
+    QString serverSelect = charConfig.value("serverSelect").toString();
+    if (serverSelect == "DeepSeek")
+        classifier->setServiceType(AiProvider::DeepSeek);
+    else if (serverSelect == "OpenAI")
+        classifier->setServiceType(AiProvider::OpenAI);
+    else if (serverSelect == "Custom")
+        classifier->setServiceType(AiProvider::Custom);
+    else
+        classifier->setServiceType(AiProvider::DeepSeek);
+
+    const ZcJsonLib config(JsonSettingPath);
+    const QString apiKey =
+        config.value("llm/" + serverSelect + "/ApiKey").toString();
+    classifier->setApiKey(apiKey);
+    if (serverSelect == "Custom")
+    {
+        const QString baseUrl =
+            config.value("llm/Custom/BaseUrl").toString().trimmed();
+        if (!baseUrl.isEmpty())
+            classifier->setBaseUrl(baseUrl);
+    }
+    const QString modelSelect = charConfig.value("modelSelect").toString();
+    classifier->setModel(modelSelect);
+
+    classifier->setSystemPrompt(QStringLiteral(
+        "你是一个搜索意图分类器。判断用户消息是否需要联网搜索才能准确回答。\n"
+        "需要搜索（YES）：\n"
+        "- 实时信息：天气、新闻、股价、赛事比分、今日热点\n"
+        "- 具体事物查询：某游戏/动漫/影视/产品/人物的介绍、评价、最新动态\n"
+        "- 时效性问题：最近发生的事件、最新版本、当前价格\n"
+        "不需要搜索（NO）：\n"
+        "- 纯聊天：问候、心情、日常闲聊\n"
+        "- 通用知识：数学、物理、编程语法、历史常识\n"
+        "- 翻译、写作、建议等不需要实时数据的请求\n"
+        "严格只回复一行，格式：NO 或 YES|搜索关键词\n"
+        "示例：\n"
+        "今天天气 → YES|天气\n"
+        "你好 → NO\n"
+        "介绍一下原神 → YES|原神 介绍\n"
+        "Python列表怎么用 → NO\n"
+        "最近有什么好玩的游戏 → YES|热门游戏推荐"));
+
+    classifier->chat(userInput);
+
+    connect(classifier, &AiProvider::replyReceived, this,
+            [this, classifier, userInput](const QString &reply)
+            {
+                classifier->deleteLater();
+                m_classifierInFlight = false;
+
+                const QString trimmed = reply.trimmed();
+                qDebug() << "[Classifier] reply:" << trimmed;
+
+                if (trimmed.startsWith("YES", Qt::CaseInsensitive))
+                {
+                    // 提取搜索关键词
+                    QString searchQuery;
+                    const int pipePos = trimmed.indexOf('|');
+                    if (pipePos >= 0)
+                        searchQuery = trimmed.mid(pipePos + 1).trimmed();
+                    else
+                        searchQuery = userInput; // 没有关键词则用原始输入
+
+                    if (!searchQuery.isEmpty())
+                    {
+                        // 仅当查询涉及本地信息时自动附加城市
+                        if (!m_cachedLocation.isEmpty())
+                        {
+                            static const QStringList kLocationKeywords = {
+                                QStringLiteral("天气"), QStringLiteral("新闻"),
+                                QStringLiteral("附近"), QStringLiteral("本地"),
+                                QStringLiteral("周边"), QStringLiteral("今天"),
+                                QStringLiteral("今日"), QStringLiteral("现在"),
+                                QStringLiteral("当前"), QStringLiteral("实时"),
+                                QStringLiteral("房价"), QStringLiteral("招聘"),
+                                QStringLiteral("外卖"), QStringLiteral("快递"),
+                                QStringLiteral("美食"), QStringLiteral("医院"),
+                                QStringLiteral("银行"), QStringLiteral("药店"),
+                                QStringLiteral("超市"), QStringLiteral("商场"),
+                                QStringLiteral("电影院"), QStringLiteral("理发"),
+                                QStringLiteral("加油"), QStringLiteral("停车"),
+                                QStringLiteral("景点"), QStringLiteral("酒店"),
+                            };
+                            bool needsLocation = false;
+                            for (const QString &kw : kLocationKeywords)
+                            {
+                                if (searchQuery.contains(kw))
+                                {
+                                    needsLocation = true;
+                                    break;
+                                }
+                            }
+
+                            if (needsLocation)
+                            {
+                                const QStringList locParts =
+                                    m_cachedLocation.split(' ', Qt::SkipEmptyParts);
+                                QString city;
+                                if (locParts.size() >= 3)
+                                    city = locParts.at(2);
+                                else if (locParts.size() >= 1)
+                                    city = locParts.last();
+
+                                if (!city.isEmpty() &&
+                                    !searchQuery.contains(city))
+                                {
+                                    searchQuery = city + " " + searchQuery;
+                                }
+                            }
+                        }
+
+                        qDebug() << "[Classifier] auto-search:" << searchQuery;
+                        ui->textEdit->setText(
+                            QStringLiteral("正在搜索：%1……").arg(searchQuery));
+                        executeSearch(searchQuery, userInput, false);
+                        return;
+                    }
+                }
+
+                // 不需要搜索，走正常对话
+                doSubmitCurrentInput(userInput);
+            });
+
+    connect(classifier, &AiProvider::errorOccurred, this,
+            [this, classifier, userInput](const QString &)
+            {
+                classifier->deleteLater();
+                m_classifierInFlight = false;
+                // 分类器出错，降级为正常对话
+                doSubmitCurrentInput(userInput);
+            });
+}
+
+/*IP定位：获取用户大致地理位置（省/市/区）*/
+void Dialog::fetchLocation()
+{
+    // 国内优先用 ip.sb，ip-api.com 作为备选（可能被墙）
+    QNetworkRequest request(
+        QUrl("https://api.ip.sb/geoip"));
+    request.setRawHeader("Accept", "application/json");
+    QNetworkReply *reply = m_locationManager->get(request);
+
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply]()
+            {
+                reply->deleteLater();
+                if (reply->error() != QNetworkReply::NoError)
+                {
+                    // 备选：尝试 ip-api.com
+                    QNetworkRequest fallbackReq(
+                        QUrl("http://ip-api.com/json/?lang=zh-CN&fields=country,regionName,city,district"));
+                    QNetworkReply *fallback = m_locationManager->get(fallbackReq);
+                    connect(fallback, &QNetworkReply::finished, this,
+                            [this, fallback]()
+                            {
+                                fallback->deleteLater();
+                                if (fallback->error() != QNetworkReply::NoError)
+                                {
+                                    qWarning() << "Location fetch failed (all sources)";
+                                    return;
+                                }
+                                const QJsonDocument doc =
+                                    QJsonDocument::fromJson(fallback->readAll());
+                                const QJsonObject obj = doc.object();
+                                QStringList parts;
+                                auto add = [&](const QString &v) {
+                                    if (!v.isEmpty() && v != "-") parts.append(v);
+                                };
+                                add(obj.value("country").toString());
+                                add(obj.value("regionName").toString());
+                                add(obj.value("city").toString());
+                                add(obj.value("district").toString());
+                                if (!parts.isEmpty())
+                                {
+                                    m_cachedLocation = parts.join(" ");
+                                    m_memoryDirty = true;
+                                    m_cachedSystemPrompt.clear();
+                                    qDebug() << "[Location]" << m_cachedLocation;
+                                }
+                            });
+                    return;
+                }
+
+                const QJsonDocument doc =
+                    QJsonDocument::fromJson(reply->readAll());
+                const QJsonObject obj = doc.object();
+
+                QStringList parts;
+                // ip.sb 返回: country, region (省), city, organization 等
+                auto add = [&](const QString &v) {
+                    if (!v.isEmpty() && v != "-") parts.append(v);
+                };
+                add(obj.value("country").toString());
+                add(obj.value("region").toString());    // 省
+                add(obj.value("city").toString());      // 市
+                add(obj.value("district").toString());  // 区（可能为空）
+
+                if (!parts.isEmpty())
+                {
+                    m_cachedLocation = parts.join(" ");
+                    m_memoryDirty = true;
+                    m_cachedSystemPrompt.clear();
+                    qDebug() << "[Location]" << m_cachedLocation;
+                }
             });
 }
 

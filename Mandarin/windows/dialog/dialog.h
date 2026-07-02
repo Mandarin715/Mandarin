@@ -2,6 +2,7 @@
 #define DIALOG_H
 
 #include "AiProvider.h"
+#include "../../utils/SearchProvider.h"
 #include <QDateTime>
 #include <QEvent>
 #include <QJsonArray>
@@ -40,6 +41,7 @@ class Dialog : public QWidget
     void ReloadGeneralConfig();
     void ReloadSpeechInputConfig();
     void ReloadScreenCaptureConfig();
+    void ReloadSearchConfig();
     void ReloadAppLauncherConfig();
     void ReloadContinuousHotkeyConfig();
     bool handleSpeechHotkeyEvent(quint32 vkCode, bool isKeyDown, bool isKeyUp);
@@ -115,7 +117,8 @@ class Dialog : public QWidget
     int m_streamSynthCursor = 0;
     QStringList m_vitsPendingTexts;
     QList<QTemporaryFile *> m_vitsReadyFiles;
-    bool m_vitsRequestInFlight = false;
+    int m_vitsInFlightCount = 0;
+    static constexpr int kVitsMaxConcurrent = 2;
     QNetworkAccessManager *m_vitsManager = nullptr;
     QMediaPlayer *m_vitsPlayer = nullptr;
     QString m_cachedVitsApiUrl;
@@ -136,6 +139,13 @@ class Dialog : public QWidget
     QString buildMemoryContext() const;
     void extractAndStoreMemory(const QString &userInput, const QString &aiReply);
     void compressContextHistory();
+    // IP 定位
+    QString m_cachedLocation;
+    QNetworkAccessManager *m_locationManager = nullptr;
+    void fetchLocation();
+    // AI 搜索意图分类
+    bool m_classifierInFlight = false;
+    void classifyAndSearch(const QString &userInput);
     // 语音输入（QAudioSource直录PCM，录音+静音检测同一音源）
     QAudioSource *m_speechAudioSource = nullptr;
     QIODevice *m_speechAudioDevice = nullptr;
@@ -180,6 +190,18 @@ class Dialog : public QWidget
                                   const QString &userMessage);
     static QStringList screenCaptureTriggerKeywords();
     bool doSubmitCurrentInput(const QString &userInput);
+    // 联网搜索
+    SearchProvider *m_searchProvider = nullptr;
+    bool m_searchEnabled = false;
+    bool m_searchAutoSearch = false;
+    bool m_searchInFlight = false;
+    QString m_pendingSearchUserMessage;
+    void executeSearch(const QString &query, const QString &userMessage,
+                       bool isAutoSearch);
+    static QStringList searchTriggerKeywords();
+    static QString extractSearchQuery(const QString &userInput);
+    void doSubmitWithSearchContext(const QString &userMessage,
+                                   const QString &searchSummary);
 };
 
 #endif //DIALOG_H
