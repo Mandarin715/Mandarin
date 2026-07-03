@@ -60,9 +60,6 @@ SettingChild_About::SettingChild_About(QWidget *parent)
     //延迟到事件循环中异步加载发布信息，避免构造函数中的网络阻塞
     QTimer::singleShot(0, this, [this]()
                        {
-        if (m_releaseInfoLoaded)
-            return;
-        m_releaseInfoLoaded = true; //标记已加载，防止重复请求
         //异步获取GitHub发布列表
         QNetworkReply *reply = m_manager->get(QNetworkRequest(
             QUrl("https://api.github.com/repos/Mandarin715/Mandarin/releases")));

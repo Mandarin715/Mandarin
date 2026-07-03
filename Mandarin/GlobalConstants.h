@@ -41,10 +41,11 @@ inline QString ReadNowSelectChar()
 //读取当前选中角色的立绘路径
 inline QString ReadCharacterTachiePath()
 {
-    if (ReadNowSelectChar() == "未选择")
+    const QString charName = ReadNowSelectChar();
+    if (charName == "未选择")
         return QString();
     QString tachiePath =
-        QDir(CharacterAssestPath).filePath(ReadNowSelectChar() + "/Tachie");
+        QDir(CharacterAssestPath).filePath(charName + "/Tachie");
     if (QDir(tachiePath).exists())
         return tachiePath;
     else
@@ -54,27 +55,29 @@ inline QString ReadCharacterTachiePath()
 //读取当前选中角色的配置路径
 inline QString ReadCharacterUserConfigPath()
 {
-    if (ReadNowSelectChar() == "未选择")
+    const QString charName = ReadNowSelectChar();
+    if (charName == "未选择")
         return QString();
-    QString tachiePath = QDir(CharacterUserConfigPath)
-                             .filePath(ReadNowSelectChar() + "/config.json");
-    return tachiePath;
+    return QDir(CharacterUserConfigPath)
+        .filePath(charName + "/config.json");
 }
 
 //读取当前选中角色的对话上下文路径
 inline QString ReadCharacterContextPath()
 {
-    if (ReadNowSelectChar() == "未选择")
+    const QString charName = ReadNowSelectChar();
+    if (charName == "未选择")
         return QString();
     return QDir(CharacterUserConfigPath)
-        .filePath(ReadNowSelectChar() + "/context.json");
+        .filePath(charName + "/context.json");
 }
 
 //读取当前选中角色的记忆路径
 inline QString ReadCharacterMemoryPath()
 {
-    if (ReadNowSelectChar() == "未选择")
+    const QString charName = ReadNowSelectChar();
+    if (charName == "未选择")
         return QString();
     return QDir(CharacterUserConfigPath)
-        .filePath(ReadNowSelectChar() + "/memory.json");
+        .filePath(charName + "/memory.json");
 }

@@ -3,6 +3,7 @@
 
 #include "AiProvider.h"
 #include "../../utils/SearchProvider.h"
+#include "ZcJsonLib.h"
 #include <QDateTime>
 #include <QEvent>
 #include <QJsonArray>
@@ -80,6 +81,15 @@ class Dialog : public QWidget
     QList<int> keys; //按键按键获取
     /*主逻辑*/
     void initWindow();
+    void initServices(); // 延迟初始化
+    void showTemporaryMessage(const QString &msg); // 显示临时消息，2.5s后自动清除：网络/音频/AI配置等重操作，首帧后再执行
+    // 配置缓存重载：接受预加载的 config.json，避免构造函数中重复 I/O
+    void reloadAIConfig(const ZcJsonLib &config);
+    void reloadSpeechInputConfig(const ZcJsonLib &config);
+    void reloadScreenCaptureConfig(const ZcJsonLib &config);
+    void reloadSearchConfig(const ZcJsonLib &config);
+    void reloadAppLauncherConfig(const ZcJsonLib &config);
+    void reloadContinuousHotkeyConfig(const ZcJsonLib &config);
     //历史
     void loadContextHistory(); //加载上下文历史
     void saveContextHistory() const;

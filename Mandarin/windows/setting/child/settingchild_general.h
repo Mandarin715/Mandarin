@@ -22,6 +22,7 @@ class SettingChild_General : public QWidget
   private slots:
     void on_spinBox_DialogWidth_valueChanged(int arg1);
     void on_spinBox_DialogHeight_valueChanged(int arg1);
+    void on_ToggleSwitch_AutoStart_toggled(bool checked);
 
   private:
     Ui::SettingChild_General *ui;

@@ -6,7 +6,6 @@ historychild::historychild(int historyIndex, const QString &name, const QString 
     : QWidget(parent), ui(new Ui::historychild), m_historyIndex(historyIndex)
 {
     ui->setupUi(this);
-    setWindowFlags(Qt::Window | Qt::FramelessWindowHint | Qt::Tool);
     //显示不抢占焦点
     setAttribute(Qt::WA_ShowWithoutActivating);
     //获取信息

@@ -253,7 +253,7 @@ SettingChild_Char::SettingChild_Char(QWidget *parent)
     ui->comboBox_CharList->setCurrentText(defaultChar);
     LoadCurrentCharConfig();
 
-    isAlreadyLoading = true;
+    m_ready = true;
 }
 
 SettingChild_Char::~SettingChild_Char()
@@ -377,15 +377,15 @@ void SettingChild_Char::RefreshCharList()
 void SettingChild_Char::on_comboBox_CharList_currentTextChanged(
     const QString &arg1)
 {
-    if (!isAlreadyLoading)
+    if (!m_ready)
         return;
     //保存到配置文件
     QSettings settings(IniSettingPath, QSettings::IniFormat);
     settings.setValue("character/CharSelect", arg1);
 
-    isAlreadyLoading = false;
+    m_ready = false;
     LoadCurrentCharConfig();
-    isAlreadyLoading = true;
+    m_ready = true;
 
     emit requestReloadCharSelect("default");
     emit requestReloadAIConfig();
@@ -394,7 +394,7 @@ void SettingChild_Char::on_comboBox_CharList_currentTextChanged(
 /*修改角色提示词*/
 void SettingChild_Char::on_plainTextEdit_CharPrompt_textChanged()
 {
-    if (!isAlreadyLoading)
+    if (!m_ready)
         return;
     //保存到角色文件夹下的config.json
     QString charName = ui->comboBox_CharList->currentText();
@@ -406,7 +406,7 @@ void SettingChild_Char::on_plainTextEdit_CharPrompt_textChanged()
 /*修改立绘大小*/
 void SettingChild_Char::on_spinBox_TachieSize_textChanged(const QString &arg1)
 {
-    if (!isAlreadyLoading)
+    if (!m_ready)
         return;
     //保存到角色配置位置下的config.json
     QString tachieSize = ui->spinBox_TachieSize->text();
@@ -419,7 +419,7 @@ void SettingChild_Char::on_spinBox_TachieSize_textChanged(const QString &arg1)
 void SettingChild_Char::on_comboBox_ServerSelect_currentTextChanged(
     const QString &arg1)
 {
-    if (!isAlreadyLoading)
+    if (!m_ready)
         return;
     Q_UNUSED(arg1)
     //保存到角色配置位置下的config.json
@@ -462,7 +462,7 @@ void SettingChild_Char::RefreshVitsModelList()
 void SettingChild_Char::on_comboBox_ModelSelect_currentTextChanged(
     const QString &arg1)
 {
-    if (!isAlreadyLoading)
+    if (!m_ready)
         return;
     Q_UNUSED(arg1)
     //保存到角色配置位置下的config.json
@@ -482,7 +482,7 @@ void SettingChild_Char::on_pushButton_ResetTachieLoc_clicked()
 void SettingChild_Char::on_comboBox_Vits_MASSelect_currentTextChanged(
     const QString &arg1)
 {
-    if (!isAlreadyLoading)
+    if (!m_ready)
         return;
     Q_UNUSED(arg1)
     //保存到角色配置位置下的config.json
@@ -494,7 +494,7 @@ void SettingChild_Char::on_comboBox_Vits_MASSelect_currentTextChanged(
 /*切换是否启用Vits*/
 void SettingChild_Char::on_ToggleSwitch_VitsEnable_toggled(bool checked)
 {
-    if (!isAlreadyLoading)
+    if (!m_ready)
         return;
     //保存到角色配置位置下的config.json
     ZcJsonLib charConfig(ReadCharacterUserConfigPath());
@@ -768,7 +768,7 @@ void SettingChild_Char::RefreshTachieActionList()
                          [this, actionName, combo](int index)
                          {
                              Q_UNUSED(index)
-                             if (!isAlreadyLoading)
+                             if (!m_ready)
                                  return;
 
                              QString currentCharName =

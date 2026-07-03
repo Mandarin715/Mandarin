@@ -3,8 +3,14 @@
 
 #include "../../../GlobalConstants.h"
 
+#include <QCoreApplication>
+#include <QDir>
 #include <QSettings>
 #include <QSignalBlocker>
+
+#ifdef Q_OS_WIN
+#include <windows.h>
+#endif
 
 namespace
 {
@@ -29,6 +35,8 @@ SettingChild_General::SettingChild_General(QWidget *parent)
         settings.value("general/DialogWidth", kDefaultDialogWidth).toInt());
     ui->spinBox_DialogHeight->setValue(
         settings.value("general/DialogHeight", kDefaultDialogHeight).toInt());
+    ui->ToggleSwitch_AutoStart->setIsToggled(
+        settings.value("general/AutoStart", false).toBool());
 }
 
 SettingChild_General::~SettingChild_General()
@@ -50,4 +58,71 @@ void SettingChild_General::on_spinBox_DialogHeight_valueChanged(int arg1)
     QSettings settings(IniSettingPath, QSettings::IniFormat);
     settings.setValue("general/DialogHeight", arg1);
     emit generalConfigChanged();
+}
+
+/*开机自启开关*/
+void SettingChild_General::on_ToggleSwitch_AutoStart_toggled(bool checked)
+{
+    QSettings settings(IniSettingPath, QSettings::IniFormat);
+    settings.setValue("general/AutoStart", checked);
+
+    const QString batPath = QDir::toNativeSeparators(
+        QDir(QCoreApplication::applicationDirPath()).filePath("启动.bat"));
+#ifdef Q_OS_WIN
+    if (checked) {
+        HKEY hKey;
+        LONG openResult = RegOpenKeyExW(HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            0, KEY_SET_VALUE | KEY_QUERY_VALUE, &hKey);
+        if (openResult == ERROR_SUCCESS) {
+            const auto utf16 = batPath.utf16();
+            RegSetValueExW(hKey, L"Mandarin", 0, REG_SZ,
+                reinterpret_cast<const BYTE *>(utf16),
+                static_cast<DWORD>((batPath.size() + 1) * sizeof(QChar)));
+            RegCloseKey(hKey);
+        }
+    } else {
+        HKEY hKey;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER,
+                          L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                          0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+            RegDeleteValueW(hKey, L"Mandarin");
+            RegCloseKey(hKey);
+        }
+    }
+#elif defined(Q_OS_MACOS)
+    const QString plistPath = QDir::homePath() +
+        "/Library/LaunchAgents/com.mandarin715.mandarin.plist";
+    if (checked) {
+        QFile file(plistPath);
+        QDir().mkpath(QFileInfo(plistPath).absolutePath());
+        if (file.open(QIODevice::WriteOnly)) {
+            file.write(QStringLiteral(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+                "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+                "<plist version=\"1.0\">\n<dict>\n"
+                "<key>Label</key><string>com.mandarin715.mandarin</string>\n"
+                "<key>ProgramArguments</key><array><string>%1</string></array>\n"
+                "<key>RunAtLoad</key><true/>\n"
+                "</dict>\n</plist>\n").arg(batPath).toUtf8());
+        }
+    } else {
+        QFile::remove(plistPath);
+    }
+#elif defined(Q_OS_LINUX)
+    const QString desktopPath = QDir::homePath() +
+        "/.config/autostart/mandarin.desktop";
+    if (checked) {
+        QFile file(desktopPath);
+        QDir().mkpath(QFileInfo(desktopPath).absolutePath());
+        if (file.open(QIODevice::WriteOnly)) {
+            file.write(QStringLiteral(
+                "[Desktop Entry]\nType=Application\nName=Mandarin\nExec=%1\n"
+                "X-GNOME-Autostart-enabled=true\n").arg(batPath).toUtf8());
+        }
+    } else {
+        QFile::remove(desktopPath);
+    }
+#endif
 }

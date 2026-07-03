@@ -35,7 +35,6 @@ class SettingChild_About : public QWidget
     QString m_latestTagName;           //最新版本号标签
     QString m_latestDownloadUrl;       //最新版本exe下载链接
     QString m_localVersion;            //当前本地版本号
-    bool m_releaseInfoLoaded = false;  //发布信息是否已加载（防止重复加载）
     bool m_downloadInProgress = false; //是否正在下载中（防止并发下载）
 };
 

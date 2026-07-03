@@ -54,6 +54,41 @@
 
 namespace
 {
+// 统一 AI Provider 配置，消除 5 处重复的 serverSelect → ServiceType 逻辑
+void configureAiProvider(AiProvider *ai, const ZcJsonLib &config,
+                         const ZcJsonLib &charConfig)
+{
+    QString serverSelect = charConfig.value("serverSelect").toString();
+    if (serverSelect == "DeepSeek")
+        ai->setServiceType(AiProvider::DeepSeek);
+    else if (serverSelect == "OpenAI")
+        ai->setServiceType(AiProvider::OpenAI);
+    else if (serverSelect == "Custom")
+        ai->setServiceType(AiProvider::Custom);
+    else {
+        serverSelect = "DeepSeek";
+        ai->setServiceType(AiProvider::DeepSeek);
+    }
+
+    ai->setApiKey(config.value("llm/" + serverSelect + "/ApiKey").toString());
+    if (serverSelect == "Custom") {
+        QString baseUrl = config.value("llm/Custom/BaseUrl").toString().trimmed();
+        if (baseUrl.isEmpty())
+            ai->setApiUrl(QString());
+        else
+            ai->setBaseUrl(baseUrl);
+    }
+
+    QString modelSelect = charConfig.value("modelSelect").toString();
+    if (modelSelect.isEmpty()) {
+        if (serverSelect == "DeepSeek")
+            modelSelect = "deepseek-v4-pro";
+        else if (serverSelect == "OpenAI")
+            modelSelect = "gpt-4o-mini";
+    }
+    ai->setModel(modelSelect);
+}
+
 //对话框尺寸配置范围，避免配置文件被手动写入过小或过大的值。
 constexpr int kDefaultDialogWidth = 650;
 constexpr int kDefaultDialogHeight = 200;
@@ -310,8 +345,13 @@ Dialog::Dialog(QWidget *parent)
     initWindow();
     lastPos = pos();
 
-    /*AI初始化*/
-    ai = new AiProvider(this);
+    ai = new AiProvider(this); // 轻量创建，配置在 initServices 中
+    ReloadGeneralConfig();       // 必须在 show() 前设置窗口尺寸
+    QTimer::singleShot(0, this, &Dialog::initServices);
+}
+
+void Dialog::initServices()
+{
     ai->setStreamEnabled(true);
 
     // 流式显示定时器：100ms固定间隔更新，不再被快速chunk重置
@@ -330,7 +370,7 @@ Dialog::Dialog(QWidget *parent)
     m_searchProvider = new SearchProvider(this);
     /*IP 定位初始化*/
     m_locationManager = new QNetworkAccessManager(this);
-    fetchLocation();
+    QTimer::singleShot(500, this, &Dialog::fetchLocation); // 延迟定位，不阻塞首帧
     connect(m_searchProvider, &SearchProvider::searchCompleted, this,
             [this](const QList<SearchResult> &, const QString &summary)
             {
@@ -415,10 +455,11 @@ Dialog::Dialog(QWidget *parent)
                     }
                 }
             });
-    ReloadAIConfig();
-    ReloadGeneralConfig();
-    ReloadSpeechInputConfig();
-    QTimer::singleShot(100, this, &Dialog::initWakeWord); // 延迟加载ONNX模型，不阻塞首帧
+    // 缓存 config.json 避免构造函数中重复 I/O（5 次 → 1 次）
+    const ZcJsonLib config(JsonSettingPath);
+    reloadAIConfig(config);
+    reloadSpeechInputConfig(config);
+    QTimer::singleShot(500, this, &Dialog::initWakeWord); // 延迟加载ONNX，窗口渲染完毕后再加载
 
     // 轮询定时器：每100ms读取音频+检测语音活动，25帧(2.5秒)无声音自动停止
     m_silencePollTimer = new QTimer(this);
@@ -486,10 +527,10 @@ Dialog::Dialog(QWidget *parent)
         setVisible(false);
     });
 
-    ReloadContinuousHotkeyConfig();
-    ReloadScreenCaptureConfig();
-    ReloadAppLauncherConfig();
-    // loadContextHistory/loadMemory 已在 ReloadAIConfig() 中调用，不重复
+    reloadContinuousHotkeyConfig(config);
+    reloadScreenCaptureConfig(config);
+    reloadAppLauncherConfig(config);
+    // loadContextHistory/loadMemory 已在 reloadAIConfig() 中调用，不重复
 
     //接收分块回复
     connect(ai, &AiProvider::replyChunkReceived, [=](const QString &chunk)
@@ -696,55 +737,28 @@ void Dialog::ToggleVisible()
 /*重载ai配置*/
 void Dialog::ReloadAIConfig()
 {
-    /*AI初始化*/
-    ZcJsonLib CharConfig(ReadCharacterUserConfigPath());
-    //读取当前角色的服务商选择
-    QString serverSelect = CharConfig.value("serverSelect").toString();
-    if (serverSelect == "DeepSeek")
-        ai->setServiceType(AiProvider::DeepSeek);
-    else if (serverSelect == "OpenAI")
-        ai->setServiceType(AiProvider::OpenAI);
-    else if (serverSelect == "Custom")
-        ai->setServiceType(AiProvider::Custom);
-    else
-    {
-        serverSelect = "DeepSeek";
-        ai->setServiceType(AiProvider::DeepSeek);
-    }
-
     ZcJsonLib config(JsonSettingPath);
-    QString apiKey = config.value("llm/" + serverSelect + "/ApiKey").toString();
-    ai->setApiKey(apiKey);
-    if (serverSelect == "Custom")
-    {
-        QString baseUrl = config.value("llm/Custom/BaseUrl").toString().trimmed();
-        if (baseUrl.isEmpty())
-            ai->setApiUrl(QString());
-        else
-            ai->setBaseUrl(baseUrl);
-    }
+    reloadAIConfig(config);
+}
 
-    //读取当前角色的模型选择
-    QString modelSelect = CharConfig.value("modelSelect").toString();
-    if (modelSelect.isEmpty())
-    {
-        // 新用户未选择模型时，根据服务商使用默认模型
-        if (serverSelect == "DeepSeek")
-            modelSelect = "deepseek-v4-pro";
-        else if (serverSelect == "OpenAI")
-            modelSelect = "gpt-4o-mini";
-    }
-    ai->setModel(modelSelect);
-
+void Dialog::reloadAIConfig(const ZcJsonLib &config)
+{
+    ZcJsonLib CharConfig(ReadCharacterUserConfigPath());
+    configureAiProvider(ai, config, CharConfig);
     loadContextHistory();
     loadMemory();
-    ReloadSearchConfig();
+    reloadSearchConfig(config);
 }
 
 /*重载语音输入配置*/
 void Dialog::ReloadSpeechInputConfig()
 {
     ZcJsonLib config(JsonSettingPath);
+    reloadSpeechInputConfig(config);
+}
+
+void Dialog::reloadSpeechInputConfig(const ZcJsonLib &config)
+{
     const bool speechEnabled =
         config.value("speechInput/Enable", false).toBool();
     const bool autoSend =
@@ -821,6 +835,11 @@ void Dialog::ReloadSpeechInputConfig()
 void Dialog::ReloadContinuousHotkeyConfig()
 {
     ZcJsonLib config(JsonSettingPath);
+    reloadContinuousHotkeyConfig(config);
+}
+
+void Dialog::reloadContinuousHotkeyConfig(const ZcJsonLib &config)
+{
     const bool enable =
         config.value("speechInput/ContinuousHotkey/Enable", false).toBool();
     const quint32 nativeKey = static_cast<quint32>(
@@ -1307,9 +1326,10 @@ bool Dialog::doSubmitCurrentInput(const QString &userInput)
     QStringList nameFilters;
     nameFilters << "*.png" << "*.jpg" << "*.jpeg";
     QStringList fileNames = dir.entryList(nameFilters, QDir::Files);
-    QString nameListStr;
+    QStringList names;
     for (const QString &fileName : fileNames)
-        nameListStr += fileName.section('.', 0, 0) + ", ";
+        names << fileName.section('.', 0, 0);
+    const QString nameListStr = names.join(", ");
 
     ZcJsonLib roleConfig(CharacterAssestPath + "/" + ReadNowSelectChar() +
                          "/config.json");
@@ -1401,6 +1421,14 @@ void Dialog::on_pushButton_input_released()
     stopSpeechRecording();
 }
 
+void Dialog::showTemporaryMessage(const QString &msg)
+{
+    QTimer::singleShot(2500, this, [this, msg]() {
+        if (ui->textEdit->toPlainText() == msg)
+            ui->textEdit->clear();
+    });
+}
+
 /*自动发送开关*/
 void Dialog::on_checkBox_autoInput_toggled(bool checked)
 {
@@ -1438,10 +1466,7 @@ void Dialog::startSpeechRecordingFromHotkey()
         {
             const QString msg = QStringLiteral("麦克风权限未开启，请在系统设置中允许 Mandarin 使用麦克风");
             ui->textEdit->setText(msg);
-            QTimer::singleShot(2500, this, [this, msg]() {
-                if (ui->textEdit->toPlainText() == msg)
-                    ui->textEdit->clear();
-            });
+            showTemporaryMessage(msg);
             return;
         }
 
@@ -1449,10 +1474,7 @@ void Dialog::startSpeechRecordingFromHotkey()
         {
             const QString msg = QStringLiteral("正在请求麦克风权限……");
             ui->textEdit->setText(msg);
-            QTimer::singleShot(2500, this, [this, msg]() {
-                if (ui->textEdit->toPlainText() == msg)
-                    ui->textEdit->clear();
-            });
+            showTemporaryMessage(msg);
             app->requestPermission(microphonePermission, this,
                                    [this](const QPermission &permission)
                                    {
@@ -1464,10 +1486,7 @@ void Dialog::startSpeechRecordingFromHotkey()
                                            const QString errMsg = QStringLiteral(
                                                "麦克风权限未开启，请在系统设置中允许 Mandarin 使用麦克风");
                                            ui->textEdit->setText(errMsg);
-                                           QTimer::singleShot(2500, this, [this, errMsg]() {
-                                               if (ui->textEdit->toPlainText() == errMsg)
-                                                   ui->textEdit->clear();
-                                           });
+            showTemporaryMessage(errMsg);
                                        }
                                    });
             return;
@@ -1479,10 +1498,7 @@ void Dialog::startSpeechRecordingFromHotkey()
     {
         const QString msg = QStringLiteral("未检测到可用麦克风");
         ui->textEdit->setText(msg);
-        QTimer::singleShot(2500, this, [this, msg]() {
-            if (ui->textEdit->toPlainText() == msg)
-                ui->textEdit->clear();
-        });
+        showTemporaryMessage(msg);
         return;
     }
 
@@ -1689,10 +1705,7 @@ QString Dialog::recognizeSpeechFromFile(const QString &filePath)
     {
         const QString msg = QStringLiteral("百度语音识别配置不完整或 Token 获取失败");
         ui->textEdit->setText(msg);
-        QTimer::singleShot(2500, this, [this, msg]() {
-            if (ui->textEdit->toPlainText() == msg)
-                ui->textEdit->clear();
-        });
+        showTemporaryMessage(msg);
         return QString();
     }
 
@@ -1700,10 +1713,7 @@ QString Dialog::recognizeSpeechFromFile(const QString &filePath)
     {
         const QString msg = QStringLiteral("无法读取录音文件");
         ui->textEdit->setText(msg);
-        QTimer::singleShot(2500, this, [this, msg]() {
-            if (ui->textEdit->toPlainText() == msg)
-                ui->textEdit->clear();
-        });
+        showTemporaryMessage(msg);
         return QString();
     }
     const QByteArray audioData = file.readAll();
@@ -1750,10 +1760,7 @@ QString Dialog::recognizeSpeechFromFile(const QString &filePath)
     {
         const QString msg = QStringLiteral("没有识别到有效语音");
         ui->textEdit->setText(msg);
-        QTimer::singleShot(2500, this, [this, msg]() {
-            if (ui->textEdit->toPlainText() == msg)
-                ui->textEdit->clear();
-        });
+        showTemporaryMessage(msg);
     }
     return recognizedText;
 }
@@ -1955,29 +1962,8 @@ void Dialog::extractAndStoreMemory(const QString &userInput,
 
     // 复用当前角色的 AI 配置
     ZcJsonLib charConfig(ReadCharacterUserConfigPath());
-    QString serverSelect = charConfig.value("serverSelect").toString();
-    if (serverSelect == "DeepSeek")
-        memoryAi->setServiceType(AiProvider::DeepSeek);
-    else if (serverSelect == "OpenAI")
-        memoryAi->setServiceType(AiProvider::OpenAI);
-    else if (serverSelect == "Custom")
-        memoryAi->setServiceType(AiProvider::Custom);
-    else
-        memoryAi->setServiceType(AiProvider::DeepSeek);
-
     const ZcJsonLib config(JsonSettingPath);
-    const QString apiKey =
-        config.value("llm/" + serverSelect + "/ApiKey").toString();
-    memoryAi->setApiKey(apiKey);
-    if (serverSelect == "Custom")
-    {
-        const QString baseUrl =
-            config.value("llm/Custom/BaseUrl").toString().trimmed();
-        if (!baseUrl.isEmpty())
-            memoryAi->setBaseUrl(baseUrl);
-    }
-    const QString modelSelect = charConfig.value("modelSelect").toString();
-    memoryAi->setModel(modelSelect);
+    configureAiProvider(memoryAi, config, charConfig);
 
     // 记忆提取专用的系统提示词
     memoryAi->setSystemPrompt(QStringLiteral(
@@ -2140,6 +2126,11 @@ void Dialog::on_pushButton_screenCapture_clicked()
 void Dialog::ReloadScreenCaptureConfig()
 {
     ZcJsonLib config(JsonSettingPath);
+    reloadScreenCaptureConfig(config);
+}
+
+void Dialog::reloadScreenCaptureConfig(const ZcJsonLib &config)
+{
     m_screenCaptureEnabled =
         config.value("screenCapture/Enable", false).toBool();
 
@@ -2151,6 +2142,11 @@ void Dialog::ReloadScreenCaptureConfig()
 void Dialog::ReloadSearchConfig()
 {
     ZcJsonLib config(JsonSettingPath);
+    reloadSearchConfig(config);
+}
+
+void Dialog::reloadSearchConfig(const ZcJsonLib &config)
+{
     m_searchEnabled = config.value("search/Enable", false).toBool();
     m_searchAutoSearch = config.value("search/AutoSearch", true).toBool();
 
@@ -2167,17 +2163,20 @@ void Dialog::ReloadSearchConfig()
     m_searchProvider->setSecretKey(secretKey);
     m_searchProvider->setBaseUrl(baseUrl);
 
-    qDebug() << "[Search] Config reloaded - enabled:" << m_searchEnabled
-             << "autoSearch:" << m_searchAutoSearch
-             << "apiKey:" << (apiKey.isEmpty() ? "(empty)" : "(set)")
-             << "secretKey:" << (secretKey.isEmpty() ? "(empty)" : "(set)")
-             << "baseUrl:" << baseUrl;
+    qDebug() << "[Search]" << (m_searchEnabled ? "enabled" : "disabled")
+             << "auto:" << m_searchAutoSearch
+             << "key:" << (apiKey.isEmpty() ? "no" : "yes");
 }
 
 /*应用调用配置重载*/
 void Dialog::ReloadAppLauncherConfig()
 {
     ZcJsonLib config(JsonSettingPath);
+    reloadAppLauncherConfig(config);
+}
+
+void Dialog::reloadAppLauncherConfig(const ZcJsonLib &config)
+{
     m_cachedAppCommands =
         config.value("appLauncher/commands", QJsonArray()).toArray();
 }
@@ -2356,10 +2355,7 @@ void Dialog::captureAndAnalyzeScreen()
     {
         const QString msg = QStringLiteral("屏幕捕获失败，请重试");
         ui->textEdit->setText(msg);
-        QTimer::singleShot(2500, this, [this, msg]() {
-            if (ui->textEdit->toPlainText() == msg)
-                ui->textEdit->clear();
-        });
+        showTemporaryMessage(msg);
         ui->textEdit->setEnabled(true);
         ui->label_name->setText(QStringLiteral("你"));
         ui->pushButton_next->show();
@@ -2548,29 +2544,8 @@ void Dialog::classifyAndSearch(const QString &userInput)
 
     // 复用当前AI配置
     ZcJsonLib charConfig(ReadCharacterUserConfigPath());
-    QString serverSelect = charConfig.value("serverSelect").toString();
-    if (serverSelect == "DeepSeek")
-        classifier->setServiceType(AiProvider::DeepSeek);
-    else if (serverSelect == "OpenAI")
-        classifier->setServiceType(AiProvider::OpenAI);
-    else if (serverSelect == "Custom")
-        classifier->setServiceType(AiProvider::Custom);
-    else
-        classifier->setServiceType(AiProvider::DeepSeek);
-
     const ZcJsonLib config(JsonSettingPath);
-    const QString apiKey =
-        config.value("llm/" + serverSelect + "/ApiKey").toString();
-    classifier->setApiKey(apiKey);
-    if (serverSelect == "Custom")
-    {
-        const QString baseUrl =
-            config.value("llm/Custom/BaseUrl").toString().trimmed();
-        if (!baseUrl.isEmpty())
-            classifier->setBaseUrl(baseUrl);
-    }
-    const QString modelSelect = charConfig.value("modelSelect").toString();
-    classifier->setModel(modelSelect);
+    configureAiProvider(classifier, config, charConfig);
 
     classifier->setSystemPrompt(QStringLiteral(
         "你是一个搜索意图分类器。判断用户消息是否需要联网搜索才能准确回答。\n"
@@ -2704,6 +2679,11 @@ void Dialog::fetchLocation()
                                 add(obj.value("regionName").toString());
                                 add(obj.value("city").toString());
                                 add(obj.value("district").toString());
+                                for (int i = parts.size() - 1; i > 0; --i) {
+                                    if (parts[i] == parts[i - 1])
+                                        parts.removeAt(i);
+                                }
+                                parts.removeAll(QStringLiteral("China"));
                                 if (!parts.isEmpty())
                                 {
                                     m_cachedLocation = parts.join(" ");
@@ -2728,6 +2708,13 @@ void Dialog::fetchLocation()
                 add(obj.value("region").toString());    // 省
                 add(obj.value("city").toString());      // 市
                 add(obj.value("district").toString());  // 区（可能为空）
+                // 去重相邻相同值（如直辖市 region=city="Shanghai"）
+                for (int i = parts.size() - 1; i > 0; --i) {
+                    if (parts[i] == parts[i - 1])
+                        parts.removeAt(i);
+                }
+                // 去掉 "China"，国内用户无需看到国家名
+                parts.removeAll(QStringLiteral("China"));
 
                 if (!parts.isEmpty())
                 {
@@ -2759,23 +2746,7 @@ void Dialog::compressContextHistory()
 
     ZcJsonLib config(JsonSettingPath);
     ZcJsonLib charConfig(ReadCharacterUserConfigPath());
-    QString serverSelect = charConfig.value("serverSelect").toString();
-    if (serverSelect.isEmpty())
-        serverSelect = QStringLiteral("DeepSeek");
-    const QString apiKey =
-        config.value("llm/" + serverSelect + "/ApiKey").toString();
-    const QString model = charConfig.value("modelSelect").toString();
-
-    if (serverSelect == "DeepSeek")
-        compressAi->setServiceType(AiProvider::DeepSeek);
-    else if (serverSelect == "OpenAI")
-        compressAi->setServiceType(AiProvider::OpenAI);
-    else if (serverSelect == "Custom")
-        compressAi->setServiceType(AiProvider::Custom);
-    else
-        compressAi->setServiceType(AiProvider::DeepSeek);
-    compressAi->setApiKey(apiKey);
-    compressAi->setModel(model);
+    configureAiProvider(compressAi, config, charConfig);
 
     compressAi->setSystemPrompt(QStringLiteral(
         "你是一个对话摘要助手。用一句话（50字内）概括以下对话的核心内容。"));
@@ -2846,7 +2817,6 @@ void Dialog::startWakeWord()
         connect(m_wakeWordDetector, &WakeWordDetector::wakeWordDetected,
                 this, &Dialog::onWakeWordDetected);
         m_wakeWordDetector->start();
-        qDebug() << "Wake word detection started";
     }
     else
     {

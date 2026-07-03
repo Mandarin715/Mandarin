@@ -47,7 +47,7 @@ class SettingChild_Char : public QWidget
 
   private:
     Ui::SettingChild_Char *ui;
-    bool isAlreadyLoading = false;
+    bool m_ready = false;
     AnimePluginManager m_pluginManager;
     QList<QWidget *> m_tachieBindingRows;
     void LoadCurrentCharConfig();

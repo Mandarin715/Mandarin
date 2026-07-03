@@ -50,10 +50,10 @@ Tachie::Tachie(QWidget *parent)
 
     //延迟加载立绘
     QTimer::singleShot(0, this, [this]()
-                       { SetTachieImg("default"); });
-
-    //初始化动画插件索引
-    m_animePluginManager.Reload();
+                       {
+                           m_animePluginManager.Reload();
+                           SetTachieImg("default");
+                       });
 }
 
 Tachie::~Tachie()

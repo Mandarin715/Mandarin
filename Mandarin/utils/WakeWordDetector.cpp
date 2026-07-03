@@ -41,7 +41,7 @@ bool WakeWordDetector::init(const QString &modelDir, const QStringList &keywords
         qWarning() << "WakeWordDetector: keywords.txt not found in model dir";
         return false;
     }
-    qDebug() << "WakeWordDetector: using keyword file" << kwFilePath;
+    qDebug() << "WakeWordDetector: using" << kwFilePath;
 
     KeywordSpotterConfig config;
 
@@ -76,8 +76,7 @@ bool WakeWordDetector::init(const QString &modelDir, const QStringList &keywords
 
     m_stream = new OnlineStream(m_spotter->CreateStream());
     m_initialized = true;
-    qDebug() << "WakeWordDetector: initialized with" << keywords.size()
-             << "keywords, threshold=" << threshold;
+    qDebug() << "WakeWordDetector: initialized, threshold=" << threshold;
     return true;
 }
 

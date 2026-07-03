@@ -239,6 +239,14 @@ if(WIN32)
         ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ZcJsonLib/lib/ZcJsonLib.lib
     )
 
+    # 延迟加载 ONNX 相关 DLL，仅唤醒词检测需要（已延迟 500ms 初始化）
+    target_link_options(Mandarin PRIVATE
+        /DELAYLOAD:sherpa-onnx-cxx-api.dll
+        /DELAYLOAD:sherpa-onnx-c-api.dll
+        /DELAYLOAD:onnxruntime.dll
+        /DELAYLOAD:onnxruntime_providers_shared.dll
+    )
+
     add_custom_command(TARGET Mandarin POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${ZCAILIB_WIN_DLL}
