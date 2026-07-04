@@ -510,7 +510,7 @@ void Dialog::initServices()
                          << "| threshold:" << kSilenceThreshold;
         }
         // 连续静音达到上限 → 停止录音
-        if (m_silentFrameCount >= kSilenceFrameMax)
+        if (m_silentFrameCount >= m_silenceFrameMax)
         {
             qDebug() << "Silence detected:" << m_silentFrameCount << "frames, stopping";
             stopSpeechRecording();
@@ -655,8 +655,9 @@ void Dialog::initServices()
                     });
                 }
 
-                // 连续对话模式兜底：VITS未播放时直接开始下一轮录音
-                if (m_continuousMode)
+                // 连续对话模式兜底：仅 VITS 未启用时直接开始下一轮录音。
+                // VITS 启用了则由 playbackStateChanged 回调负责触发。
+                if (m_continuousMode && !m_streamVitsEnabled)
                 {
                     const bool allDone = isAllVitsDone();
                     qDebug() << "[Continuous] replyReceived | allDone:" << allDone
@@ -667,7 +668,6 @@ void Dialog::initServices()
                     {
                         qDebug() << "Continuous mode: no VITS audio, starting next recording";
                         QTimer::singleShot(500, this, [this]() {
-                            // 恢复输入状态（清除AI回复残留文字）
                             if (!ui->textEdit->isEnabled() && ui->pushButton_next->isVisible())
                             {
                                 ui->textEdit->setEnabled(true);
@@ -829,6 +829,8 @@ void Dialog::reloadSpeechInputConfig(const ZcJsonLib &config)
     else if (!wakeWordEnabled && m_wakeWordEnabled)
         stopWakeWord();
     m_wakeWordEnabled = wakeWordEnabled;
+    m_silenceFrameMax = qMax(5, qMin(50,
+        config.value("speechInput/SilenceTimeoutMs", 1500).toInt() / kSilencePollMs));
 }
 
 /*重载连续对话快捷键配置*/
@@ -1188,6 +1190,11 @@ void Dialog::tryStartNextVitsPlayback()
     m_vitsTempFile = m_vitsReadyFiles.takeFirst();
     if (!m_vitsTempFile)
         return;
+
+    // 每次播放前刷新音频输出设备，跟随系统默认（耳机热插拔等）
+    delete m_vitsAudioOutput;
+    m_vitsAudioOutput = new QAudioOutput(this);
+    m_vitsPlayer->setAudioOutput(m_vitsAudioOutput);
 
     //播放严格串行：只有播放器空闲才取下一句。
     m_vitsPlayer->setSource(QUrl::fromLocalFile(m_vitsTempFile->fileName()));
@@ -1555,6 +1562,7 @@ void Dialog::stopSpeechRecording()
     {
         m_capturedAudioData.clear();
         ui->label_name->setText(QStringLiteral("你"));
+        ui->textEdit->clear();
         if (m_continuousMode)
             QTimer::singleShot(500, this, &Dialog::startSpeechRecordingFromHotkey);
         return;

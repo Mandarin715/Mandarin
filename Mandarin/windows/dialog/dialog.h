@@ -176,7 +176,7 @@ class Dialog : public QWidget
     int m_silentFrameCount = 0;
     static constexpr float kSilenceThreshold = 0.005f;
     static constexpr int kSilencePollMs = 100;
-    static constexpr int kSilenceFrameMax = 25;
+    int m_silenceFrameMax = 15; // 静默帧上限，从配置读取，默认 1.5s
     void initWakeWord();
     void startWakeWord();
     void stopWakeWord();

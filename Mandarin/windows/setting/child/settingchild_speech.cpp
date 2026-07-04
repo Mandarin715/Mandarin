@@ -45,6 +45,8 @@ SettingChild_Speech::SettingChild_Speech(QWidget *parent)
             config.value("speechInput/ContinuousHotkey/NativeKey", 0).toInteger()));
     ui->spinBox_ContinuousAudioDelay->setValue(
         config.value("speechInput/ContinuousAudioDelayMs", 2500).toInt());
+    ui->spinBox_SilenceTimeout->setValue(
+        config.value("speechInput/SilenceTimeoutMs", 1500).toInt());
 
     refreshBaiduStatus();
     refreshGlobalHotkeyBinderState();
@@ -318,5 +320,12 @@ void SettingChild_Speech::on_spinBox_ContinuousAudioDelay_valueChanged(int value
 {
     ZcJsonLib config(JsonSettingPath);
     config.setValue("speechInput/ContinuousAudioDelayMs", value);
+    emit speechConfigChanged();
+}
+
+void SettingChild_Speech::on_spinBox_SilenceTimeout_valueChanged(int value)
+{
+    ZcJsonLib config(JsonSettingPath);
+    config.setValue("speechInput/SilenceTimeoutMs", value);
     emit speechConfigChanged();
 }
