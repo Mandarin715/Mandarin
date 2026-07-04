@@ -25,7 +25,7 @@
 │       │              │               │            │
 │  ┌────┴──────────────┴───────────────┴──────────┐ │
 │  │              C++ 业务核心                      │ │
-│  │  AI对话 │ VITS语音 │ 百度识别 │ 唤醒词检测     │ │
+│  │  AI对话 │ VITS语音 │ SenseVoice │ 唤醒词检测   │ │
 │  └────────────────────┬──────────────────────────┘ │
 │                       │                            │
 │  ┌────────────────────┼──────────────────────────┐ │
@@ -103,6 +103,17 @@
 ### Step 2：（可选）语音功能
 
 > 仅文字对话可跳过此步。
+
+**语音识别（SenseVoice 离线引擎）**
+
+便携包已内置语音识别模型（`models/sense-voice/`），无需额外操作即可使用语音输入。
+
+如未下载便携包或需手动安装模型：
+1. 下载 SenseVoice 模型：[hf-mirror.com](https://hf-mirror.com/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17)（选 `model.int8.onnx` + `tokens.txt`）
+2. 放入 Mandarin 目录下的 `models/sense-voice/` 文件夹
+3. 重启 Mandarin，设置 → 语音输入设置 → 确认引擎状态为「已就绪」
+
+**语音合成（VITS TTS）**
 
 1. 下载 [vits-simple-api](https://github.com/Artrajz/vits-simple-api/releases)（Windows CPU 版本）
 2. 解压到 Mandarin 安装目录（保留原文件夹名，如 `vits-simple-api-windows-cpu-v0.6.16`）
