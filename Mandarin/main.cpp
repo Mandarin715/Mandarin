@@ -18,6 +18,10 @@
 
 #include <QDir>
 
+#ifdef Q_OS_WIN
+#include <windows.h>
+#endif
+
 namespace
 {
 struct DefaultConfigEntry
@@ -141,6 +145,20 @@ int main(int argc, char *argv[])
     QAction *actionQuit = trayMenu.addAction("退出");
     tray.setContextMenu(&trayMenu);
     tray.show();
+    // 将窗口强制拉到前台（托盘图标点击响应是用户主动行为，不会被系统拦截）
+    auto bringToFront = [](QWidget *w) {
+        w->show();
+        // 如果最小化了就先还原
+        if (w->isMinimized())
+            w->setWindowState(w->windowState() & ~Qt::WindowMinimized);
+        w->raise();
+        w->activateWindow();
+#ifdef Q_OS_WIN
+        // Qt 的 activateWindow 在部分 Windows 版本不够强力，补一刀原生 API
+        SetForegroundWindow(reinterpret_cast<HWND>(w->winId()));
+#endif
+    };
+
     //左键点击托盘打开设置
     QObject::connect(&tray, QOverload<QSystemTrayIcon::ActivationReason>::of(&QSystemTrayIcon::activated),
                      [&](QSystemTrayIcon::ActivationReason reason)
@@ -152,9 +170,7 @@ int main(int argc, char *argv[])
                                  eApp->init();
                                  settings = new MainWindow(&dialogWin, &tachieWin);
                              }
-                             settings->show();
-                             settings->raise();
-                             settings->activateWindow();
+                             bringToFront(settings);
                          }
                      });
     //设置界面懒加载
@@ -165,9 +181,7 @@ int main(int argc, char *argv[])
                              eApp->init();
                              settings = new MainWindow(&dialogWin, &tachieWin);
                          }
-                         settings->show();
-                         settings->raise();
-                         settings->activateWindow(); });
+                         bringToFront(settings); });
     //退出程序
     QObject::connect(actionQuit, &QAction::triggered, &a, &QApplication::quit);
 

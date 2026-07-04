@@ -20,6 +20,7 @@ class QNetworkAccessManager;
 class QIODevice;
 class QTemporaryFile;
 class WakeWordDetector;
+class OfflineSpeechRecognizer;
 
 namespace Ui
 {
@@ -109,7 +110,6 @@ class Dialog : public QWidget
     QString m_streamDisplayedChinese;
     QTimer *m_streamDisplayTimer = nullptr; // 流式显示防抖定时器
     bool m_isSpeechRecording = false;
-    bool m_isSpeechRecognizing = false;
     bool m_globalSpeechHotkeyEnabled = false; //全局录音热键是否启用
     bool m_globalSpeechHotkeyPressed = false; //当前热键是否处于按下录音中
     quint32 m_globalSpeechHotkeyNativeKey = 0; //Ela绑定得到的原生按键值
@@ -164,10 +164,10 @@ class Dialog : public QWidget
     void startSpeechRecordingFromHotkey();
     void stopSpeechRecording();
     QString speechRecordFilePath() const;
-    QString recognizeSpeechFromFile(const QString &filePath);
-    QString requestBaiduAccessToken(const QString &apiKey,
-                                    const QString &secretKey);
     void releaseSpeechHotkeyResources();
+    // 离线语音识别
+    OfflineSpeechRecognizer *m_speechRecognizer = nullptr;
+    void initSpeechRecognizer();
     // 语音唤醒
     WakeWordDetector *m_wakeWordDetector = nullptr;
     bool m_wakeWordEnabled = false;
@@ -180,9 +180,6 @@ class Dialog : public QWidget
     void initWakeWord();
     void startWakeWord();
     void stopWakeWord();
-    // 百度Token缓存
-    QString m_cachedBaiduToken;
-    QDateTime m_baiduTokenExpiry;
     // 上下文历史延迟写入
     QTimer *m_contextSaveTimer = nullptr;
     bool m_contextDirty = false;

@@ -43,23 +43,23 @@
         <number>0</number>
        </property>
        <item>
-        <widget class="ElaText" name="label_Interface">
+        <widget class="ElaText" name="label_Engine">
          <property name="font">
           <font>
            <pointsize>10</pointsize>
           </font>
          </property>
          <property name="text">
-          <string>接口</string>
+          <string>引擎</string>
          </property>
         </widget>
        </item>
        <item>
-       <widget class="ElaScrollPageArea" name="widget_Interface" native="true">
+       <widget class="ElaScrollPageArea" name="widget_Engine" native="true">
          <property name="toolTip">
-          <string>配置语音识别服务，当前支持百度语音识别</string>
+          <string>离线语音识别引擎，无需联网、无需 API Key</string>
          </property>
-         <layout class="QHBoxLayout" name="horizontalLayout" stretch="1,0,1">
+         <layout class="QHBoxLayout" name="horizontalLayout" stretch="1,0">
           <property name="leftMargin">
            <number>15</number>
           </property>
@@ -67,7 +67,7 @@
            <number>15</number>
           </property>
           <item>
-           <widget class="ElaText" name="label_Baidu">
+           <widget class="ElaText" name="label_SenseVoice">
             <property name="sizePolicy">
              <sizepolicy hsizetype="Expanding" vsizetype="Preferred">
               <horstretch>0</horstretch>
@@ -80,42 +80,22 @@
              </font>
             </property>
             <property name="text">
-             <string>百度语音识别</string>
+             <string>SenseVoice (离线)</string>
             </property>
            </widget>
           </item>
           <item>
-           <widget class="ElaText" name="label_Baidu_Status">
+           <widget class="ElaText" name="label_Engine_Status">
             <property name="font">
              <font>
-              <pointsize>16</pointsize>
-              <bold>true</bold>
+              <pointsize>12</pointsize>
              </font>
-            </property>
-            <property name="visible">
-             <bool>false</bool>
             </property>
             <property name="styleSheet">
              <string notr="true">color: #2EAD4B;</string>
             </property>
             <property name="text">
-             <string>√</string>
-            </property>
-           </widget>
-          </item>
-          <item>
-           <widget class="ElaPushButton" name="pushButton_Baidu_Set">
-            <property name="toolTip">
-             <string>填写百度语音识别的 API Key 和 Secret Key</string>
-            </property>
-            <property name="sizePolicy">
-             <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
-              <horstretch>0</horstretch>
-              <verstretch>0</verstretch>
-             </sizepolicy>
-            </property>
-            <property name="text">
-             <string>配置</string>
+             <string>已就绪</string>
             </property>
            </widget>
           </item>
@@ -447,121 +427,6 @@
        </item>
        <item>
         <spacer name="verticalSpacer">
-         <property name="orientation">
-          <enum>Qt::Vertical</enum>
-         </property>
-         <property name="sizeHint" stdset="0">
-          <size>
-           <width>20</width>
-           <height>40</height>
-          </size>
-         </property>
-        </spacer>
-       </item>
-      </layout>
-     </widget>
-     <widget class="QWidget" name="page_Baidu">
-      <layout class="QVBoxLayout" name="verticalLayout_3">
-       <property name="leftMargin">
-        <number>0</number>
-       </property>
-       <property name="topMargin">
-        <number>0</number>
-       </property>
-       <property name="rightMargin">
-        <number>0</number>
-       </property>
-       <property name="bottomMargin">
-        <number>0</number>
-       </property>
-       <item>
-       <widget class="ElaScrollPageArea" name="widget_ApiKey" native="true">
-         <property name="toolTip">
-          <string>百度智能云语音识别应用的 API Key</string>
-         </property>
-         <layout class="QHBoxLayout" name="horizontalLayout_3" stretch="1,1">
-          <property name="leftMargin">
-           <number>15</number>
-          </property>
-          <property name="rightMargin">
-           <number>15</number>
-          </property>
-          <item>
-           <widget class="ElaText" name="label_ApiKey">
-            <property name="font">
-             <font>
-              <pointsize>12</pointsize>
-             </font>
-            </property>
-            <property name="text">
-             <string>API Key</string>
-            </property>
-           </widget>
-          </item>
-          <item>
-           <widget class="ElaLineEdit" name="lineEdit_BaiduApiKey">
-            <property name="toolTip">
-             <string>请输入百度语音识别 API Key</string>
-            </property>
-           </widget>
-          </item>
-         </layout>
-        </widget>
-       </item>
-       <item>
-       <widget class="ElaScrollPageArea" name="widget_SecretKey" native="true">
-         <property name="toolTip">
-          <string>百度智能云语音识别应用的 Secret Key</string>
-         </property>
-         <layout class="QHBoxLayout" name="horizontalLayout_4" stretch="1,1">
-          <property name="leftMargin">
-           <number>15</number>
-          </property>
-          <property name="rightMargin">
-           <number>15</number>
-          </property>
-          <item>
-           <widget class="ElaText" name="label_SecretKey">
-            <property name="font">
-             <font>
-              <pointsize>12</pointsize>
-             </font>
-            </property>
-            <property name="text">
-             <string>Secret Key</string>
-            </property>
-           </widget>
-          </item>
-          <item>
-           <widget class="ElaLineEdit" name="lineEdit_BaiduSecretKey">
-            <property name="toolTip">
-             <string>请输入百度语音识别 Secret Key</string>
-            </property>
-            <property name="echoMode">
-             <enum>QLineEdit::PasswordEchoOnEdit</enum>
-            </property>
-           </widget>
-          </item>
-         </layout>
-        </widget>
-       </item>
-       <item>
-        <widget class="ElaText" name="label_BaiduDesc">
-         <property name="font">
-          <font>
-           <pointsize>9</pointsize>
-          </font>
-         </property>
-         <property name="text">
-          <string>在百度智能云创建短语音识别应用后，将对应的 API Key 和 Secret Key 填到这里即可。</string>
-         </property>
-         <property name="wordWrap">
-          <bool>true</bool>
-         </property>
-        </widget>
-       </item>
-       <item>
-        <spacer name="verticalSpacer_2">
          <property name="orientation">
           <enum>Qt::Vertical</enum>
          </property>

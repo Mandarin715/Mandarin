@@ -7,6 +7,9 @@
 
 #include "ElaKeyBinder.h"
 
+#include <QCoreApplication>
+#include <QDir>
+#include <QFile>
 #include <QLayout>
 #include <QSignalBlocker>
 #include <QTimer>
@@ -48,7 +51,20 @@ SettingChild_Speech::SettingChild_Speech(QWidget *parent)
     ui->spinBox_SilenceTimeout->setValue(
         config.value("speechInput/SilenceTimeoutMs", 1500).toInt());
 
-    refreshBaiduStatus();
+    // SenseVoice 模型状态检测
+    {
+        const QString modelPath =
+            QCoreApplication::applicationDirPath() + "/models/sense-voice";
+        const bool ready = QDir(modelPath).exists() &&
+                           QFile::exists(modelPath + "/model.int8.onnx") &&
+                           QFile::exists(modelPath + "/tokens.txt");
+        ui->label_Engine_Status->setText(ready ? "已就绪" : "未安装");
+        ui->label_Engine_Status->setStyleSheet(
+            ready ? "color: #2EAD4B;" : "color: #CC3333;");
+        ui->widget_Engine->setToolTip(
+            ready ? "SenseVoice 离线语音识别已就绪，支持中/英/日/韩/粤"
+                  : "未找到模型文件，请将 models/sense-voice/ 放入应用目录");
+    }
     refreshGlobalHotkeyBinderState();
     refreshContinuousHotkeyBinderState();
     //ElaKeyBinder构造时会用window()创建原生弹窗，延迟重建可确保父窗口已稳定。
@@ -70,20 +86,6 @@ void SettingChild_Speech::on_BreadcrumbBar_breadcrumbClicked(
     Q_UNUSED(breadcrumb)
     Q_UNUSED(lastBreadcrumbList)
     ui->stackedWidget->setCurrentIndex(0);
-    refreshBaiduStatus();
-}
-
-/*进入下一级*/
-void SettingChild_Speech::on_pushButton_Baidu_Set_clicked()
-{
-    ui->stackedWidget->setCurrentIndex(1);
-    ui->BreadcrumbBar->appendBreadcrumb("百度语音识别");
-
-    ZcJsonLib config(JsonSettingPath);
-    ui->lineEdit_BaiduApiKey->setText(
-        config.value("speechInput/Baidu/ApiKey").toString());
-    ui->lineEdit_BaiduSecretKey->setText(
-        config.value("speechInput/Baidu/SecretKey").toString());
 }
 
 /*启用输入*/
@@ -101,35 +103,6 @@ void SettingChild_Speech::on_ToggleSwitch_GlobalHotkeyEnable_toggled(
     config.setValue("speechInput/GlobalHotkey/Enable", checked);
     refreshGlobalHotkeyBinderState();
     emit speechConfigChanged();
-}
-
-void SettingChild_Speech::on_lineEdit_BaiduApiKey_textChanged(const QString &arg1)
-{
-    ZcJsonLib config(JsonSettingPath);
-    config.setValue("speechInput/Baidu/ApiKey", arg1);
-    refreshBaiduStatus();
-    emit speechConfigChanged();
-}
-
-void SettingChild_Speech::on_lineEdit_BaiduSecretKey_textChanged(
-    const QString &arg1)
-{
-    ZcJsonLib config(JsonSettingPath);
-    config.setValue("speechInput/Baidu/SecretKey", arg1);
-    refreshBaiduStatus();
-    emit speechConfigChanged();
-}
-
-/*刷新状态*/
-void SettingChild_Speech::refreshBaiduStatus()
-{
-    ZcJsonLib config(JsonSettingPath);
-    const QString apiKey =
-        config.value("speechInput/Baidu/ApiKey").toString().trimmed();
-    const QString secretKey =
-        config.value("speechInput/Baidu/SecretKey").toString().trimmed();
-
-    ui->label_Baidu_Status->setVisible(!apiKey.isEmpty() && !secretKey.isEmpty());
 }
 
 void SettingChild_Speech::on_keyBinder_GlobalHotkey_binderKeyTextChanged(

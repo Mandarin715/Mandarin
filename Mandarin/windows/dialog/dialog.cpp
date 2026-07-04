@@ -7,6 +7,7 @@
 #include "../../utils/CustomScrollBinder.h"
 #include "../../utils/DragHelper.h"
 #include "../../utils/WakeWordDetector.h"
+#include "../../utils/OfflineSpeechRecognizer.h"
 
 #include "ZcJsonLib.h"
 #include <QCoreApplication>
@@ -333,8 +334,6 @@ void Dialog::stopPendingConversationState()
 
     if (m_vitsPlayer)
         m_vitsPlayer->stop();
-
-    m_isSpeechRecognizing = false;
 }
 
 /*构建窗口*/
@@ -421,7 +420,7 @@ void Dialog::initServices()
                     // VITS 全部播放完毕后切回默认立绘
                     {
                         const bool allDone = isAllVitsDone();
-                        if (allDone && !m_isSpeechRecording && !m_isSpeechRecognizing)
+                        if (allDone && !m_isSpeechRecording)
                         {
                             QTimer::singleShot(m_continuousAudioDelayMs, this, [this]() {
                                 emit requestSetCharTachie("default");
@@ -435,10 +434,9 @@ void Dialog::initServices()
                         const bool allDone = isAllVitsDone();
                         qDebug() << "[Continuous] VITS stopped | allDone:" << allDone
                                  << "| recording:" << m_isSpeechRecording
-                                 << "| recognizing:" << m_isSpeechRecognizing
                                  << "| readyFiles:" << m_vitsReadyFiles.size()
                                  << "| inFlight:" << m_vitsInFlightCount;
-                        if (allDone && !m_isSpeechRecording && !m_isSpeechRecognizing)
+                        if (allDone && !m_isSpeechRecording)
                         {
                             qDebug() << "Continuous mode: VITS stopped, waiting"
                                      << m_continuousAudioDelayMs << "ms...";
@@ -459,7 +457,8 @@ void Dialog::initServices()
     const ZcJsonLib config(JsonSettingPath);
     reloadAIConfig(config);
     reloadSpeechInputConfig(config);
-    QTimer::singleShot(500, this, &Dialog::initWakeWord); // 延迟加载ONNX，窗口渲染完毕后再加载
+    QTimer::singleShot(500, this, &Dialog::initWakeWord);          // 延迟加载唤醒词ONNX
+    QTimer::singleShot(500, this, &Dialog::initSpeechRecognizer); // 延迟加载语音识别模型
 
     // 轮询定时器：每100ms读取音频+检测语音活动，25帧(2.5秒)无声音自动停止
     m_silencePollTimer = new QTimer(this);
@@ -627,7 +626,7 @@ void Dialog::initServices()
                 // VITS 播放完毕/无语音时，延迟切回默认立绘
                 {
                     const bool allDone = isAllVitsDone();
-                    if (allDone && !m_isSpeechRecording && !m_isSpeechRecognizing)
+                    if (allDone && !m_isSpeechRecording)
                     {
                         QTimer::singleShot(m_continuousAudioDelayMs, this, [this]() {
                             emit requestSetCharTachie("default");
@@ -662,9 +661,8 @@ void Dialog::initServices()
                     const bool allDone = isAllVitsDone();
                     qDebug() << "[Continuous] replyReceived | allDone:" << allDone
                              << "| recording:" << m_isSpeechRecording
-                             << "| recognizing:" << m_isSpeechRecognizing
                                  << "| inFlight:" << m_vitsInFlightCount;
-                    if (allDone && !m_isSpeechRecording && !m_isSpeechRecognizing)
+                    if (allDone && !m_isSpeechRecording)
                     {
                         qDebug() << "Continuous mode: no VITS audio, starting next recording";
                         QTimer::singleShot(500, this, [this]() {
@@ -1454,8 +1452,7 @@ void Dialog::startSpeechRecording()
 
 void Dialog::startSpeechRecordingFromHotkey()
 {
-    if (!ui->textEdit->isEnabled() || m_isSpeechRecording ||
-        m_isSpeechRecognizing)
+    if (!ui->textEdit->isEnabled() || m_isSpeechRecording)
         return;
 
     // 停止语音唤醒，释放麦克风给录音使用
@@ -1568,23 +1565,19 @@ void Dialog::stopSpeechRecording()
         return;
     }
 
-    // 保存PCM到文件
-    QDir().mkpath(QFileInfo(speechRecordFilePath()).absolutePath());
-    QFile file(speechRecordFilePath());
-    if (!file.open(QIODevice::WriteOnly))
+    // 离线语音识别（SenseVoice），直接使用内存中的 PCM 数据
+    QString recognizedText;
+    if (m_speechRecognizer && m_speechRecognizer->isInitialized())
     {
-        m_capturedAudioData.clear();
-        return;
+        recognizedText = m_speechRecognizer->recognize(m_capturedAudioData).trimmed();
     }
-    file.write(m_capturedAudioData);
-    file.close();
+    else
+    {
+        const QString msg = QStringLiteral("语音识别模型未就绪，请确保 models/sense-voice/ 目录包含模型文件");
+        ui->textEdit->setText(msg);
+        showTemporaryMessage(msg);
+    }
     m_capturedAudioData.clear();
-
-    // 送百度识别
-    m_isSpeechRecognizing = true;
-    const QString recognizedText =
-        recognizeSpeechFromFile(speechRecordFilePath()).trimmed();
-    m_isSpeechRecognizing = false;
 
     if (recognizedText.isEmpty())
     {
@@ -1646,131 +1639,37 @@ QString Dialog::speechRecordFilePath() const
     return QDir(QDir::tempPath()).filePath("Mandarin/speech_input.pcm");
 }
 
-/*获取百度 Token*/
-QString Dialog::requestBaiduAccessToken(const QString &apiKey,
-                                        const QString &secretKey)
+/*初始化离线语音识别（SenseVoice）*/
+void Dialog::initSpeechRecognizer()
 {
-    if (apiKey.trimmed().isEmpty() || secretKey.trimmed().isEmpty())
-        return QString();
-
-    // 缓存Token：30天有效期，避免每次语音识别都请求OAuth
-    if (!m_cachedBaiduToken.isEmpty() &&
-        m_baiduTokenExpiry.isValid() &&
-        QDateTime::currentDateTime() < m_baiduTokenExpiry)
+    // 先清理旧实例
+    if (m_speechRecognizer)
     {
-        return m_cachedBaiduToken;
+        delete m_speechRecognizer;
+        m_speechRecognizer = nullptr;
     }
 
-    QNetworkAccessManager manager;
-    QUrl url("https://aip.baidubce.com/oauth/2.0/token");
-    QUrlQuery query;
-    query.addQueryItem("grant_type", "client_credentials");
-    query.addQueryItem("client_id", apiKey);
-    query.addQueryItem("client_secret", secretKey);
-    url.setQuery(query);
+    const QString modelDir =
+        QCoreApplication::applicationDirPath() + "/models/sense-voice";
 
-    QNetworkRequest request(url);
-    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-
-    QEventLoop loop;
-    QNetworkReply *reply = manager.post(request, QByteArray());
-    QString accessToken;
-    connect(reply, &QNetworkReply::finished, &loop, [&]()
-            {
-                if (reply->error() == QNetworkReply::NoError)
-                {
-                    const QJsonDocument doc =
-                        QJsonDocument::fromJson(reply->readAll());
-                    accessToken =
-                        doc.object().value("access_token").toString().trimmed();
-                }
-                reply->deleteLater();
-                loop.quit(); });
-    loop.exec();
-    // 缓存获取到的Token，30天有效期（百度默认）
-    if (!accessToken.isEmpty())
+    if (!QDir(modelDir).exists())
     {
-        m_cachedBaiduToken = accessToken;
-        m_baiduTokenExpiry = QDateTime::currentDateTime().addDays(29);
-    }
-    return accessToken;
-}
-
-/*识别录音文件*/
-QString Dialog::recognizeSpeechFromFile(const QString &filePath)
-{
-    QFile file(filePath);
-    if (!file.exists() || file.size() <= 0)
-        return QString();
-
-    ZcJsonLib config(JsonSettingPath);
-    const QString apiKey =
-        config.value("speechInput/Baidu/ApiKey").toString().trimmed();
-    const QString secretKey =
-        config.value("speechInput/Baidu/SecretKey").toString().trimmed();
-    const QString accessToken = requestBaiduAccessToken(apiKey, secretKey);
-    if (accessToken.isEmpty())
-    {
-        const QString msg = QStringLiteral("百度语音识别配置不完整或 Token 获取失败");
-        ui->textEdit->setText(msg);
-        showTemporaryMessage(msg);
-        return QString();
+        qDebug() << "SpeechRecognizer: model dir not found:" << modelDir
+                 << "— speech recognition unavailable";
+        return;
     }
 
-    if (!file.open(QIODevice::ReadOnly))
+    m_speechRecognizer = new OfflineSpeechRecognizer(this);
+    if (m_speechRecognizer->init(modelDir))
     {
-        const QString msg = QStringLiteral("无法读取录音文件");
-        ui->textEdit->setText(msg);
-        showTemporaryMessage(msg);
-        return QString();
+        qDebug() << "SpeechRecognizer: SenseVoice initialized successfully";
     }
-    const QByteArray audioData = file.readAll();
-    file.close();
-    if (audioData.isEmpty())
-        return QString();
-
-    //沿用旧项目的百度短语音识别请求格式，直接提交 PCM 的 Base64 数据
-    QJsonObject payload{
-        {"format", "pcm"},
-        {"rate", 16000},
-        {"channel", 1},
-        {"token", accessToken},
-        {"cuid", QUuid::createUuid().toString(QUuid::WithoutBraces)},
-        {"speech", QString::fromLatin1(audioData.toBase64())},
-        {"len", audioData.size()},
-    };
-
-    QNetworkAccessManager manager;
-    QNetworkRequest request(QUrl("https://vop.baidu.com/server_api"));
-    request.setRawHeader("Content-Type", "application/json");
-    request.setRawHeader("Accept", "application/json");
-
-    QEventLoop loop;
-    QNetworkReply *reply =
-        manager.post(request, QJsonDocument(payload).toJson(QJsonDocument::Compact));
-    QString recognizedText;
-    connect(reply, &QNetworkReply::finished, &loop, [&]()
-            {
-                if (reply->error() == QNetworkReply::NoError)
-                {
-                    const QJsonDocument doc =
-                        QJsonDocument::fromJson(reply->readAll());
-                    const QJsonArray result =
-                        doc.object().value("result").toArray();
-                    if (!result.isEmpty())
-                        recognizedText = result.first().toString().trimmed();
-                }
-                reply->deleteLater();
-                loop.quit(); });
-    loop.exec();
-
-    if (recognizedText.isEmpty())
+    else
     {
-        const QString msg = QStringLiteral("没有识别到有效语音");
-        ui->textEdit->setText(msg);
-        showTemporaryMessage(msg);
+        qWarning() << "SpeechRecognizer: SenseVoice init failed";
+        delete m_speechRecognizer;
+        m_speechRecognizer = nullptr;
     }
-    return recognizedText;
 }
 
 bool Dialog::handleSpeechHotkeyEvent(quint32 vkCode, bool isKeyDown, bool isKeyUp)
@@ -2854,7 +2753,7 @@ void Dialog::onWakeWordDetected(const QString &keyword)
     // AI正在生成回复时不响应（继续按钮不可见表示生成中）
     if (!ui->textEdit->isEnabled() && !ui->pushButton_next->isVisible())
         return;
-    if (m_isSpeechRecording || m_isSpeechRecognizing)
+    if (m_isSpeechRecording)
         return;
 
     // 全部延迟到下一事件循环，避免在 audio callback 栈中 stop/delete
@@ -2862,7 +2761,7 @@ void Dialog::onWakeWordDetected(const QString &keyword)
         this,
         [this]()
         {
-            if (m_isSpeechRecording || m_isSpeechRecognizing)
+            if (m_isSpeechRecording)
                 return;
             stopWakeWord();
             // 隐藏状态下自动弹出聊天栏

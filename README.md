@@ -50,7 +50,7 @@
 - **前端 UI**：Qt 6.6.3 + ElaWidgetTools（Windows 11 Fluent Design 风格）
 - **AI 对话**：支持 DeepSeek / OpenAI / 自定义兼容 API，流式 SSE 传输
 - **语音合成**：VITS 日语 TTS，HTTP 流式分词合成
-- **语音识别**：百度短语音识别 API，16kHz PCM 音频
+- **语音识别**：SenseVoice 离线语音识别（sherpa-onnx），无需联网、无需 API Key
 - **唤醒词**：sherpa-onnx 离线关键词识别（KWS），无需联网
 - **构建工具**：CMake + MSVC 2022，GitHub Actions 自动发布
 
@@ -114,7 +114,7 @@
 
 1. 右键系统托盘图标 → 设置
 2. 「对话模型」→ 选择服务商 → 填入 API Key → 点击「获取」
-3. （语音输入需）「语音输入设置」→ 填入百度语音识别 API Key
+3. 语音识别已内置 SenseVoice 离线引擎，无需额外配置
 
 ### Step 4：联网搜索（可选）
 
@@ -175,7 +175,7 @@
 | [DeepSeek API](https://platform.deepseek.com/api_keys) | AI 对话（默认） |
 | [OpenAI API](https://platform.openai.com/api-keys) | AI 对话（可选） |
 | [百度千帆 AI 搜索](https://console.bce.baidu.com/qianfan/ais/console/applicationConsole/application) | 联网搜索 |
-| [百度语音识别](https://console.bce.baidu.com/ai/#/ai/speech/overview/index) | 语音输入 |
+| [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | 语音识别 + 语音唤醒 |
 | [Kimi 视觉模型](https://platform.moonshot.cn/) | 屏幕识别 |
 
 ---
