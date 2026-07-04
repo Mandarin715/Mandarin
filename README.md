@@ -111,7 +111,36 @@
 2. 「对话模型」→ 选择服务商 → 填入 API Key → 点击「获取」
 3. （语音输入需）「语音输入设置」→ 填入百度语音识别 API Key
 
-### Step 4：导入角色
+### Step 4：联网搜索（可选）
+
+> 仅文字对话可跳过此步。开启后桌宠会自动判断是否需要联网查询。
+
+1. 申请搜索 API（任选一个）：
+   - [百度千帆 AI 搜索](https://console.bce.baidu.com/qianfan/ais/console/applicationConsole/application) — 免费额度，国内首选
+   - [SearXNG](https://docs.searxng.org/) — 自部署，无限制
+   - [Bing Web Search](https://portal.azure.com/) — Azure 订阅
+   - [SerpAPI](https://serpapi.com/) — 付费，稳定
+2. 设置 → 「联网搜索」→ 填入 API Key / Base URL
+3. 对话中直接说"帮我搜一下xxx"即可触发
+
+### Step 5：屏幕识别（可选）
+
+> 桌宠可以"看到"你的屏幕内容并和你讨论。
+
+1. 申请 [Kimi 视觉模型 API Key](https://platform.moonshot.cn/)（默认，推荐）
+2. 或使用 OpenAI 兼容的视觉 API（如 GPT-4V）
+3. 设置 → 「屏幕捕获」→ 填入 API Key
+4. 对话中说"看看屏幕"或点击截图按钮触发
+
+### Step 6：应用调用（可选）
+
+> 让桌宠帮你打开本地应用。
+
+1. 设置 → 「应用调用」
+2. 添加关键词（如"微信"）和程序路径（如 `C:\Program Files\Tencent\WeChat\WeChat.exe`）
+3. 对话中说"打开微信"即可启动
+
+### Step 7：导入角色
 
 1. 在 [Release](https://github.com/Mandarin715/Mandarin/releases) （1.6.1版本及以前）下载角色包（如 Atri.zip）
 2. 设置 → 角色设置 → 导入
@@ -138,5 +167,10 @@
 | [Liniyous/ElaWidgetTools](https://github.com/Liniyous/ElaWidgetTools) | Fluent UI for Qt |
 | [Artrajz/vits-simple-api](https://github.com/Artrajz/vits-simple-api) | VITS 语音合成 |
 | [Qt](https://www.qt.io/) | 跨平台 C++ 框架 |
+| [DeepSeek API](https://platform.deepseek.com/api_keys) | AI 对话（默认） |
+| [OpenAI API](https://platform.openai.com/api-keys) | AI 对话（可选） |
+| [百度千帆 AI 搜索](https://console.bce.baidu.com/qianfan/ais/console/applicationConsole/application) | 联网搜索 |
+| [百度语音识别](https://console.bce.baidu.com/ai/#/ai/speech/overview/index) | 语音输入 |
+| [Kimi 视觉模型](https://platform.moonshot.cn/) | 屏幕识别 |
 
 ---
