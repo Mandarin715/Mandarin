@@ -9,7 +9,6 @@
 #include <QHBoxLayout>
 #include <QJsonArray>
 #include <QJsonObject>
-#include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
 #include <QVBoxLayout>
@@ -62,42 +61,39 @@ void SettingChild_AppLauncher::addCard(const QString &keyword,
     card.area->setToolTip("输入含关键词的文本时自动启动对应应用");
 
     auto *outerLayout = new QVBoxLayout(card.area);
-    outerLayout->setContentsMargins(12, 8, 12, 8);
-    outerLayout->setSpacing(6);
+    outerLayout->setContentsMargins(14, 6, 14, 6);
+    outerLayout->setSpacing(4);
 
-    // ── 标题行：编号 + 删除按钮 ──
-    auto *headerRow = new QHBoxLayout();
-    auto *labelIndex = new QLabel(QString("应用 #%1").arg(index + 1), card.area);
-    labelIndex->setStyleSheet("font-weight:bold;font-size:13px;color:#666;");
-    headerRow->addWidget(labelIndex);
-    headerRow->addStretch();
-    auto *btnDelete = new QPushButton("✕", card.area);
-    btnDelete->setFixedSize(28, 28);
-    btnDelete->setStyleSheet(
-        "QPushButton{background:#e0e0e0;border:none;border-radius:14px;"
-        "font-size:14px;color:#888;}QPushButton:hover{background:#e74c3c;color:#fff;}");
-    headerRow->addWidget(btnDelete);
-    outerLayout->addLayout(headerRow);
+    // 标签固定宽度，保证多卡片对齐
+    constexpr int kLabelWidth = 55;
 
-    // ── 关键词行 ──
+    // ── 关键词行：标签 + 输入框 + 删除按钮 ──
     auto *keywordRow = new QHBoxLayout();
+    keywordRow->setSpacing(8);
     auto *kwLabel = new ElaText(card.area);
     kwLabel->setText("关键词");
     kwLabel->setFont(QFont(kwLabel->font().family(), 12));
-    kwLabel->setMinimumWidth(50);
+    kwLabel->setMinimumWidth(kLabelWidth);
     keywordRow->addWidget(kwLabel);
     card.keywordEdit = new QLineEdit(card.area);
     card.keywordEdit->setText(keyword);
     card.keywordEdit->setPlaceholderText("例如：打开记事本");
     keywordRow->addWidget(card.keywordEdit, 1);
+    auto *btnDelete = new QPushButton("✕", card.area);
+    btnDelete->setFixedSize(28, 28);
+    btnDelete->setStyleSheet(
+        "QPushButton{background:#e0e0e0;border:none;border-radius:14px;"
+        "font-size:14px;color:#888;}QPushButton:hover{background:#e74c3c;color:#fff;}");
+    keywordRow->addWidget(btnDelete);
     outerLayout->addLayout(keywordRow);
 
-    // ── 路径行 ──
+    // ── 路径行：标签 + 输入框 + 浏览按钮 ──
     auto *pathRow = new QHBoxLayout();
+    pathRow->setSpacing(8);
     auto *pLabel = new ElaText(card.area);
     pLabel->setText("路  径");
     pLabel->setFont(QFont(pLabel->font().family(), 12));
-    pLabel->setMinimumWidth(50);
+    pLabel->setMinimumWidth(kLabelWidth);
     pathRow->addWidget(pLabel);
     card.pathEdit = new QLineEdit(card.area);
     card.pathEdit->setText(path);
@@ -147,24 +143,6 @@ void SettingChild_AppLauncher::removeCard(int index)
     ui->verticalLayout_Cards->removeWidget(card.area);
     card.area->deleteLater();
     m_cards.removeAt(index);
-
-    // 重新编号：遍历每个卡片，找到 header 里的 QLabel 更新
-    for (int i = 0; i < m_cards.size(); ++i)
-    {
-        auto *areaLayout = m_cards[i].area->layout();
-        if (!areaLayout || areaLayout->count() < 1)
-            continue;
-        // 第一项是 headerRow (QHBoxLayout)
-        auto *item = areaLayout->itemAt(0);
-        if (!item)
-            continue;
-        auto *headerLayout = item->layout();
-        if (!headerLayout || headerLayout->count() < 1)
-            continue;
-        auto *label = qobject_cast<QLabel *>(headerLayout->itemAt(0)->widget());
-        if (label)
-            label->setText(QString("应用 #%1").arg(i + 1));
-    }
 }
 
 void SettingChild_AppLauncher::saveAll()

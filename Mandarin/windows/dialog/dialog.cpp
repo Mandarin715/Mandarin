@@ -404,6 +404,17 @@ void Dialog::initServices()
     m_vitsPlayer = new QMediaPlayer(this);
     m_vitsAudioOutput = new QAudioOutput(this);
     m_vitsPlayer->setAudioOutput(m_vitsAudioOutput);
+    // 音频输出设备切换时（耳机热插拔等）刷新，不每句重建
+    auto *mediaDevices = new QMediaDevices(this);
+    connect(mediaDevices, &QMediaDevices::audioOutputsChanged, this, [this]() {
+        if (m_vitsPlayer && m_vitsPlayer->playbackState() == QMediaPlayer::StoppedState)
+        {
+            delete m_vitsAudioOutput;
+            m_vitsAudioOutput = new QAudioOutput(this);
+            m_vitsPlayer->setAudioOutput(m_vitsAudioOutput);
+            qDebug() << "VITS audio output device refreshed";
+        }
+    });
     //播放完成后播放下一条
     connect(m_vitsPlayer, &QMediaPlayer::playbackStateChanged, this,
             [this](QMediaPlayer::PlaybackState state)
@@ -460,12 +471,15 @@ void Dialog::initServices()
     QTimer::singleShot(500, this, &Dialog::initWakeWord);          // 延迟加载唤醒词ONNX
     QTimer::singleShot(500, this, &Dialog::initSpeechRecognizer); // 延迟加载语音识别模型
 
-    // 轮询定时器：每100ms读取音频+检测语音活动，25帧(2.5秒)无声音自动停止
+    // 轮询定时器：每100ms读取音频+检测语音活动，静音超限自动停止
+    // 录音前 1 秒为保护期，防止麦克风预热期误触发停止
+    static constexpr int kMinRecordFrames = 1000 / kSilencePollMs; // 10 帧 = 1 秒
     m_silencePollTimer = new QTimer(this);
     m_silencePollTimer->setInterval(kSilencePollMs);
-    connect(m_silencePollTimer, &QTimer::timeout, this, [this]() {
+    connect(m_silencePollTimer, &QTimer::timeout, this, [this, recordFrame = 0]() mutable {
         if (!m_isSpeechRecording || !m_speechAudioDevice)
             return;
+        recordFrame++;
         bool speechDetected = false;
         float maxRms = 0.0f;
         while (m_speechAudioDevice->bytesAvailable() > 0)
@@ -499,14 +513,23 @@ void Dialog::initServices()
                          << "| bytes:" << m_capturedAudioData.size();
             m_silentFrameCount = 0;
         }
-        else
+        else if (recordFrame > kMinRecordFrames)
         {
+            // 保护期过后才开始累计静音帧
             m_silentFrameCount++;
             if (m_silentFrameCount % 10 == 1)
                 qDebug() << "[Poll] silence frame" << m_silentFrameCount
                          << "| maxRms:" << maxRms
                          << "| bytes:" << m_capturedAudioData.size()
                          << "| threshold:" << kSilenceThreshold;
+            // 倒计时提示：让用户感知剩余时间
+            const int remaining = m_silenceFrameMax - m_silentFrameCount;
+            if (remaining <= 10) // 只剩 1 秒内才显示倒计时
+            {
+                const double sec = remaining * kSilencePollMs / 1000.0;
+                ui->textEdit->setText(
+                    QStringLiteral("录音中 ⏳ %1s").arg(sec, 0, 'f', 1));
+            }
         }
         // 连续静音达到上限 → 停止录音
         if (m_silentFrameCount >= m_silenceFrameMax)
@@ -1189,11 +1212,6 @@ void Dialog::tryStartNextVitsPlayback()
     if (!m_vitsTempFile)
         return;
 
-    // 每次播放前刷新音频输出设备，跟随系统默认（耳机热插拔等）
-    delete m_vitsAudioOutput;
-    m_vitsAudioOutput = new QAudioOutput(this);
-    m_vitsPlayer->setAudioOutput(m_vitsAudioOutput);
-
     //播放严格串行：只有播放器空闲才取下一句。
     m_vitsPlayer->setSource(QUrl::fromLocalFile(m_vitsTempFile->fileName()));
     m_vitsPlayer->play();
@@ -1579,11 +1597,42 @@ void Dialog::stopSpeechRecording()
     }
     m_capturedAudioData.clear();
 
+    // ── 识别结果过滤：拒绝环境噪音/无意义输出 ──
+    if (!recognizedText.isEmpty())
+    {
+        int cjkChars = 0;  // CJK 汉字
+        int latinChars = 0; // 拉丁字母
+        for (const QChar &ch : recognizedText)
+        {
+            const ushort uc = ch.unicode();
+            if ((uc >= 0x4E00 && uc <= 0x9FFF) ||
+                (uc >= 0x3400 && uc <= 0x4DBF))
+            {
+                cjkChars++;
+            }
+            else if ((uc >= 'a' && uc <= 'z') || (uc >= 'A' && uc <= 'Z'))
+            {
+                latinChars++;
+            }
+        }
+        // CJK 文本 ≥ 2 字即有效（"你好"、"嗯好"）
+        // 纯拉丁文本需 ≥ 5 字母才有效（过滤 "the"、"a"、"is" 等幻觉短词）
+        const bool valid = (cjkChars >= 2) || (latinChars >= 5) ||
+                           (cjkChars >= 1 && latinChars >= 3); // 中英混合如"OK吧"
+        if (!valid)
+        {
+            qDebug() << "[Filter] rejected noise:" << recognizedText
+                     << "| cjk:" << cjkChars << "latin:" << latinChars;
+            recognizedText.clear();
+        }
+    }
+
     if (recognizedText.isEmpty())
     {
         ui->label_name->setText(QStringLiteral("你"));
+        ui->textEdit->clear();
         if (m_continuousMode)
-            QTimer::singleShot(500, this, &Dialog::startSpeechRecordingFromHotkey);
+            QTimer::singleShot(300, this, &Dialog::startSpeechRecordingFromHotkey);
         return;
     }
 
