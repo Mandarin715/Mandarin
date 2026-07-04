@@ -109,7 +109,7 @@
 便携包已内置语音识别模型（`models/sense-voice/`），无需额外操作即可使用语音输入。
 
 如未下载便携包或需手动安装模型：
-1. 下载 SenseVoice 模型：[hf-mirror.com](https://hf-mirror.com/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17)（选 `model.int8.onnx` + `tokens.txt`）
+1. 下载 SenseVoice 模型：[hf-mirror.com](https://hf-mirror.com/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17)（点击文件与版本）（选 `model.int8.onnx` + `tokens.txt`）
 2. 放入 Mandarin 目录下的 `models/sense-voice/` 文件夹
 3. 重启 Mandarin，设置 → 语音输入设置 → 确认引擎状态为「已就绪」
 
