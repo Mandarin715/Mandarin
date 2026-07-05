@@ -50,6 +50,8 @@ SettingChild_Speech::SettingChild_Speech(QWidget *parent)
         config.value("speechInput/ContinuousAudioDelayMs", 2500).toInt());
     ui->spinBox_SilenceTimeout->setValue(
         config.value("speechInput/SilenceTimeoutMs", 1500).toInt());
+    ui->spinBox_SilenceThreshold->setValue(
+        config.value("speechInput/SilenceThreshold", 0.005).toDouble());
 
     // SenseVoice 模型状态检测
     {
@@ -300,5 +302,12 @@ void SettingChild_Speech::on_spinBox_SilenceTimeout_valueChanged(int value)
 {
     ZcJsonLib config(JsonSettingPath);
     config.setValue("speechInput/SilenceTimeoutMs", value);
+    emit speechConfigChanged();
+}
+
+void SettingChild_Speech::on_spinBox_SilenceThreshold_valueChanged(double value)
+{
+    ZcJsonLib config(JsonSettingPath);
+    config.setValue("speechInput/SilenceThreshold", value);
     emit speechConfigChanged();
 }

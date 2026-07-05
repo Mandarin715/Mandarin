@@ -4,6 +4,7 @@
 #include "child/settingchild_about.h"
 #include "child/settingchild_char.h"
 #include "child/settingchild_general.h"
+#include "child/settingchild_memory.h"
 #include "child/settingchild_llm.h"
 #include "child/settingchild_plugin.h"
 #include "child/settingchild_appLauncher.h"
@@ -52,6 +53,9 @@ MainWindow::MainWindow(Dialog *dialog, Tachie *tachie, QWidget *parent)
     SettingChild_Char *settingchild_charWin = new SettingChild_Char(this);
     settingchild_charWin->show();
     addPageNode("角色设置", settingchild_charWin, ElaIconType::SquareUser);
+    SettingChild_Memory *settingchild_memoryWin = new SettingChild_Memory(this);
+    settingchild_memoryWin->show();
+    addPageNode("对话记忆", settingchild_memoryWin, ElaIconType::Bookmark);
     SettingChild_About *settingchild_aboutWin = new SettingChild_About(this);
     settingchild_aboutWin->show();
     QString aboutKey = QStringLiteral("about");

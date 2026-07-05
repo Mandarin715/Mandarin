@@ -17,8 +17,8 @@ class QAudioOutput;
 class QAudioSource;
 class QMediaPlayer;
 class QNetworkAccessManager;
+class QBuffer;
 class QIODevice;
-class QTemporaryFile;
 class WakeWordDetector;
 class OfflineSpeechRecognizer;
 
@@ -126,16 +126,17 @@ class Dialog : public QWidget
     bool m_streamVitsSentenceSplitEnabled = true;
     int m_streamSynthCursor = 0;
     QStringList m_vitsPendingTexts;
-    QList<QTemporaryFile *> m_vitsReadyFiles;
+    QMap<int, QBuffer *> m_vitsReadyFiles; // key=序号，保证并发乱序完成时按原文序播放
     int m_vitsInFlightCount = 0;
-    static constexpr int kVitsMaxConcurrent = 2;
+    int m_vitsSeqNext = 0;
+    static constexpr int kVitsMaxConcurrent = 3;
     QNetworkAccessManager *m_vitsManager = nullptr;
     QMediaPlayer *m_vitsPlayer = nullptr;
     QString m_cachedVitsApiUrl;
     QString m_cachedVitsModel;
     QString m_cachedVitsSpeaker;
     QAudioOutput *m_vitsAudioOutput = nullptr;
-    QTemporaryFile *m_vitsTempFile = nullptr;
+    QBuffer *m_vitsTempFile = nullptr;
     void tryStartNextVitsPlayback();
     bool submitCurrentInput();
     // 记忆功能
@@ -174,7 +175,7 @@ class Dialog : public QWidget
     // 静音检测：100ms轮询+帧计数器，25帧(2.5秒)无声音自动停止录音
     QTimer *m_silencePollTimer = nullptr;
     int m_silentFrameCount = 0;
-    static constexpr float kSilenceThreshold = 0.005f;
+    float m_silenceThreshold = 0.005f; // 静音 RMS 阈值，从配置读取
     static constexpr int kSilencePollMs = 100;
     int m_silenceFrameMax = 15; // 静默帧上限，从配置读取，默认 1.5s
     void initWakeWord();

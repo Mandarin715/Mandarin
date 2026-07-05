@@ -40,7 +40,8 @@
 #include <QPropertyAnimation>
 #include <QPixmap>
 #include <QScreen>
-#include <QTemporaryFile>
+#include <QBuffer>
+#include <QElapsedTimer>
 #include <QUrlQuery>
 #include <QUuid>
 #include <QWheelEvent>
@@ -128,9 +129,21 @@ static int findNextSentenceEnd(const QString &text, int start)
     for (int i = qMax(0, start); i < text.size(); ++i)
     {
         const QChar ch = text.at(i);
-        if (ch == QChar('.') || ch == QChar('!') || ch == QChar('?') ||
-            ch == QChar('\n') || ch == QStringLiteral("。").at(0) ||
-            ch == QStringLiteral("！").at(0) || ch == QStringLiteral("？").at(0))
+        const ushort uc = ch.unicode();
+        // 句末标点（强停顿，必然分句）
+        if (uc == '.' || uc == '!' || uc == '?' || uc == '\n' ||
+            uc == 0x3002 || // 。
+            uc == 0xFF01 || // ！
+            uc == 0xFF1F)   // ？
+            return i;
+        // 句中停顿标点（顿号、逗号、省略号、波浪线、引号闭合等，人正常说话会稍作停顿）
+        if (uc == 0x3001 || // 、
+            uc == ',' ||    // ,
+            uc == 0xFF0C || // ，（全角逗号）
+            uc == 0x2026 || // …
+            uc == 0xFF5E || // ～（全角波浪）
+            uc == 0x301C || // 〜（日文波浪）
+            uc == 0x300D)   // 」（右引号，日文语料中常标志句末）
             return i;
     }
     return -1;
@@ -319,7 +332,7 @@ void Dialog::stopPendingConversationState()
     m_vitsPendingTexts.clear();
     m_vitsInFlightCount = 0;
 
-    for (QTemporaryFile *file : m_vitsReadyFiles)
+    for (QBuffer *file : m_vitsReadyFiles)
     {
         if (file)
             file->deleteLater();
@@ -426,7 +439,11 @@ void Dialog::initServices()
                         m_vitsTempFile->deleteLater();
                         m_vitsTempFile = nullptr;
                     }
+                    QElapsedTimer gapTimer;
+                    gapTimer.start();
                     tryStartNextVitsPlayback();
+                    if (m_vitsPlayer->playbackState() == QMediaPlayer::PlayingState)
+                        qDebug() << "[VITS] inter-sentence gap:" << gapTimer.elapsed() << "ms";
 
                     // VITS 全部播放完毕后切回默认立绘
                     {
@@ -452,6 +469,9 @@ void Dialog::initServices()
                             qDebug() << "Continuous mode: VITS stopped, waiting"
                                      << m_continuousAudioDelayMs << "ms...";
                             QTimer::singleShot(m_continuousAudioDelayMs, this, [this]() {
+                                // 二次确认：排期期间可能有新的 VITS 合成完成并开始播放
+                                if (!isAllVitsDone())
+                                    return;
                                 if (!ui->textEdit->isEnabled() && ui->pushButton_next->isVisible())
                                 {
                                     ui->textEdit->setEnabled(true);
@@ -503,7 +523,7 @@ void Dialog::initServices()
                 num > 0 ? static_cast<float>(std::sqrt(sumSq / num)) : 0.0f;
             if (rms > maxRms)
                 maxRms = rms;
-            if (rms > kSilenceThreshold)
+            if (rms > m_silenceThreshold)
                 speechDetected = true;
         }
         if (speechDetected)
@@ -521,7 +541,7 @@ void Dialog::initServices()
                 qDebug() << "[Poll] silence frame" << m_silentFrameCount
                          << "| maxRms:" << maxRms
                          << "| bytes:" << m_capturedAudioData.size()
-                         << "| threshold:" << kSilenceThreshold;
+                         << "| threshold:" << m_silenceThreshold;
             // 倒计时提示：让用户感知剩余时间
             const int remaining = m_silenceFrameMax - m_silentFrameCount;
             if (remaining <= 10) // 只剩 1 秒内才显示倒计时
@@ -689,6 +709,9 @@ void Dialog::initServices()
                     {
                         qDebug() << "Continuous mode: no VITS audio, starting next recording";
                         QTimer::singleShot(500, this, [this]() {
+                            // 二次确认：排期期间可能有新的 VITS 合成完成并开始播放
+                            if (!isAllVitsDone())
+                                return;
                             if (!ui->textEdit->isEnabled() && ui->pushButton_next->isVisible())
                             {
                                 ui->textEdit->setEnabled(true);
@@ -852,6 +875,9 @@ void Dialog::reloadSpeechInputConfig(const ZcJsonLib &config)
     m_wakeWordEnabled = wakeWordEnabled;
     m_silenceFrameMax = qMax(5, qMin(50,
         config.value("speechInput/SilenceTimeoutMs", 1500).toInt() / kSilencePollMs));
+    m_silenceThreshold = static_cast<float>(
+        qMax(0.001, qMin(0.05,
+            config.value("speechInput/SilenceThreshold", 0.005).toDouble())));
 }
 
 /*重载连续对话快捷键配置*/
@@ -1155,41 +1181,50 @@ void Dialog::tryStartNextVitsRequest()
             .arg(QString(QUrl::toPercentEncoding(text)))
             .arg(QString(QUrl::toPercentEncoding(m_cachedVitsModel)))
             .arg(QString(QUrl::toPercentEncoding(m_cachedVitsSpeaker)));
+    const int seq = m_vitsSeqNext++; // 分配序号，保证并发完成时仍按序播放
     m_vitsInFlightCount++;
     QNetworkRequest request(urlString);
     request.setTransferTimeout(15000); // 15秒超时，防止VITS挂死
+    request.setRawHeader("Accept-Encoding", "identity"); // 禁用压缩，边收边播
     //发送 GET 请求
     QNetworkReply *reply = m_vitsManager->get(request);
-    //连接信号处理响应
-    QObject::connect(reply, &QNetworkReply::finished, this, [this, reply]()
-                     {
-                         m_vitsInFlightCount--;
 
-                         if (reply->error() == QNetworkReply::NoError)
-                         {
-                             QByteArray audioData = reply->readAll();
-                             if (!audioData.isEmpty())
-                             {
-                                 QTemporaryFile *readyFile =
-                                     new QTemporaryFile(QDir::tempPath() + "/vits_XXXXXX.mp3", this);
-                                 if (readyFile->open())
-                                 {
-                                     readyFile->write(audioData);
-                                     readyFile->flush();
-                                     //合成完成先入就绪队列，播放端按顺序播放
-                                     m_vitsReadyFiles.append(readyFile);
-                                     tryStartNextVitsPlayback();
-                                 }
-                                 else
-                                 {
-                                     readyFile->deleteLater();
-                                 }
-                             }
-                         }
+    // 性能日志
+    QElapsedTimer *timer = new QElapsedTimer();
+    timer->start();
+    const QString logText = text.left(20) + (text.size() > 20 ? "..." : "");
 
-                         reply->deleteLater();
-                         // 当前请求结束后立即尝试启动更多并发合成
-                         tryStartNextVitsRequest(); });
+    // 内存缓冲区替代磁盘临时文件
+    QBuffer *audioBuffer = new QBuffer(this);
+    audioBuffer->open(QIODevice::WriteOnly);
+
+    QObject::connect(reply, &QNetworkReply::readyRead, this, [=]() {
+        audioBuffer->write(reply->readAll());
+    });
+
+    QObject::connect(reply, &QNetworkReply::finished, this, [=]() {
+        m_vitsInFlightCount--;
+        audioBuffer->close();
+        qDebug() << "[VITS] done | text:" << logText
+                 << "| elapsed:" << timer->elapsed() << "ms"
+                 << "| size:" << audioBuffer->size() << "bytes"
+                 << "| error:" << (reply->error() != QNetworkReply::NoError ? reply->errorString() : "none");
+
+        if (reply->error() == QNetworkReply::NoError && audioBuffer->size() > 0)
+        {
+            audioBuffer->open(QIODevice::ReadOnly);
+            // QMap 按序号自动排序，并发乱序完成也不会错位
+            m_vitsReadyFiles[seq] = audioBuffer;
+            tryStartNextVitsPlayback();
+        }
+        else
+        {
+            audioBuffer->deleteLater();
+        }
+
+        reply->deleteLater();
+        delete timer;
+        tryStartNextVitsRequest(); });
 }
 
 /*启动下一个Vits播放*/
@@ -1208,13 +1243,15 @@ void Dialog::tryStartNextVitsPlayback()
         m_vitsTempFile = nullptr;
     }
 
-    m_vitsTempFile = m_vitsReadyFiles.takeFirst();
+    m_vitsTempFile = m_vitsReadyFiles.first();
+    m_vitsReadyFiles.remove(m_vitsReadyFiles.firstKey());
     if (!m_vitsTempFile)
         return;
 
-    //播放严格串行：只有播放器空闲才取下一句。
-    m_vitsPlayer->setSource(QUrl::fromLocalFile(m_vitsTempFile->fileName()));
+    // QBuffer 已在 finished 中设为 ReadOnly，QMediaPlayer 直接读取，免磁盘 I/O
+    m_vitsPlayer->setSourceDevice(m_vitsTempFile, QUrl("audio.mp3"));
     m_vitsPlayer->play();
+    qDebug() << "[VITS] play started | size:" << m_vitsTempFile->size() << "bytes";
 }
 
 /*提交当前输入*/
@@ -1407,13 +1444,14 @@ skipPromptBuild:
     m_streamDisplayedChinese.clear();
     m_streamSynthCursor = 0;
     m_vitsPendingTexts.clear();
-    for (QTemporaryFile *file : m_vitsReadyFiles)
+    for (QBuffer *file : m_vitsReadyFiles)
     {
         if (file)
             file->deleteLater();
     }
     m_vitsReadyFiles.clear();
     m_vitsInFlightCount = 0;
+    m_vitsSeqNext = 0;
     if (m_vitsTempFile)
     {
         m_vitsTempFile->deleteLater();

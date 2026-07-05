@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>SettingChild_Memory</class>
+ <widget class="QWidget" name="SettingChild_Memory">
+  <property name="geometry">
+   <rect><x>0</x><y>0</y><width>889</width><height>645</height></rect>
+  </property>
+  <property name="windowTitle"><string>Form</string></property>
+  <layout class="QVBoxLayout" name="verticalLayout">
+   <property name="leftMargin"><number>12</number></property>
+   <property name="rightMargin"><number>12</number></property>
+   <item>
+    <widget class="ElaText" name="label_Title">
+     <property name="font"><font><pointsize>10</pointsize></font></property>
+     <property name="text"><string>对话记忆管理</string></property>
+    </widget>
+   </item>
+   <item>
+    <layout class="QHBoxLayout" name="horizontalLayout_Actions">
+     <item>
+      <widget class="ElaPushButton" name="pushButton_ClearAll">
+       <property name="toolTip"><string>清空当前角色的全部对话记忆</string></property>
+       <property name="text"><string>全部清空</string></property>
+       <property name="minimumHeight"><number>28</number></property>
+      </widget>
+     </item>
+     <item>
+      <spacer name="horizontalSpacer_Actions">
+       <property name="orientation"><enum>Qt::Horizontal</enum></property>
+       <property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property>
+      </spacer>
+     </item>
+     <item>
+      <widget class="QPushButton" name="pushButton_Refresh">
+       <property name="toolTip"><string>刷新对话记忆列表</string></property>
+       <property name="text"><string>↻</string></property>
+       <property name="minimumSize"><size><width>28</width><height>28</height></size></property>
+       <property name="maximumSize"><size><width>28</width><height>28</height></size></property>
+       <property name="styleSheet">
+        <string notr="true">QPushButton {
+    background: transparent;
+    border: 1px solid #ddd;
+    border-radius: 14px;
+    font-size: 16px;
+    color: #888;
+}
+QPushButton:hover {
+    background: #e8e8e8;
+    border-color: #bbb;
+    color: #333;
+}</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <widget class="QScrollArea" name="scrollArea_Memory">
+     <property name="frameShape"><enum>QFrame::NoFrame</enum></property>
+     <property name="widgetResizable"><bool>true</bool></property>
+     <property name="styleSheet">
+      <string notr="true">QScrollArea { border: none; background: transparent; }
+QScrollBar:vertical { border: none; background: transparent; width: 8px; }
+QScrollBar::handle:vertical { background: rgba(136,136,136,0.5); border-radius: 4px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }</string>
+     </property>
+     <widget class="QWidget" name="widget_MemoryContainer">
+      <property name="geometry"><rect><x>0</x><y>0</y><width>855</width><height>100</height></rect></property>
+      <layout class="QVBoxLayout" name="verticalLayout_Memory">
+       <property name="leftMargin"><number>0</number></property>
+       <property name="rightMargin"><number>0</number></property>
+       <property name="topMargin"><number>0</number></property>
+       <property name="bottomMargin"><number>0</number></property>
+       <property name="spacing"><number>4</number></property>
+      </layout>
+     </widget>
+    </widget>
+   </item>
+   <item>
+    <spacer name="verticalSpacer">
+     <property name="orientation"><enum>Qt::Vertical</enum></property>
+     <property name="sizeHint" stdset="0">
+      <size><width>20</width><height>40</height></size>
+     </property>
+    </spacer>
+   </item>
+  </layout>
+ </widget>
+ <customwidgets>
+  <customwidget><class>ElaText</class><extends>QLabel</extends><header>ElaText.h</header></customwidget>
+  <customwidget><class>ElaPushButton</class><extends>QPushButton</extends><header>ElaPushButton.h</header></customwidget>
+  <customwidget><class>ElaScrollPageArea</class><extends>QWidget</extends><header>ElaScrollPageArea.h</header><container>1</container></customwidget>
+ </customwidgets>
+ <resources/>
+ <connections/>
+</ui>

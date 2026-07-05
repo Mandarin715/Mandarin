@@ -149,6 +149,7 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
         windows/setting/child/settingchild_plugin.h windows/setting/child/settingchild_plugin.cpp windows/setting/child/settingchild_plugin.ui
         windows/setting/child/settingchild_about.h windows/setting/child/settingchild_about.cpp windows/setting/child/settingchild_about.ui
         windows/setting/child/settingchild_general.h windows/setting/child/settingchild_general.cpp windows/setting/child/settingchild_general.ui
+        windows/setting/child/settingchild_memory.h windows/setting/child/settingchild_memory.cpp windows/setting/child/settingchild_memory.ui
 
     )
 # Define target properties for Android with Qt 6 as:
