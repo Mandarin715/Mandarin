@@ -256,7 +256,12 @@ void Dialog::loadContextHistory()
     {
         const QString line = value.toString();
         if (!line.isEmpty())
+        {
             m_contextHistory.append(line);
+            // 记录最后一条日期标记，避免当天重复插入
+            if (line.startsWith('[') && line.endsWith(']') && line.contains(QStringLiteral("月")))
+                m_lastHistoryDate = line.mid(1, line.size() - 2);
+        }
     }
 }
 
@@ -277,6 +282,13 @@ void Dialog::appendHistoryLine(const QString &line)
 {
     if (line.isEmpty())
         return;
+    // 日期变更时插入日期标记，AI 可据此说"昨天我们聊过..."、"7月3号..."
+    const QString today = QDateTime::currentDateTime().toString("M月d日");
+    if (today != m_lastHistoryDate)
+    {
+        m_lastHistoryDate = today;
+        m_contextHistory.append(QStringLiteral("[%1]").arg(today));
+    }
     m_contextHistory.append(line);
     // 历史超过60行时异步AI压缩
     if (m_contextHistory.size() > 60)
@@ -542,14 +554,11 @@ void Dialog::initServices()
                          << "| maxRms:" << maxRms
                          << "| bytes:" << m_capturedAudioData.size()
                          << "| threshold:" << m_silenceThreshold;
-            // 倒计时提示：让用户感知剩余时间
+            // 倒计时提示：静音开始累积就显示，让用户感知剩余时间
             const int remaining = m_silenceFrameMax - m_silentFrameCount;
-            if (remaining <= 10) // 只剩 1 秒内才显示倒计时
-            {
-                const double sec = remaining * kSilencePollMs / 1000.0;
-                ui->textEdit->setText(
-                    QStringLiteral("录音中 ⏳ %1s").arg(sec, 0, 'f', 1));
-            }
+            const double sec = remaining * kSilencePollMs / 1000.0;
+            ui->textEdit->setText(
+                QStringLiteral("录音中 ⏳ %1s").arg(sec, 0, 'f', 1));
         }
         // 连续静音达到上限 → 停止录音
         if (m_silentFrameCount >= m_silenceFrameMax)
@@ -1294,6 +1303,11 @@ bool Dialog::submitCurrentInput()
                 break;
             }
         }
+        // 兜底：含"看"+"屏幕"也触发
+        if (!triggered && lowerInput.contains(QStringLiteral("看")) &&
+            lowerInput.contains(QStringLiteral("屏幕")))
+            triggered = true;
+
         if (triggered)
         {
             m_lastUserInput = userInput;
@@ -2179,19 +2193,22 @@ void Dialog::reloadAppLauncherConfig(const ZcJsonLib &config)
 QStringList Dialog::screenCaptureTriggerKeywords()
 {
     static const QStringList triggers = {
-        QStringLiteral("看看屏幕"),   QStringLiteral("看下屏幕"),
-        QStringLiteral("看一下屏幕"), QStringLiteral("看一眼屏幕"),
-        QStringLiteral("帮我看看"),   QStringLiteral("帮我看看这个"),
-        QStringLiteral("看看这个"),   QStringLiteral("看下这个"),
-        QStringLiteral("看看这是什么"), QStringLiteral("看看这是啥"),
+        QStringLiteral("看看屏幕"),    QStringLiteral("看下屏幕"),
+        QStringLiteral("看一下屏幕"),  QStringLiteral("看一眼屏幕"),
+        QStringLiteral("看我屏幕"),    QStringLiteral("看看我屏幕"),
+        QStringLiteral("帮我看看"),    QStringLiteral("帮我看看这个"),
+        QStringLiteral("看看这个"),    QStringLiteral("看下这个"),
+        QStringLiteral("看看这是什么"),QStringLiteral("看看这是啥"),
         QStringLiteral("看看我在干什么"), QStringLiteral("看看我在干嘛"),
-        QStringLiteral("看这是什么"), QStringLiteral("看这是啥"),
-        QStringLiteral("截图"),       QStringLiteral("屏幕截图"),
-        QStringLiteral("截屏"),       QStringLiteral("看屏幕"),
-        QStringLiteral("你可以看看"), QStringLiteral("瞧瞧屏幕"),
-        QStringLiteral("瞧瞧这个"),   QStringLiteral("看到什么"),
-        QStringLiteral("看到了什么"), QStringLiteral("扫一眼"),
-        QStringLiteral("识别屏幕"),
+        QStringLiteral("看我在干什么"),QStringLiteral("看我在干嘛"),
+        QStringLiteral("你在干什么"),  QStringLiteral("你在干嘛"),
+        QStringLiteral("看这是什么"),  QStringLiteral("看这是啥"),
+        QStringLiteral("截图"),        QStringLiteral("屏幕截图"),
+        QStringLiteral("截屏"),        QStringLiteral("看屏幕"),
+        QStringLiteral("你可以看看"),  QStringLiteral("瞧瞧屏幕"),
+        QStringLiteral("瞧瞧这个"),    QStringLiteral("看到什么"),
+        QStringLiteral("看到了什么"),  QStringLiteral("扫一眼"),
+        QStringLiteral("识别屏幕"),    QStringLiteral("你在看什么"),
     };
     return triggers;
 }

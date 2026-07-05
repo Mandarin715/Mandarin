@@ -97,6 +97,7 @@ class Dialog : public QWidget
     void stopPendingConversationState();
     bool isHistoryOpen = false;
     QStringList m_contextHistory;
+    QString m_lastHistoryDate;
 
     QString buildUserMessageWithContext(
         const QString &input) const; //构建用户消息，包含上下文
