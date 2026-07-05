@@ -129,7 +129,8 @@ class Dialog : public QWidget
     QStringList m_vitsPendingTexts;
     QMap<int, QBuffer *> m_vitsReadyFiles; // key=序号，保证并发乱序完成时按原文序播放
     int m_vitsInFlightCount = 0;
-    int m_vitsSeqNext = 0;
+    int m_vitsSeqNext = 0;   // 下一个待分配的合成序号
+    int m_vitsSeqCursor = 0; // 下一个应播放的序号，保证即使乱序完成也按序播放
     static constexpr int kVitsMaxConcurrent = 3;
     QNetworkAccessManager *m_vitsManager = nullptr;
     QMediaPlayer *m_vitsPlayer = nullptr;

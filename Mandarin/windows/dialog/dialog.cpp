@@ -14,6 +14,7 @@
 #include <QDebug>
 #include <QDir>
 #include <QFile>
+#include <QDesktopServices>
 #include <QProcess>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -798,6 +799,7 @@ void Dialog::reloadAIConfig(const ZcJsonLib &config)
 {
     ZcJsonLib CharConfig(ReadCharacterUserConfigPath());
     configureAiProvider(ai, config, CharConfig);
+    m_cachedSystemPrompt.clear(); // 强制下次对话重建提示词（用户可能改了角色设定）
     loadContextHistory();
     loadMemory();
     reloadSearchConfig(config);
@@ -1252,15 +1254,22 @@ void Dialog::tryStartNextVitsPlayback()
         m_vitsTempFile = nullptr;
     }
 
+    // 只播放序号最小的就绪条目，且必须与播放游标一致（防止短句后完成先播放）
+    const int nextKey = m_vitsReadyFiles.firstKey();
+    if (nextKey != m_vitsSeqCursor)
+        return;
+
     m_vitsTempFile = m_vitsReadyFiles.first();
-    m_vitsReadyFiles.remove(m_vitsReadyFiles.firstKey());
+    m_vitsReadyFiles.remove(nextKey);
+    m_vitsSeqCursor++;
     if (!m_vitsTempFile)
         return;
 
     // QBuffer 已在 finished 中设为 ReadOnly，QMediaPlayer 直接读取，免磁盘 I/O
     m_vitsPlayer->setSourceDevice(m_vitsTempFile, QUrl("audio.mp3"));
     m_vitsPlayer->play();
-    qDebug() << "[VITS] play started | size:" << m_vitsTempFile->size() << "bytes";
+    qDebug() << "[VITS] play started | seq:" << (nextKey)
+             << "| size:" << m_vitsTempFile->size() << "bytes";
 }
 
 /*提交当前输入*/
@@ -1358,7 +1367,12 @@ bool Dialog::submitCurrentInput()
             if (!keyword.isEmpty() && !path.isEmpty()
                 && lowerInput.contains(keyword.toLower()))
             {
-                QProcess::startDetached(path, QStringList());
+                // URL 用系统默认浏览器打开，本地路径用 QProcess 启动
+                if (path.startsWith("http://", Qt::CaseInsensitive) ||
+                    path.startsWith("https://", Qt::CaseInsensitive))
+                    QDesktopServices::openUrl(QUrl(path));
+                else
+                    QProcess::startDetached(path, QStringList());
                 ui->textEdit->clear();
                 ui->textEdit->setEnabled(true);
                 ui->label_name->setText(QStringLiteral("你"));
@@ -1466,6 +1480,7 @@ skipPromptBuild:
     m_vitsReadyFiles.clear();
     m_vitsInFlightCount = 0;
     m_vitsSeqNext = 0;
+    m_vitsSeqCursor = 0;
     if (m_vitsTempFile)
     {
         m_vitsTempFile->deleteLater();
@@ -1522,8 +1537,19 @@ void Dialog::startSpeechRecording()
 
 void Dialog::startSpeechRecordingFromHotkey()
 {
-    if (!ui->textEdit->isEnabled() || m_isSpeechRecording)
+    // AI 正在生成回复中（输入禁用且无"继续"按钮）→ 不响应
+    if (!ui->textEdit->isEnabled() && !ui->pushButton_next->isVisible())
         return;
+    if (m_isSpeechRecording)
+        return;
+
+    // AI 回复已完成但用户未清空 → 自动清空，直接录音
+    if (!ui->textEdit->isEnabled() && ui->pushButton_next->isVisible())
+    {
+        ui->textEdit->clear();
+        ui->textEdit->setEnabled(true);
+        ui->pushButton_next->hide();
+    }
 
     // 停止语音唤醒，释放麦克风给录音使用
     stopWakeWord();
@@ -1926,7 +1952,12 @@ QString Dialog::buildMemoryContext() const
     const QJsonObject personalInfo = m_memoryData.value("personal_info").toObject();
     if (!personalInfo.isEmpty())
     {
-        context += QStringLiteral("关于用户的记忆：\n");
+        // 用户名放在最前面独立一行，避免被角色设定中的 NPC 名字混淆
+        const QString userName = personalInfo.value("名字").toString();
+        if (!userName.isEmpty())
+            context += QStringLiteral("当前和你对话的用户名字叫%1。\n\n").arg(userName);
+
+        context += QStringLiteral("关于用户的更多记忆：\n");
         for (auto it = personalInfo.begin(); it != personalInfo.end(); ++it)
         {
             context += QStringLiteral("- ") + it.key() +

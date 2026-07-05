@@ -401,6 +401,7 @@ void SettingChild_Char::on_plainTextEdit_CharPrompt_textChanged()
     QString charPrompt = ui->plainTextEdit_CharPrompt->toPlainText();
     ZcJsonLib charConfig(CharacterAssestPath + "/" + charName + "/config.json");
     charConfig.setValue("prompt", charPrompt);
+    emit requestReloadAIConfig();
 }
 
 /*修改立绘大小*/
