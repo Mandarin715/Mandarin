@@ -60,6 +60,8 @@ class Dialog : public QWidget
 
   signals:
     void requestSetCharTachie(QString TachieName);
+    void requestShowInnerThought(QString text);
+    void requestHideInnerThought();
 
   public slots:
     void ReloadAIConfig();

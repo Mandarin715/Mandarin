@@ -30,6 +30,7 @@
 #include <QGraphicsOpacityEffect>
 #include <QGuiApplication>
 #include <QJsonDocument>
+#include <QShortcut>
 #include <QTimer>
 #include <QMediaDevices>
 #include <QMediaPlayer>
@@ -458,11 +459,12 @@ void Dialog::initServices()
                     if (m_vitsPlayer->playbackState() == QMediaPlayer::PlayingState)
                         qDebug() << "[VITS] inter-sentence gap:" << gapTimer.elapsed() << "ms";
 
-                    // VITS 全部播放完毕后切回默认立绘
+                    // VITS 全部播放完毕后切回默认立绘 + 隐藏内心独白
                     {
                         const bool allDone = isAllVitsDone();
                         if (allDone && !m_isSpeechRecording)
                         {
+                            emit requestHideInnerThought();
                             QTimer::singleShot(m_continuousAudioDelayMs, this, [this]() {
                                 emit requestSetCharTachie("default");
                             });
@@ -584,6 +586,21 @@ void Dialog::initServices()
     reloadAppLauncherConfig(config);
     // loadContextHistory/loadMemory 已在 reloadAIConfig() 中调用，不重复
 
+    // F5 全局刷新：重载所有配置，无需重启
+    auto *refreshShortcut = new QShortcut(QKeySequence(Qt::Key_F5), this);
+    connect(refreshShortcut, &QShortcut::activated, this, [this]() {
+        const ZcJsonLib config(JsonSettingPath);
+        reloadAIConfig(config);
+        reloadSpeechInputConfig(config);
+        reloadScreenCaptureConfig(config);
+        reloadSearchConfig(config);
+        reloadAppLauncherConfig(config);
+        reloadContinuousHotkeyConfig(config);
+        ReloadGeneralConfig();
+        showTemporaryMessage(QStringLiteral("配置已刷新"));
+        qDebug() << "All configs reloaded via F5";
+    });
+
     //接收分块回复
     connect(ai, &AiProvider::replyChunkReceived, [=](const QString &chunk)
             {
@@ -651,6 +668,7 @@ void Dialog::initServices()
                 const QString mood = finalReply.section('|', 0, 0).trimmed();
                 const QString chineseReply = finalReply.section('|', 1, 1).trimmed();
                 const QString japaneseReply = finalReply.section('|', 2, 2).trimmed();
+                const QString innerThought = finalReply.section('|', 3, 3).trimmed();
 
                 //界面更新（停止防抖定时器，立即显示最终结果）
                 m_streamDisplayTimer->stop();
@@ -675,6 +693,10 @@ void Dialog::initServices()
                     }
                 }
                 emit requestSetCharTachie(mood); //提取心情并发出信号
+
+                // 内心独白
+                if (!innerThought.isEmpty())
+                    emit requestShowInnerThought(innerThought);
 
                 // VITS 播放完毕/无语音时，延迟切回默认立绘
                 {
@@ -1430,26 +1452,39 @@ bool Dialog::doSubmitCurrentInput(const QString &userInput)
     if (!memoryContext.isEmpty())
         systemPrompt += memoryContext + QStringLiteral("\n\n");
 
-    // 注入位置信息
-    if (!m_cachedLocation.isEmpty())
-        systemPrompt += QStringLiteral("用户当前所在地：") + m_cachedLocation +
-                        QStringLiteral("\n\n");
+    // 注入位置信息：手动设置优先，否则用 IP 自动定位
+    {
+        QSettings iniSettings(IniSettingPath, QSettings::IniFormat);
+        const QString manualLocation =
+            iniSettings.value("general/Location").toString().trimmed();
+        const QString location = !manualLocation.isEmpty()
+                                     ? manualLocation
+                                     : m_cachedLocation;
+        if (!location.isEmpty())
+            systemPrompt += QStringLiteral("用户当前所在地：") + location +
+                            QStringLiteral("\n\n");
+    }
 
     if (!characterPrompt.isEmpty())
         systemPrompt += QStringLiteral("角色设定：") + characterPrompt +
                         QStringLiteral("\n请始终保持该设定进行回复。\n\n");
     systemPrompt +=
         QStringLiteral("你是一个桌宠 AI，输出内容必须严格按照以下格式：\n"
-                       "心情|中文|日语\n\n"
+                       "心情|中文|日语|内心独白\n\n"
                        "要求：\n"
                        "1. 心情必须从以下列表中选择：") +
         nameListStr + "\n" +
         QStringLiteral("2. 中文是桌宠此刻想表达的内容\n"
                        "3. 日语是中文内容的对应翻译\n"
-                       "4. 输出中不能有多余内容或解释，严格用\"|\"分隔\n\n"
+                       "4. 内心独白是角色没说出口的真实想法，放在第四段，用\"|\"分隔\n"
+                       "   - 长度不超过 15 字\n"
+                       "   - 可以是吐槽、真实感受、小心思，让人物更有灵魂\n"
+                       "   - 没有想说的就留空（即只输出三段，无第四个|分隔）\n"
+                       "5. 输出中不能有多余内容或解释\n\n"
                        "示例输出：\n"
-                       "快乐|今天的天气真好呀！|今日はいい天気ですね！\n"
-                       "生气|为什么一直打扰我！|なんでずっと邪魔するの！");
+                       "快乐|今天的天气真好呀！|今日はいい天気ですね！|（这家伙终于出门了）\n"
+                       "生气|为什么一直打扰我！|なんでずっと邪魔するの！\n"
+                       "担心|还在改bug呀？|まだバグ直してるの？|其实我也有点困了");
         m_cachedSystemPrompt = systemPrompt;
         m_cachedCharacterForPrompt = currentChar;
         m_memoryDirty = false;
@@ -2629,8 +2664,13 @@ void Dialog::classifyAndSearch(const QString &userInput)
 
                     if (!searchQuery.isEmpty())
                     {
-                        // 仅当查询涉及本地信息时自动附加城市
-                        if (!m_cachedLocation.isEmpty())
+                        // 仅当查询涉及本地信息时自动附加城市（手动设置优先）
+                        QSettings iniSettings(IniSettingPath, QSettings::IniFormat);
+                        const QString location =
+                            iniSettings.value("general/Location").toString().trimmed();
+                        const QString &effectiveLocation =
+                            !location.isEmpty() ? location : m_cachedLocation;
+                        if (!effectiveLocation.isEmpty())
                         {
                             bool needsLocation = false;
                             for (const QString &kw : kLocationDependentKeywords)
@@ -2645,7 +2685,7 @@ void Dialog::classifyAndSearch(const QString &userInput)
                             if (needsLocation)
                             {
                                 const QStringList locParts =
-                                    m_cachedLocation.split(' ', Qt::SkipEmptyParts);
+                                    effectiveLocation.split(' ', Qt::SkipEmptyParts);
                                 QString city;
                                 if (locParts.size() >= 3)
                                     city = locParts.at(2);
@@ -2684,87 +2724,90 @@ void Dialog::classifyAndSearch(const QString &userInput)
 /*IP定位：获取用户大致地理位置（省/市/区）*/
 void Dialog::fetchLocation()
 {
-    // 国内优先用 ip.sb，ip-api.com 作为备选（可能被墙）
+    // ip-api.com 返回省市详情，优先使用；ip.sb 作为备选
     QNetworkRequest request(
-        QUrl("https://api.ip.sb/geoip"));
-    request.setRawHeader("Accept", "application/json");
-    request.setTransferTimeout(5000); // 5秒超时
+        QUrl("https://ip-api.com/json/?lang=zh-CN&fields=country,regionName,city,district"));
+    request.setTransferTimeout(5000);
     QNetworkReply *reply = m_locationManager->get(request);
 
     connect(reply, &QNetworkReply::finished, this,
             [this, reply]()
             {
                 reply->deleteLater();
-                if (reply->error() != QNetworkReply::NoError)
+
+                auto parseAndStore = [this](const QJsonObject &obj, const char *source) {
+                    QStringList parts;
+                    auto add = [&](const QString &v) {
+                        if (!v.isEmpty() && v != "-") parts.append(v);
+                    };
+                    add(obj.value("country").toString());
+                    add(obj.value("regionName").toString());
+                    add(obj.value("city").toString());
+                    add(obj.value("district").toString());
+                    // 去重相邻相同值
+                    for (int i = parts.size() - 1; i > 0; --i) {
+                        if (parts[i] == parts[i - 1])
+                            parts.removeAt(i);
+                    }
+                    parts.removeAll(QStringLiteral("China"));
+                    parts.removeAll(QStringLiteral("中国"));
+                    if (!parts.isEmpty())
+                    {
+                        m_cachedLocation = parts.join(" ");
+                        m_memoryDirty = true;
+                        m_cachedSystemPrompt.clear();
+                        qDebug() << "[Location]" << m_cachedLocation << "| source:" << source;
+                    }
+                };
+
+                if (reply->error() == QNetworkReply::NoError)
                 {
-                    // 备选：尝试 ip-api.com
-                    QNetworkRequest fallbackReq(
-                        QUrl("https://ip-api.com/json/?lang=zh-CN&fields=country,regionName,city,district"));
-                    QNetworkReply *fallback = m_locationManager->get(fallbackReq);
-                    connect(fallback, &QNetworkReply::finished, this,
-                            [this, fallback]()
+                    const QJsonDocument doc = QJsonDocument::fromJson(reply->readAll());
+                    if (doc.isObject())
+                    {
+                        const QJsonObject obj = doc.object();
+                        if (!obj.value("city").toString().isEmpty())
+                        {
+                            parseAndStore(obj, "ip-api.com");
+                            return;
+                        }
+                    }
+                }
+
+                // 备选：ip.sb（仅返回 country + timezone，从 timezone 提取城市）
+                QNetworkRequest fbReq(QUrl("https://api.ip.sb/geoip"));
+                fbReq.setRawHeader("Accept", "application/json");
+                fbReq.setTransferTimeout(5000);
+                QNetworkReply *fallback = m_locationManager->get(fbReq);
+                connect(fallback, &QNetworkReply::finished, this,
+                        [this, fallback, parseAndStore]()
+                        {
+                            fallback->deleteLater();
+                            if (fallback->error() != QNetworkReply::NoError)
                             {
-                                fallback->deleteLater();
-                                if (fallback->error() != QNetworkReply::NoError)
+                                qWarning() << "Location fetch failed (all sources)";
+                                return;
+                            }
+                            const QJsonDocument doc =
+                                QJsonDocument::fromJson(fallback->readAll());
+                            if (!doc.isObject()) return;
+                            QJsonObject obj = doc.object();
+                            // 从 timezone "Asia/Shanghai" 提取 "上海" 或后备城市名
+                            const QString tz = obj.value("timezone").toString();
+                            if (!tz.isEmpty() && tz.contains('/'))
+                            {
+                                const QString cityEn = tz.section('/', -1);
+                                if (!cityEn.isEmpty() && cityEn != "UTC")
                                 {
-                                    qWarning() << "Location fetch failed (all sources)";
-                                    return;
-                                }
-                                const QJsonDocument doc =
-                                    QJsonDocument::fromJson(fallback->readAll());
-                                const QJsonObject obj = doc.object();
-                                QStringList parts;
-                                auto add = [&](const QString &v) {
-                                    if (!v.isEmpty() && v != "-") parts.append(v);
-                                };
-                                add(obj.value("country").toString());
-                                add(obj.value("regionName").toString());
-                                add(obj.value("city").toString());
-                                add(obj.value("district").toString());
-                                for (int i = parts.size() - 1; i > 0; --i) {
-                                    if (parts[i] == parts[i - 1])
-                                        parts.removeAt(i);
-                                }
-                                parts.removeAll(QStringLiteral("China"));
-                                if (!parts.isEmpty())
-                                {
-                                    m_cachedLocation = parts.join(" ");
+                                    m_cachedLocation = cityEn;
                                     m_memoryDirty = true;
                                     m_cachedSystemPrompt.clear();
-                                    qDebug() << "[Location]" << m_cachedLocation;
+                                    qDebug() << "[Location]" << m_cachedLocation << "| source: ip.sb timezone";
+                                    return;
                                 }
-                            });
-                    return;
-                }
-
-                const QJsonDocument doc =
-                    QJsonDocument::fromJson(reply->readAll());
-                const QJsonObject obj = doc.object();
-
-                QStringList parts;
-                // ip.sb 返回: country, region (省), city, organization 等
-                auto add = [&](const QString &v) {
-                    if (!v.isEmpty() && v != "-") parts.append(v);
-                };
-                add(obj.value("country").toString());
-                add(obj.value("region").toString());    // 省
-                add(obj.value("city").toString());      // 市
-                add(obj.value("district").toString());  // 区（可能为空）
-                // 去重相邻相同值（如直辖市 region=city="Shanghai"）
-                for (int i = parts.size() - 1; i > 0; --i) {
-                    if (parts[i] == parts[i - 1])
-                        parts.removeAt(i);
-                }
-                // 去掉 "China"，国内用户无需看到国家名
-                parts.removeAll(QStringLiteral("China"));
-
-                if (!parts.isEmpty())
-                {
-                    m_cachedLocation = parts.join(" ");
-                    m_memoryDirty = true;
-                    m_cachedSystemPrompt.clear();
-                    qDebug() << "[Location]" << m_cachedLocation;
-                }
+                            }
+                            qWarning() << "Location fetch failed (no city in response)";
+                        });
             });
 }
 

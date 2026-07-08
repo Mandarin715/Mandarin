@@ -135,6 +135,10 @@ int main(int argc, char *argv[])
     //修改立绘图片
     QObject::connect(&dialogWin, &Dialog::requestSetCharTachie, &tachieWin,
                      &Tachie::SetTachieImg);
+    QObject::connect(&dialogWin, &Dialog::requestShowInnerThought, &tachieWin,
+                     &Tachie::ShowInnerThought);
+    QObject::connect(&dialogWin, &Dialog::requestHideInnerThought, &tachieWin,
+                     &Tachie::HideInnerThought);
 
     /*托盘*/
     QSystemTrayIcon tray;

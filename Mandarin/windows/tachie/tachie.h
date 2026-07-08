@@ -27,6 +27,8 @@ class Tachie : public QWidget
     void SetTachieImg(QString TachieName = "default");
     void SetTachieSize(int size);
     void ResetTachieLoc();
+    void ShowInnerThought(QString text);
+    void HideInnerThought();
 
   private:
     Ui::Tachie *ui;
@@ -36,6 +38,7 @@ class Tachie : public QWidget
     bool _tachiePosRestoreDone = false; //位置恢复完成后才允许自动保存
     AnimePluginManager m_animePluginManager;
     QSequentialAnimationGroup *m_activeAnimationGroup = nullptr;
+    QWidget *m_innerThoughtBubble = nullptr;
     void SaveTachieLoc();    //将当前立绘位置写入 config.ini（按角色）
     void RestoreTachieLoc(); //从 config.ini 读取并恢复立绘位置
     void TryPlayAnimationForAction(const QString &actionName);

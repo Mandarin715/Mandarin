@@ -37,6 +37,8 @@ SettingChild_General::SettingChild_General(QWidget *parent)
         settings.value("general/DialogHeight", kDefaultDialogHeight).toInt());
     ui->ToggleSwitch_AutoStart->setIsToggled(
         settings.value("general/AutoStart", false).toBool());
+    ui->lineEdit_Location->setText(
+        settings.value("general/Location").toString());
 }
 
 SettingChild_General::~SettingChild_General()
@@ -125,4 +127,12 @@ void SettingChild_General::on_ToggleSwitch_AutoStart_toggled(bool checked)
         QFile::remove(desktopPath);
     }
 #endif
+}
+
+/*手动设置所在城市*/
+void SettingChild_General::on_lineEdit_Location_textChanged(const QString &arg1)
+{
+    QSettings settings(IniSettingPath, QSettings::IniFormat);
+    settings.setValue("general/Location", arg1.trimmed());
+    emit generalConfigChanged();
 }

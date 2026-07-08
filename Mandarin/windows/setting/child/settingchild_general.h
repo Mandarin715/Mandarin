@@ -23,6 +23,7 @@ class SettingChild_General : public QWidget
     void on_spinBox_DialogWidth_valueChanged(int arg1);
     void on_spinBox_DialogHeight_valueChanged(int arg1);
     void on_ToggleSwitch_AutoStart_toggled(bool checked);
+    void on_lineEdit_Location_textChanged(const QString &arg1);
 
   private:
     Ui::SettingChild_General *ui;

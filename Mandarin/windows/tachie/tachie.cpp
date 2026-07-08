@@ -12,7 +12,9 @@
 #include <QDir>
 #include <QEasingCurve>
 #include <QFileInfo>
+#include <QGraphicsOpacityEffect>
 #include <QImage>
+#include <QLabel>
 #include <QMouseEvent>
 #include <QPropertyAnimation>
 #include <QSequentialAnimationGroup>
@@ -492,4 +494,64 @@ void Tachie::RestoreTachieLoc()
     //恢复阶段不触发 mouseReleaseEvent 保存，直接移动即可。
     this->move(settings.value(keyX).toInt(), settings.value(keyY).toInt());
     _tachiePosRestoreDone = true;
+}
+
+/*内心独白气泡：立绘头顶右上 45°，半透明淡入→停留→语音播完淡出*/
+void Tachie::ShowInnerThought(QString text)
+{
+    if (text.isEmpty())
+        return;
+
+    // 先清理上一个气泡
+    HideInnerThought();
+
+    auto *bubble = new QLabel(text, this);
+    bubble->setStyleSheet(
+        "color: #555; background: rgba(255,255,255,200); "
+        "border: 1px solid rgba(180,180,180,120); "
+        "border-radius: 12px; padding: 8px 14px; font-size: 13px;");
+    bubble->adjustSize();
+
+    // 定位：立绘头顶，向右上 45° 偏移
+    const int centerX = width() / 2;
+    const int headY = static_cast<int>(height() * 0.30);
+    const int offset = 50;
+    bubble->move(centerX + offset, headY - offset - bubble->height());
+    bubble->show();
+
+    // 淡入
+    auto *effect = new QGraphicsOpacityEffect(bubble);
+    bubble->setGraphicsEffect(effect);
+    effect->setOpacity(0.0);
+    auto *fadeIn = new QPropertyAnimation(effect, "opacity", bubble);
+    fadeIn->setDuration(400);
+    fadeIn->setStartValue(0.0);
+    fadeIn->setEndValue(1.0);
+    fadeIn->start(QAbstractAnimation::DeleteWhenStopped);
+
+    m_innerThoughtBubble = bubble;
+}
+
+/*隐藏内心独白气泡：淡出后销毁*/
+void Tachie::HideInnerThought()
+{
+    if (!m_innerThoughtBubble)
+        return;
+
+    QWidget *bubble = m_innerThoughtBubble;
+    m_innerThoughtBubble = nullptr;
+
+    auto *eff = qobject_cast<QGraphicsOpacityEffect *>(bubble->graphicsEffect());
+    if (!eff)
+    {
+        delete bubble;
+        return;
+    }
+
+    auto *fadeOut = new QPropertyAnimation(eff, "opacity", bubble);
+    fadeOut->setDuration(400);
+    fadeOut->setStartValue(eff->opacity());
+    fadeOut->setEndValue(0.0);
+    QObject::connect(fadeOut, &QPropertyAnimation::finished, bubble, &QObject::deleteLater);
+    fadeOut->start(QAbstractAnimation::DeleteWhenStopped);
 }
