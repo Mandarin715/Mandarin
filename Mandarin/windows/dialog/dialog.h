@@ -202,6 +202,21 @@ class Dialog : public QWidget
                                   const QString &userMessage);
     static QStringList screenCaptureTriggerKeywords();
     bool doSubmitCurrentInput(const QString &userInput);
+    // 主动对话
+    QTimer *m_proactiveTimer = nullptr;
+    QDateTime m_lastProactiveSpeakTime;
+    bool m_userAway = false;
+    bool m_proactiveEnabled = false;
+    int m_proactiveCooldownSec = 600;   // 冷却期，默认 10 分钟
+    int m_proactiveDwellSec = 10;       // 窗口驻留确认，默认 10 秒
+    int64_t m_proactivePendingHwnd = 0; // 待确认的窗口句柄（比标题更稳定）
+    QString m_proactivePendingTitle;
+    int m_proactiveDwellCount = 0;      // 驻留倒计时
+    void initProactiveAgent();
+    void checkProactiveWindow();
+    void checkProactiveUserPresence();
+    void doProactiveSpeak(const QString &windowTitle, const QString &contextHint);
+
     // 联网搜索
     SearchProvider *m_searchProvider = nullptr;
     bool m_searchEnabled = false;

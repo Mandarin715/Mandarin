@@ -39,6 +39,16 @@ SettingChild_General::SettingChild_General(QWidget *parent)
         settings.value("general/AutoStart", false).toBool());
     ui->lineEdit_Location->setText(
         settings.value("general/Location").toString());
+    {
+        const QSignalBlocker proactiveBlocker(ui->ToggleSwitch_ProactiveEnable);
+        ui->ToggleSwitch_ProactiveEnable->setIsToggled(
+            settings.value("general/ProactiveEnable", false).toBool());
+    }
+    {
+        const QSignalBlocker cooldownBlocker(ui->spinBox_ProactiveCooldown);
+        ui->spinBox_ProactiveCooldown->setValue(
+            settings.value("general/ProactiveCooldownMinutes", 10).toInt());
+    }
 }
 
 SettingChild_General::~SettingChild_General()
@@ -134,5 +144,21 @@ void SettingChild_General::on_lineEdit_Location_textChanged(const QString &arg1)
 {
     QSettings settings(IniSettingPath, QSettings::IniFormat);
     settings.setValue("general/Location", arg1.trimmed());
+    emit generalConfigChanged();
+}
+
+/*主动对话开关*/
+void SettingChild_General::on_ToggleSwitch_ProactiveEnable_toggled(bool checked)
+{
+    QSettings settings(IniSettingPath, QSettings::IniFormat);
+    settings.setValue("general/ProactiveEnable", checked);
+    emit generalConfigChanged();
+}
+
+/*主动对话冷却间隔*/
+void SettingChild_General::on_spinBox_ProactiveCooldown_valueChanged(int value)
+{
+    QSettings settings(IniSettingPath, QSettings::IniFormat);
+    settings.setValue("general/ProactiveCooldownMinutes", value);
     emit generalConfigChanged();
 }

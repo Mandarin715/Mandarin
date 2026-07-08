@@ -16,6 +16,10 @@
 #include <QFile>
 #include <QDesktopServices>
 #include <QProcess>
+
+#ifdef Q_OS_WIN
+#include <windows.h>
+#endif
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QPainter>
@@ -239,6 +243,34 @@ void Dialog::ReloadGeneralConfig()
         historyWin->resize(dialogWidth, historyWin->height());
         if (historyWin->isVisible())
             historyWin->move(x(), y() - historyWin->height());
+    }
+
+    // 主动对话配置热重载
+    m_proactiveEnabled = settings.value("general/ProactiveEnable", false).toBool();
+    m_proactiveCooldownSec =
+        settings.value("general/ProactiveCooldownMinutes", 10).toInt() * 60;
+    if (m_proactiveEnabled && !m_proactiveTimer)
+    {
+        m_proactiveTimer = new QTimer(this);
+        m_proactiveTimer->setInterval(1000);
+        connect(m_proactiveTimer, &QTimer::timeout, this, [this]() {
+#ifdef Q_OS_WIN
+            checkProactiveWindow();
+            checkProactiveUserPresence();
+#endif
+        });
+        m_proactiveTimer->start();
+        m_proactivePendingHwnd = 0;
+        qDebug() << "Proactive agent: started via config reload";
+    }
+    else if (!m_proactiveEnabled && m_proactiveTimer)
+    {
+        m_proactiveTimer->stop();
+        delete m_proactiveTimer;
+        m_proactiveTimer = nullptr;
+        m_proactivePendingHwnd = 0;
+        m_proactiveDwellCount = 0;
+        qDebug() << "Proactive agent: stopped via config reload";
     }
 }
 
@@ -600,6 +632,9 @@ void Dialog::initServices()
         showTemporaryMessage(QStringLiteral("配置已刷新"));
         qDebug() << "All configs reloaded via F5";
     });
+
+    // 主动对话代理：窗口检测 + 用户状态 + 空闲感知
+    initProactiveAgent();
 
     //接收分块回复
     connect(ai, &AiProvider::replyChunkReceived, [=](const QString &chunk)
@@ -1208,6 +1243,13 @@ void Dialog::tryStartNextVitsRequest()
     if (text.isEmpty())
         return;
 
+    if (m_cachedVitsApiUrl.isEmpty())
+    {
+        ZcJsonLib config(JsonSettingPath);
+        m_cachedVitsApiUrl = config.value("vits/ApiUrl").toString();
+        if (m_cachedVitsApiUrl.isEmpty())
+            return;
+    }
     /*请求地址构建（使用缓存配置，避免每句话重复读文件）*/
     QString urlString =
         QString(m_cachedVitsApiUrl + "/voice/%2?id=%3&text=%1")
@@ -2951,4 +2993,286 @@ void Dialog::onWakeWordDetected(const QString &keyword)
             enterContinuousMode();
         },
         Qt::QueuedConnection);
+}
+
+/* ========== 主动对话代理 ========== */
+
+/*初始化主动对话：1 秒轮询窗口标题 + 用户状态*/
+void Dialog::initProactiveAgent()
+{
+    QSettings settings(IniSettingPath, QSettings::IniFormat);
+    m_proactiveEnabled = settings.value("general/ProactiveEnable", false).toBool();
+    m_proactiveCooldownSec =
+        settings.value("general/ProactiveCooldownMinutes", 10).toInt() * 60;
+    m_proactiveDwellSec =
+        qMax(5, settings.value("general/ProactiveDwellSeconds", 10).toInt());
+
+    if (!m_proactiveEnabled)
+        return;
+
+    // 延迟 30 秒启动，等 VITS 模型加载完毕
+    QTimer::singleShot(30000, this, [this]() {
+        if (!m_proactiveEnabled)
+            return;
+        m_proactiveTimer = new QTimer(this);
+        m_proactiveTimer->setInterval(1000);
+        connect(m_proactiveTimer, &QTimer::timeout, this, [this]() {
+#ifdef Q_OS_WIN
+            checkProactiveWindow();
+            checkProactiveUserPresence();
+#else
+            checkProactiveUserPresence();
+#endif
+        });
+        m_proactiveTimer->start();
+        qDebug() << "Proactive agent: started (after 30s warmup) | cooldown:"
+                 << m_proactiveCooldownSec << "s | dwell:" << m_proactiveDwellSec << "s";
+    });
+}
+
+/*窗口标题检测：前台窗口变化 → 驻留确认 → 触发对话*/
+void Dialog::checkProactiveWindow()
+{
+#ifdef Q_OS_WIN
+    HWND fg = GetForegroundWindow();
+    if (!fg)
+        return;
+
+    wchar_t title[256];
+    GetWindowTextW(fg, title, 256);
+    const QString currentTitle = QString::fromWCharArray(title).trimmed();
+
+    // 用 HWND 而非标题判断是否同一窗口（VS Code 切标签页时标题会变但 HWND 不变）
+    const int64_t currentHwnd = reinterpret_cast<int64_t>(fg);
+
+    // 空标题窗口（开始菜单、tooltip、通知等）：不重置已有的驻留状态
+    // 这些瞬时窗口会在一个轮询周期内出现又消失，打断正常驻留倒计时
+    if (currentTitle.isEmpty())
+    {
+        // 即便 HWND 变了也不改 pending 状态，让下一个有效窗口可以继续
+        return;
+    }
+
+    if (currentHwnd == m_proactivePendingHwnd)
+    {
+        m_proactivePendingTitle = currentTitle; // 更新为最新标题
+        m_proactiveDwellCount++;
+        if (m_proactiveDwellCount >= m_proactiveDwellSec)
+        {
+            const int secsSinceLastSpeak =
+                m_lastProactiveSpeakTime.isValid()
+                    ? static_cast<int>(m_lastProactiveSpeakTime.secsTo(
+                          QDateTime::currentDateTime()))
+                    : INT_MAX;
+            if (secsSinceLastSpeak >= m_proactiveCooldownSec && !m_userAway)
+            {
+                m_proactivePendingHwnd = 0;
+                m_proactiveDwellCount = 0;
+                doProactiveSpeak(m_proactivePendingTitle, QStringLiteral("窗口切换"));
+            }
+            else
+            {
+                m_proactivePendingHwnd = 0;
+                m_proactiveDwellCount = 0;
+            }
+        }
+        return;
+    }
+
+    // 新窗口，开始驻留计时
+    m_proactivePendingHwnd = currentHwnd;
+    m_proactivePendingTitle = currentTitle;
+    m_proactiveDwellCount = 0;
+#else
+    Q_UNUSED(this);
+#endif
+}
+
+/*用户状态检测：离开/回来*/
+void Dialog::checkProactiveUserPresence()
+{
+#ifdef Q_OS_WIN
+    LASTINPUTINFO lii;
+    lii.cbSize = sizeof(LASTINPUTINFO);
+    if (!GetLastInputInfo(&lii))
+        return;
+
+    const quint32 tick = lii.dwTime;
+    const quint32 idleMs = GetTickCount() - tick;
+
+    // 用户回来检测
+    if (m_userAway && idleMs < 3000)
+    {
+        m_userAway = false;
+        const int secsSinceLastSpeak =
+            m_lastProactiveSpeakTime.isValid()
+                ? static_cast<int>(m_lastProactiveSpeakTime.secsTo(
+                      QDateTime::currentDateTime()))
+                : INT_MAX;
+        if (secsSinceLastSpeak >= m_proactiveCooldownSec)
+        {
+            doProactiveSpeak(QString(), QStringLiteral("用户回来"));
+        }
+        return;
+    }
+
+    // 用户离开检测
+    if (!m_userAway && idleMs > 30 * 60 * 1000)
+    {
+        m_userAway = true;
+        return;
+    }
+
+    // 空闲 10 分钟轻度问候
+    static bool idle10mFired = false;
+    if (!m_userAway && idleMs > 10 * 60 * 1000 && !idle10mFired)
+    {
+        idle10mFired = true;
+        const int secsSinceLastSpeak =
+            m_lastProactiveSpeakTime.isValid()
+                ? static_cast<int>(m_lastProactiveSpeakTime.secsTo(
+                      QDateTime::currentDateTime()))
+                : INT_MAX;
+        if (secsSinceLastSpeak >= m_proactiveCooldownSec)
+        {
+            doProactiveSpeak(QString(), QStringLiteral("空闲问候"));
+        }
+    }
+    if (idleMs < 60 * 1000)
+        idle10mFired = false;
+
+#else
+    Q_UNUSED(this);
+#endif
+}
+
+/*构建主动对话 Prompt（精简，不包含对话历史）*/
+static QString buildProactivePrompt(const QString &windowTitle,
+                                    const QString &contextHint,
+                                    const QString &characterPrompt,
+                                    const QString &memoryContext,
+                                    const QString &location)
+{
+    QString prompt;
+    prompt += QStringLiteral("[当前时间] %1\n")
+                  .arg(QDateTime::currentDateTime().toString("MM-dd hh:mm"));
+    prompt += QStringLiteral("[触发原因] %1\n").arg(contextHint);
+    if (!windowTitle.isEmpty())
+        prompt += QStringLiteral("[前台窗口] %1\n").arg(windowTitle);
+    if (!location.isEmpty())
+        prompt += QStringLiteral("[用户位置] %1\n").arg(location);
+
+    prompt += QStringLiteral("\n---\n\n");
+    if (!characterPrompt.isEmpty())
+        prompt += QStringLiteral("%1\n\n").arg(characterPrompt);
+    if (!memoryContext.isEmpty())
+        prompt += memoryContext + QStringLiteral("\n");
+
+    prompt += QStringLiteral(
+        "请主动发起一句简短自然的对话（20 字以内）。\n\n"
+        "输出格式（严格用\"|\"分隔，不可调换顺序）：\n"
+        "心情|中文|日语|内心独白\n\n"
+        "要求：\n"
+        "1. 心情：从角色设定的表情列表中选择\n"
+        "2. 中文：你要说的话（基于当前状态自然搭话）\n"
+        "3. 日语：第2段中文的对应翻译\n"
+        "4. 内心独白：可选，角色没说出口的真实想法\n"
+        "5. 不要用\"你刚才说\"、\"根据刚才\"等指向上文的表达\n\n"
+        "正确示例：\n"
+        "好奇|在看什么好东西呢？我也想看！|何を見てるの？私も見たい！\n"
+        "开心|又在写代码呀，加油！|またコード書いてるね、がんばれ！|（这个项目看起来很有趣）\n"
+        "错误示例（中文和日语位置不能互换）：\n"
+        "开心|何を見てるの？|在看什么呢？  ← 这是错误的！日语和中文反了！");
+
+    return prompt;
+}
+
+/*执行主动对话*/
+void Dialog::doProactiveSpeak(const QString &windowTitle,
+                               const QString &contextHint)
+{
+    if (!m_proactiveEnabled)
+        return;
+
+    if (m_lastProactiveSpeakTime.isValid())
+    {
+        const int secs =
+            static_cast<int>(m_lastProactiveSpeakTime.secsTo(
+                QDateTime::currentDateTime()));
+        if (secs < m_proactiveCooldownSec)
+            return;
+    }
+
+    // 清空上次主动对话的残留文字
+    if (ui->textEdit->toPlainText().isEmpty() || !ui->textEdit->isEnabled())
+    {
+        ui->textEdit->clear();
+        ui->textEdit->setEnabled(true);
+        ui->pushButton_next->hide();
+    }
+
+    // 构建精简 prompt
+    ZcJsonLib roleConfig(CharacterAssestPath + "/" + ReadNowSelectChar() +
+                         "/config.json");
+    const QString characterPrompt =
+        roleConfig.value("prompt").toString().trimmed();
+    const QString memoryContext = buildMemoryContext();
+    QSettings iniSettings(IniSettingPath, QSettings::IniFormat);
+    const QString manualLoc =
+        iniSettings.value("general/Location").toString().trimmed();
+    const QString location =
+        !manualLoc.isEmpty() ? manualLoc : m_cachedLocation;
+
+    const QString prompt = buildProactivePrompt(
+        windowTitle, contextHint, characterPrompt, memoryContext, location);
+
+    // 创建独立 AiProvider 用于主动对话
+    AiProvider *proactiveAi = new AiProvider(this);
+    proactiveAi->setStreamEnabled(false);
+    ZcJsonLib config(JsonSettingPath);
+    ZcJsonLib charConfig(ReadCharacterUserConfigPath());
+    configureAiProvider(proactiveAi, config, charConfig);
+    proactiveAi->setSystemPrompt(prompt);
+
+    connect(proactiveAi, &AiProvider::replyReceived, this,
+            [this, proactiveAi](const QString &reply)
+            {
+                const QString mood = reply.section('|', 0, 0).trimmed();
+                const QString chinese =
+                    reply.section('|', 1, 1).trimmed();
+                const QString japanese =
+                    reply.section('|', 2, 2).trimmed();
+                const QString innerThought =
+                    reply.section('|', 3, 3).trimmed();
+
+                ui->pushButton_next->show();
+                ui->textEdit->setText(chinese);
+                ui->textEdit->setEnabled(false);
+                ui->label_name->setText(QStringLiteral("她"));
+                emit requestSetCharTachie(mood);
+                if (!innerThought.isEmpty())
+                    emit requestShowInnerThought(innerThought);
+
+                // VITS 合成
+                if (!japanese.isEmpty())
+                {
+                    m_streamVitsEnabled = true;
+                    VitsGetAndPlay(japanese);
+                }
+
+                appendHistoryLine(QStringLiteral("角色：") + chinese);
+                scheduleContextSave();
+
+                m_lastProactiveSpeakTime = QDateTime::currentDateTime();
+                proactiveAi->deleteLater();
+            });
+
+    connect(proactiveAi, &AiProvider::errorOccurred, this,
+            [proactiveAi](const QString &error)
+            {
+                qWarning() << "Proactive AI error:" << error;
+                proactiveAi->deleteLater();
+            });
+
+    proactiveAi->chat(QStringLiteral("触发主动对话"));
 }
