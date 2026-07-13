@@ -1250,6 +1250,14 @@ void Dialog::tryStartNextVitsRequest()
         if (m_cachedVitsApiUrl.isEmpty())
             return;
     }
+    // 确保 model/speaker 已缓存（主动对话可能在用户首次发消息前触发）
+    if (m_cachedVitsModel.isEmpty() || m_cachedVitsSpeaker.isEmpty())
+    {
+        ZcJsonLib charConfig(ReadCharacterUserConfigPath());
+        const QString modelAndSpeaker = charConfig.value("vitsMasSelect").toString();
+        m_cachedVitsModel = modelAndSpeaker.section(" - ", 0, 0).trimmed().toLower();
+        m_cachedVitsSpeaker = modelAndSpeaker.section(" - ", 2, 2).trimmed();
+    }
     /*请求地址构建（使用缓存配置，避免每句话重复读文件）*/
     QString urlString =
         QString(m_cachedVitsApiUrl + "/voice/%2?id=%3&text=%1")
@@ -1461,6 +1469,9 @@ bool Dialog::doSubmitCurrentInput(const QString &userInput)
 {
     if (m_streamDisplayTimer)
         m_streamDisplayTimer->stop();
+
+    // 清理主动对话残留的内心独白
+    emit requestHideInnerThought();
 
     const QString currentChar = ReadNowSelectChar();
 
@@ -3072,7 +3083,7 @@ void Dialog::checkProactiveWindow()
             }
             else
             {
-                m_proactivePendingHwnd = 0;
+                // 冷却期内只重置计数，保留 HWND 避免同一窗口反复触发"新窗口"日志
                 m_proactiveDwellCount = 0;
             }
         }
@@ -3083,6 +3094,7 @@ void Dialog::checkProactiveWindow()
     m_proactivePendingHwnd = currentHwnd;
     m_proactivePendingTitle = currentTitle;
     m_proactiveDwellCount = 0;
+    qDebug() << "[Proactive] 新窗口:" << currentTitle << "| 开始驻留计时";
 #else
     Q_UNUSED(this);
 #endif
@@ -3194,6 +3206,12 @@ void Dialog::doProactiveSpeak(const QString &windowTitle,
     if (!m_proactiveEnabled)
         return;
 
+    qDebug() << "[Proactive] 触发:" << contextHint
+             << "| 窗口:" << (windowTitle.isEmpty() ? QStringLiteral("(无)") : windowTitle);
+
+    // 隐藏上一次残留的内心独白
+    emit requestHideInnerThought();
+
     if (m_lastProactiveSpeakTime.isValid())
     {
         const int secs =
@@ -3268,9 +3286,10 @@ void Dialog::doProactiveSpeak(const QString &windowTitle,
             });
 
     connect(proactiveAi, &AiProvider::errorOccurred, this,
-            [proactiveAi](const QString &error)
+            [this, proactiveAi](const QString &error)
             {
                 qWarning() << "Proactive AI error:" << error;
+                emit requestHideInnerThought();
                 proactiveAi->deleteLater();
             });
 
