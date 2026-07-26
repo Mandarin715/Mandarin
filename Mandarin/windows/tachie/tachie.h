@@ -6,6 +6,7 @@
 #include <QWidget>
 
 class QSequentialAnimationGroup;
+class QTimer;
 
 namespace Ui
 {
@@ -39,9 +40,11 @@ class Tachie : public QWidget
     AnimePluginManager m_animePluginManager;
     QSequentialAnimationGroup *m_activeAnimationGroup = nullptr;
     QWidget *m_innerThoughtBubble = nullptr;
+    QTimer *m_innerThoughtTimer = nullptr;
     void SaveTachieLoc();    //将当前立绘位置写入 config.ini（按角色）
     void RestoreTachieLoc(); //从 config.ini 读取并恢复立绘位置
     void TryPlayAnimationForAction(const QString &actionName);
+    void RepositionInnerThoughtBubble();
     void ApplyInteractiveRegion(const QRegion &region);
     void ApplyInteractiveRegionFromImage();
     void ApplyInteractiveRegionFullWindow();

@@ -7,6 +7,7 @@
 
 #include <QJsonArray>
 #include <QJsonValue>
+#include <QLineEdit>
 #include <QSettings>
 
 SettingChild_LLM::SettingChild_LLM(QWidget *parent)
@@ -63,6 +64,13 @@ SettingChild_LLM::SettingChild_LLM(QWidget *parent)
                 if (NowSelectServer == fetchedServer)
                     modelListModel->setStringList(list);
             });
+
+    // API Key / Base URL 改用 editingFinished 触发热重载，避免每字符都重载
+    connect(ui->lineEdit_ApiKey, &QLineEdit::editingFinished, this,
+            [this]() { emit requestReloadAIConfig(); });
+    connect(ui->lineEdit_BaseUrl, &QLineEdit::editingFinished, this,
+            [this]() { emit requestReloadAIConfig(); });
+
     //默认读取状态
     ZcJsonLib config(JsonSettingPath);
     QString openAiApiKey =
@@ -250,6 +258,8 @@ void SettingChild_LLM::on_lineEdit_ApiKey_textChanged(const QString &arg1)
         ui->label_Deepseek_Status->setVisible(false);
     else if (NowSelectServer == "Custom")
         ui->label_Custom_Status->setVisible(false);
+
+    // 不在这里 emit reload——textChanged 每字符都触发，改为 editingFinished 统一处理
 }
 
 //修改Baseurl
@@ -267,4 +277,5 @@ void SettingChild_LLM::on_lineEdit_BaseUrl_textChanged(const QString &arg1)
     config.setValue("llm/Custom/ModelList", QJsonArray());
     modelListModel->setStringList(QStringList());
     ui->label_Custom_Status->setVisible(false);
+    // 不在这里 emit reload——textChanged 每字符都触发，改为 editingFinished 统一处理
 }

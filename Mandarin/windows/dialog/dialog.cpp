@@ -251,17 +251,10 @@ void Dialog::ReloadGeneralConfig()
         settings.value("general/ProactiveCooldownMinutes", 10).toInt() * 60;
     if (m_proactiveEnabled && !m_proactiveTimer)
     {
-        m_proactiveTimer = new QTimer(this);
-        m_proactiveTimer->setInterval(1000);
-        connect(m_proactiveTimer, &QTimer::timeout, this, [this]() {
-#ifdef Q_OS_WIN
-            checkProactiveWindow();
-            checkProactiveUserPresence();
-#endif
-        });
-        m_proactiveTimer->start();
-        m_proactivePendingHwnd = 0;
-        qDebug() << "Proactive agent: started via config reload";
+        // 构造阶段服务尚未初始化，交给 initProactiveAgent 延迟启动；
+        // 设置页热重载时则立即启动。
+        if (m_streamDisplayTimer)
+            startProactiveTimer();
     }
     else if (!m_proactiveEnabled && m_proactiveTimer)
     {
@@ -269,7 +262,16 @@ void Dialog::ReloadGeneralConfig()
         delete m_proactiveTimer;
         m_proactiveTimer = nullptr;
         m_proactivePendingHwnd = 0;
+        m_proactiveHandledHwnd = 0;
         m_proactiveDwellCount = 0;
+        m_proactiveInFlight = false;
+        ++m_proactiveGeneration;
+        if (m_activeProactiveAi)
+        {
+            m_activeProactiveAi->disconnect(this);
+            m_activeProactiveAi->deleteLater();
+            m_activeProactiveAi = nullptr;
+        }
         qDebug() << "Proactive agent: stopped via config reload";
     }
 }
@@ -369,30 +371,18 @@ void Dialog::scheduleContextSave()
 /*停止当前对话的残留状态*/
 void Dialog::stopPendingConversationState()
 {
-    //清空当前轮次缓存，避免回溯后旧流式结果继续写入界面或历史
+    // 取消在途请求，使压缩/对话回调失效
+    cancelActiveChat();
+    ++m_contextGeneration;
+
+    //清空当前轮次缓存
     m_lastUserInput.clear();
     m_streamRawReply.clear();
     m_streamDisplayedChinese.clear();
     m_streamVitsEnabled = false;
     m_streamSynthCursor = 0;
     m_vitsPendingTexts.clear();
-    m_vitsInFlightCount = 0;
-
-    for (QBuffer *file : m_vitsReadyFiles)
-    {
-        if (file)
-            file->deleteLater();
-    }
-    m_vitsReadyFiles.clear();
-
-    if (m_vitsTempFile)
-    {
-        m_vitsTempFile->deleteLater();
-        m_vitsTempFile = nullptr;
-    }
-
-    if (m_vitsPlayer)
-        m_vitsPlayer->stop();
+    resetVitsPipeline();
 }
 
 /*构建窗口*/
@@ -403,15 +393,13 @@ Dialog::Dialog(QWidget *parent)
     initWindow();
     lastPos = pos();
 
-    ai = new AiProvider(this); // 轻量创建，配置在 initServices 中
+    // AiProvider 按需创建（每轮对话独立），不再长期复用
     ReloadGeneralConfig();       // 必须在 show() 前设置窗口尺寸
     QTimer::singleShot(0, this, &Dialog::initServices);
 }
 
 void Dialog::initServices()
 {
-    ai->setStreamEnabled(true);
-
     // 流式显示定时器：100ms固定间隔更新，不再被快速chunk重置
     m_streamDisplayTimer = new QTimer(this);
     m_streamDisplayTimer->setSingleShot(false);
@@ -463,6 +451,8 @@ void Dialog::initServices()
     m_vitsPlayer = new QMediaPlayer(this);
     m_vitsAudioOutput = new QAudioOutput(this);
     m_vitsPlayer->setAudioOutput(m_vitsAudioOutput);
+    qDebug() << "[VITS] player init | default audio device:"
+             << m_vitsAudioOutput->device().description();
     // 音频输出设备切换时（耳机热插拔等）刷新，不每句重建
     auto *mediaDevices = new QMediaDevices(this);
     connect(mediaDevices, &QMediaDevices::audioOutputsChanged, this, [this]() {
@@ -474,6 +464,18 @@ void Dialog::initServices()
             qDebug() << "VITS audio output device refreshed";
         }
     });
+    // 播放错误诊断
+    connect(m_vitsPlayer, &QMediaPlayer::errorOccurred, this,
+            [this](QMediaPlayer::Error error, const QString &errorString) {
+                qWarning() << "[VITS] player error:" << error << errorString
+                           << "| state:" << m_vitsPlayer->playbackState()
+                           << "| audio device:"
+                           << (m_vitsAudioOutput ? m_vitsAudioOutput->device().description()
+                                                 : QStringLiteral("null"));
+            });
+    // VITS 服务就绪检查（延迟5秒后每3秒重试，就绪后不重复）
+    QTimer::singleShot(5000, this, [this]() { checkVitsServerReady(); });
+
     //播放完成后播放下一条
     connect(m_vitsPlayer, &QMediaPlayer::playbackStateChanged, this,
             [this](QMediaPlayer::PlaybackState state)
@@ -491,44 +493,7 @@ void Dialog::initServices()
                     if (m_vitsPlayer->playbackState() == QMediaPlayer::PlayingState)
                         qDebug() << "[VITS] inter-sentence gap:" << gapTimer.elapsed() << "ms";
 
-                    // VITS 全部播放完毕后切回默认立绘 + 隐藏内心独白
-                    {
-                        const bool allDone = isAllVitsDone();
-                        if (allDone && !m_isSpeechRecording)
-                        {
-                            emit requestHideInnerThought();
-                            QTimer::singleShot(m_continuousAudioDelayMs, this, [this]() {
-                                emit requestSetCharTachie("default");
-                            });
-                        }
-                    }
-
-                    // 连续对话模式：全部VITS播完后自动开始下一轮录音
-                    if (m_continuousMode)
-                    {
-                        const bool allDone = isAllVitsDone();
-                        qDebug() << "[Continuous] VITS stopped | allDone:" << allDone
-                                 << "| recording:" << m_isSpeechRecording
-                                 << "| readyFiles:" << m_vitsReadyFiles.size()
-                                 << "| inFlight:" << m_vitsInFlightCount;
-                        if (allDone && !m_isSpeechRecording)
-                        {
-                            qDebug() << "Continuous mode: VITS stopped, waiting"
-                                     << m_continuousAudioDelayMs << "ms...";
-                            QTimer::singleShot(m_continuousAudioDelayMs, this, [this]() {
-                                // 二次确认：排期期间可能有新的 VITS 合成完成并开始播放
-                                if (!isAllVitsDone())
-                                    return;
-                                if (!ui->textEdit->isEnabled() && ui->pushButton_next->isVisible())
-                                {
-                                    ui->textEdit->setEnabled(true);
-                                    ui->pushButton_next->hide();
-                                    ui->textEdit->clear();
-                                }
-                                startSpeechRecordingFromHotkey();
-                            });
-                        }
-                    }
+                    checkVitsPipelineFinished();
                 }
             });
     // 缓存 config.json 避免构造函数中重复 I/O（5 次 → 1 次）
@@ -543,10 +508,10 @@ void Dialog::initServices()
     static constexpr int kMinRecordFrames = 1000 / kSilencePollMs; // 10 帧 = 1 秒
     m_silencePollTimer = new QTimer(this);
     m_silencePollTimer->setInterval(kSilencePollMs);
-    connect(m_silencePollTimer, &QTimer::timeout, this, [this, recordFrame = 0]() mutable {
+    connect(m_silencePollTimer, &QTimer::timeout, this, [this]() {
         if (!m_isSpeechRecording || !m_speechAudioDevice)
             return;
-        recordFrame++;
+        m_recordFrame++;
         bool speechDetected = false;
         float maxRms = 0.0f;
         while (m_speechAudioDevice->bytesAvailable() > 0)
@@ -580,7 +545,7 @@ void Dialog::initServices()
                          << "| bytes:" << m_capturedAudioData.size();
             m_silentFrameCount = 0;
         }
-        else if (recordFrame > kMinRecordFrames)
+        else if (m_recordFrame > kMinRecordFrames)
         {
             // 保护期过后才开始累计静音帧
             m_silentFrameCount++;
@@ -636,176 +601,7 @@ void Dialog::initServices()
     // 主动对话代理：窗口检测 + 用户状态 + 空闲感知
     initProactiveAgent();
 
-    //接收分块回复
-    connect(ai, &AiProvider::replyChunkReceived, [=](const QString &chunk)
-            {
-                m_streamRawReply += chunk; //追加
-
-                /*提取中文*/
-                const int firstSep = m_streamRawReply.indexOf('|'); //寻找第一个分隔符
-                if (firstSep < 0)
-                    return;
-                const int secondSep =
-                    m_streamRawReply.indexOf('|',
-                                             firstSep + 1); //寻找第二个分隔符
-                const int chineseEnd =
-                    secondSep < 0
-                        ? m_streamRawReply.size()
-                        : secondSep; //如果没有找到第二个分隔符，就以当前字符串末尾为中文结束位置
-                const QString chinesePartial = m_streamRawReply.mid(
-                    firstSep + 1, chineseEnd - firstSep - 1); //提取中文部分
-                //更新中文的显示部分
-                if (!chinesePartial.isEmpty() &&
-                    chinesePartial != m_streamDisplayedChinese)
-                {
-                    m_streamDisplayedChinese = chinesePartial;
-                    if (!m_streamDisplayTimer->isActive())
-                        m_streamDisplayTimer->start();
-                }
-
-                /*第二个分隔符处理*/
-                if (m_streamVitsEnabled && m_streamVitsSentenceSplitEnabled &&
-                    secondSep >= 0)
-                {
-                    const QString japanesePartial =
-                        m_streamRawReply.mid(secondSep + 1); //提取日语的全部内容
-                    if (!japanesePartial.isEmpty())
-                    {
-                        int sentenceEnd =
-                            findNextSentenceEnd(japanesePartial,
-                                                m_streamSynthCursor); //初始化首个句尾位置
-                        while (sentenceEnd >= 0)
-                        {
-                            const QString sentence =
-                                japanesePartial
-                                    .mid(m_streamSynthCursor,
-                                         sentenceEnd - m_streamSynthCursor + 1)
-                                    .trimmed();                    //获取从上一次切分位置到当前句子结束位置的文本
-                            m_streamSynthCursor = sentenceEnd + 1; //记录切分位置
-                            if (!sentence.isEmpty())
-                            {
-                                VitsGetAndPlay(sentence); //发送到语音合成
-                            }
-                            sentenceEnd = findNextSentenceEnd(
-                                japanesePartial,
-                                m_streamSynthCursor); //继续查找下一句结束位置
-                        }
-                    }
-                } });
-
-    //接收完整回复
-    connect(ai, &AiProvider::replyReceived, [=](const QString &reply)
-            {
-                const QString finalReply = m_streamRawReply.isEmpty()
-                                               ? reply
-                                               : m_streamRawReply; //确保使用完整结果
-                //解析回复
-                const QString mood = finalReply.section('|', 0, 0).trimmed();
-                const QString chineseReply = finalReply.section('|', 1, 1).trimmed();
-                const QString japaneseReply = finalReply.section('|', 2, 2).trimmed();
-                const QString innerThought = finalReply.section('|', 3, 3).trimmed();
-
-                //界面更新（停止防抖定时器，立即显示最终结果）
-                m_streamDisplayTimer->stop();
-                ui->pushButton_next->show();
-                ui->textEdit->setText(chineseReply); //提取中文内容并显示
-                //语音合成补漏或收尾生成
-                if (m_streamVitsEnabled)
-                {
-                    if (m_streamVitsSentenceSplitEnabled)
-                    {
-                        //若最后一段不足一句（无句末标点），在结束回包时补一次合成。
-                        const QString remainJapanese =
-                            japaneseReply.mid(qMax(0, m_streamSynthCursor)).trimmed();
-                        if (!remainJapanese.isEmpty())
-                            VitsGetAndPlay(remainJapanese);
-                    }
-                    else
-                    {
-                        //关闭切分后，仅在完整日语输出后一次性生成语音。
-                        if (!japaneseReply.isEmpty())
-                            VitsGetAndPlay(japaneseReply);
-                    }
-                }
-                emit requestSetCharTachie(mood); //提取心情并发出信号
-
-                // 内心独白
-                if (!innerThought.isEmpty())
-                    emit requestShowInnerThought(innerThought);
-
-                // VITS 播放完毕/无语音时，延迟切回默认立绘
-                {
-                    const bool allDone = isAllVitsDone();
-                    if (allDone && !m_isSpeechRecording)
-                    {
-                        QTimer::singleShot(m_continuousAudioDelayMs, this, [this]() {
-                            emit requestSetCharTachie("default");
-                        });
-                    }
-                }
-
-                //历史记录写入
-                const QString capturedUserInput = m_lastUserInput;
-                if (!m_lastUserInput.isEmpty())
-                {
-                    appendHistoryLine(QStringLiteral("用户：") + m_lastUserInput);
-                    m_lastUserInput.clear();
-                }
-                appendHistoryLine(QStringLiteral("角色：") + chineseReply);
-                scheduleContextSave();
-
-                // 延迟提取记忆：让VITS语音合成请求先发出，避免争抢网络
-                if (!capturedUserInput.isEmpty())
-                {
-                    const QString userInputCopy = capturedUserInput;
-                    const QString aiReplyCopy = chineseReply;
-                    QTimer::singleShot(200, this, [this, userInputCopy, aiReplyCopy]() {
-                        extractAndStoreMemory(userInputCopy, aiReplyCopy);
-                    });
-                }
-
-                // 连续对话模式兜底：仅 VITS 未启用时直接开始下一轮录音。
-                // VITS 启用了则由 playbackStateChanged 回调负责触发。
-                if (m_continuousMode && !m_streamVitsEnabled)
-                {
-                    const bool allDone = isAllVitsDone();
-                    qDebug() << "[Continuous] replyReceived | allDone:" << allDone
-                             << "| recording:" << m_isSpeechRecording
-                                 << "| inFlight:" << m_vitsInFlightCount;
-                    if (allDone && !m_isSpeechRecording)
-                    {
-                        qDebug() << "Continuous mode: no VITS audio, starting next recording";
-                        QTimer::singleShot(500, this, [this]() {
-                            // 二次确认：排期期间可能有新的 VITS 合成完成并开始播放
-                            if (!isAllVitsDone())
-                                return;
-                            if (!ui->textEdit->isEnabled() && ui->pushButton_next->isVisible())
-                            {
-                                ui->textEdit->setEnabled(true);
-                                ui->pushButton_next->hide();
-                                ui->textEdit->clear();
-                            }
-                            startSpeechRecordingFromHotkey();
-                        });
-                    }
-                }
-
-                //重置内容
-                m_streamRawReply.clear();
-                m_streamDisplayedChinese.clear();
-                m_streamVitsEnabled = false;
-                m_streamSynthCursor = 0; });
-    //错误处理
-    connect(ai, &AiProvider::errorOccurred, [=](const QString &error)
-            {
-                ui->pushButton_next->show();
-                ui->textEdit->setText(error);
-                ui->textEdit->setEnabled(false);
-                m_lastUserInput.clear();
-                m_streamRawReply.clear();
-                m_streamDisplayedChinese.clear();
-                m_streamVitsEnabled = false;
-                m_streamSynthCursor = 0; });
+    // AI 回调不再在 initServices 中连接——每轮对话创建独立 AiProvider 并连接回调
 }
 
 /*解构窗口*/
@@ -854,12 +650,24 @@ void Dialog::ReloadAIConfig()
 
 void Dialog::reloadAIConfig(const ZcJsonLib &config)
 {
-    ZcJsonLib CharConfig(ReadCharacterUserConfigPath());
-    configureAiProvider(ai, config, CharConfig);
-    m_cachedSystemPrompt.clear(); // 强制下次对话重建提示词（用户可能改了角色设定）
+    m_cachedSystemPrompt.clear();
     loadContextHistory();
     loadMemory();
     reloadSearchConfig(config);
+}
+
+/*仅刷新 API Key/BaseURL——不重载历史/记忆 */
+void Dialog::ReloadProviderConfig()
+{
+    // 每轮对话创建独立 AiProvider 时从磁盘读取最新配置，此处无需操作
+}
+
+/*角色切换或 prompt 变更时重载 */
+void Dialog::ReloadCharacterConfig()
+{
+    m_cachedSystemPrompt.clear();
+    loadContextHistory();
+    loadMemory();
 }
 
 /*重载语音输入配置*/
@@ -1231,12 +1039,39 @@ void Dialog::VitsGetAndPlay(QString text)
     tryStartNextVitsRequest();
 }
 
+/*VITS 服务就绪检测（延迟重试，无 timer 对象）*/
+void Dialog::checkVitsServerReady()
+{
+    if (m_vitsServerReady)
+        return;
+    if (m_cachedVitsApiUrl.isEmpty()) {
+        ZcJsonLib cfg(JsonSettingPath);
+        m_cachedVitsApiUrl = cfg.value("vits/ApiUrl").toString();
+        if (m_cachedVitsApiUrl.isEmpty()) return; // 未配置 VITS，不检测
+    }
+    QNetworkRequest req(QUrl(m_cachedVitsApiUrl + "/voice/speakers"));
+    req.setTransferTimeout(3000);
+    QNetworkReply *r = m_vitsManager->get(req);
+    connect(r, &QNetworkReply::finished, this, [this, r]() {
+        if (r->error() == QNetworkReply::NoError) {
+            m_vitsServerReady = true;
+            qDebug() << "[VITS] server ready, processing queue";
+            tryStartNextVitsRequest();
+        } else {
+            QTimer::singleShot(3000, this, [this]() { checkVitsServerReady(); });
+        }
+        r->deleteLater();
+    });
+}
+
 /*启动下一个Vits请求（支持最多2路并发合成）*/
 void Dialog::tryStartNextVitsRequest()
 {
     if (!m_vitsManager || !m_vitsPlayer)
         return;
-    if (m_vitsInFlightCount >= kVitsMaxConcurrent || m_vitsPendingTexts.isEmpty())
+    if (!m_vitsServerReady)
+        return;
+    if (m_vitsInFlightReplies.size() >= kVitsMaxConcurrent || m_vitsPendingTexts.isEmpty())
         return;
 
     const QString text = m_vitsPendingTexts.takeFirst();
@@ -1258,19 +1093,23 @@ void Dialog::tryStartNextVitsRequest()
         m_cachedVitsModel = modelAndSpeaker.section(" - ", 0, 0).trimmed().toLower();
         m_cachedVitsSpeaker = modelAndSpeaker.section(" - ", 2, 2).trimmed();
     }
-    /*请求地址构建（使用缓存配置，避免每句话重复读文件）*/
-    QString urlString =
-        QString(m_cachedVitsApiUrl + "/voice/%2?id=%3&text=%1")
-            .arg(QString(QUrl::toPercentEncoding(text)))
-            .arg(QString(QUrl::toPercentEncoding(m_cachedVitsModel)))
-            .arg(QString(QUrl::toPercentEncoding(m_cachedVitsSpeaker)));
+    /*请求地址构建（使用缓存配置，避免每句话重复读文件）
+      注意：不可用 .arg() 链拼接 URL，因为后续 .arg() 会误替换文本中已编码的 %N 字节序列。*/
+    const QString urlString =
+        m_cachedVitsApiUrl + QStringLiteral("/voice/") +
+        QString(QUrl::toPercentEncoding(m_cachedVitsModel)) +
+        QStringLiteral("?id=") +
+        QString(QUrl::toPercentEncoding(m_cachedVitsSpeaker)) +
+        QStringLiteral("&text=") +
+        QString(QUrl::toPercentEncoding(text));
     const int seq = m_vitsSeqNext++; // 分配序号，保证并发完成时仍按序播放
-    m_vitsInFlightCount++;
     QNetworkRequest request(urlString);
     request.setTransferTimeout(15000); // 15秒超时，防止VITS挂死
     request.setRawHeader("Accept-Encoding", "identity"); // 禁用压缩，边收边播
     //发送 GET 请求
     QNetworkReply *reply = m_vitsManager->get(request);
+    m_vitsInFlightReplies.append(reply);
+    const quint64 vitsGen = m_vitsGeneration;
 
     // 性能日志
     QElapsedTimer *timer = new QElapsedTimer();
@@ -1282,11 +1121,17 @@ void Dialog::tryStartNextVitsRequest()
     audioBuffer->open(QIODevice::WriteOnly);
 
     QObject::connect(reply, &QNetworkReply::readyRead, this, [=]() {
+        if (vitsGen != m_vitsGeneration) return;
         audioBuffer->write(reply->readAll());
     });
 
     QObject::connect(reply, &QNetworkReply::finished, this, [=]() {
-        m_vitsInFlightCount--;
+        if (vitsGen != m_vitsGeneration) {
+            audioBuffer->deleteLater();
+            reply->deleteLater();
+            delete timer;
+            return;
+        }
         audioBuffer->close();
         qDebug() << "[VITS] done | text:" << logText
                  << "| elapsed:" << timer->elapsed() << "ms"
@@ -1303,11 +1148,74 @@ void Dialog::tryStartNextVitsRequest()
         else
         {
             audioBuffer->deleteLater();
+            // 记录失败序号并尝试推进游标，避免卡死后续播放
+            m_vitsFailedSeqs.insert(seq);
+            tryStartNextVitsPlayback();
         }
 
         reply->deleteLater();
         delete timer;
-        tryStartNextVitsRequest(); });
+        m_vitsInFlightReplies.removeOne(reply);
+        tryStartNextVitsRequest();
+
+        checkVitsPipelineFinished(); });
+}
+
+/*重置整个 VITS 管线（abort 在途请求 + 清理队列）*/
+void Dialog::resetVitsPipeline()
+{
+    ++m_vitsGeneration;
+
+    const auto replies = m_vitsInFlightReplies;
+    m_vitsInFlightReplies.clear();
+    for (QNetworkReply *reply : replies) {
+        // 不 disconnect——让 abort 触发 finished 回调，generation 检查后自然清理
+        reply->abort();
+    }
+
+    m_vitsPendingTexts.clear();
+    for (QBuffer *file : m_vitsReadyFiles) {
+        if (file) file->deleteLater();
+    }
+    m_vitsReadyFiles.clear();
+    m_vitsFailedSeqs.clear();
+    if (m_vitsTempFile) { m_vitsTempFile->deleteLater(); m_vitsTempFile = nullptr; }
+    if (m_vitsPlayer) m_vitsPlayer->stop();
+    m_vitsSeqCursor = 0;
+    m_vitsSeqNext = 0;
+    m_vitsFinishScheduled = false;
+}
+
+/*检查 VITS 管线是否全部完成（供统一回调）*/
+void Dialog::checkVitsPipelineFinished()
+{
+    if (!m_vitsPendingTexts.isEmpty()) return;
+    if (!m_vitsInFlightReplies.isEmpty()) return;
+    if (!m_vitsReadyFiles.isEmpty()) return;
+    if (m_vitsPlayer && m_vitsPlayer->playbackState() != QMediaPlayer::StoppedState) return;
+
+    if (m_vitsFinishScheduled) return;
+    m_vitsFinishScheduled = true;
+
+    // VITS 管线只负责恢复默认立绘；内心独白由 Tachie 的 20 秒定时器管理。
+    if (!m_isSpeechRecording) {
+        QTimer::singleShot(m_continuousAudioDelayMs, this, [this]() {
+            emit requestSetCharTachie("default");
+        });
+    }
+
+    // 连续对话模式：全部播完后开始下一轮
+    if (m_continuousMode && !m_isSpeechRecording) {
+        QTimer::singleShot(500, this, [this]() {
+            if (!isAllVitsDone() || !m_continuousMode) return;
+            if (!ui->textEdit->isEnabled() && ui->pushButton_next->isVisible()) {
+                ui->textEdit->setEnabled(true);
+                ui->pushButton_next->hide();
+                ui->textEdit->clear();
+            }
+            startSpeechRecordingFromHotkey();
+        });
+    }
 }
 
 /*启动下一个Vits播放*/
@@ -1319,6 +1227,13 @@ void Dialog::tryStartNextVitsPlayback()
         return;
     if (m_vitsReadyFiles.isEmpty())
         return;
+
+    // 跳过连续失败序号，防止单个请求失败卡死整个播放队列
+    while (m_vitsFailedSeqs.contains(m_vitsSeqCursor))
+    {
+        m_vitsFailedSeqs.remove(m_vitsSeqCursor);
+        m_vitsSeqCursor++;
+    }
 
     if (m_vitsTempFile)
     {
@@ -1341,7 +1256,10 @@ void Dialog::tryStartNextVitsPlayback()
     m_vitsPlayer->setSourceDevice(m_vitsTempFile, QUrl("audio.mp3"));
     m_vitsPlayer->play();
     qDebug() << "[VITS] play started | seq:" << (nextKey)
-             << "| size:" << m_vitsTempFile->size() << "bytes";
+             << "| size:" << m_vitsTempFile->size() << "bytes"
+             << "| device:" << m_vitsAudioOutput->device().description()
+             << "| volume:" << m_vitsAudioOutput->volume()
+             << "| muted:" << m_vitsAudioOutput->isMuted();
 }
 
 /*提交当前输入*/
@@ -1464,27 +1382,13 @@ bool Dialog::submitCurrentInput()
     return doSubmitCurrentInput(userInput);
 }
 
-/*执行提交逻辑（供屏幕捕获回调复用）*/
-bool Dialog::doSubmitCurrentInput(const QString &userInput)
+/*构建系统提示词（含缓存逻辑）*/
+QString Dialog::buildSystemPrompt(const QString &currentChar)
 {
-    if (m_streamDisplayTimer)
-        m_streamDisplayTimer->stop();
-
-    // 清理主动对话残留的内心独白
-    emit requestHideInnerThought();
-
-    const QString currentChar = ReadNowSelectChar();
-
-    // 系统提示词缓存：仅在角色变更或记忆更新时重建
     if (!m_cachedSystemPrompt.isEmpty() &&
         m_cachedCharacterForPrompt == currentChar && !m_memoryDirty)
-    {
-        // 命中缓存，跳过提示词构建
-        ai->setSystemPrompt(m_cachedSystemPrompt);
-        goto skipPromptBuild;
-    }
+        return m_cachedSystemPrompt;
 
-    {
     QDir dir(ReadCharacterTachiePath());
     QStringList nameFilters;
     nameFilters << "*.png" << "*.jpg" << "*.jpeg";
@@ -1500,12 +1404,10 @@ bool Dialog::doSubmitCurrentInput(const QString &userInput)
         roleConfig.value("prompt").toString().trimmed();
     QString systemPrompt;
 
-    // 注入用户记忆
     const QString memoryContext = buildMemoryContext();
     if (!memoryContext.isEmpty())
         systemPrompt += memoryContext + QStringLiteral("\n\n");
 
-    // 注入位置信息：手动设置优先，否则用 IP 自动定位
     {
         QSettings iniSettings(IniSettingPath, QSettings::IniFormat);
         const QString manualLocation =
@@ -1538,13 +1440,38 @@ bool Dialog::doSubmitCurrentInput(const QString &userInput)
                        "快乐|今天的天气真好呀！|今日はいい天気ですね！|（这家伙终于出门了）\n"
                        "生气|为什么一直打扰我！|なんでずっと邪魔するの！\n"
                        "担心|还在改bug呀？|まだバグ直してるの？|其实我也有点困了");
-        m_cachedSystemPrompt = systemPrompt;
-        m_cachedCharacterForPrompt = currentChar;
-        m_memoryDirty = false;
-        ai->setSystemPrompt(systemPrompt);
-    }
 
-skipPromptBuild:
+    m_cachedSystemPrompt = systemPrompt;
+    m_cachedCharacterForPrompt = currentChar;
+    m_memoryDirty = false;
+    return systemPrompt;
+}
+
+/*创建并配置一个新的 AiProvider（每轮对话独立）*/
+static AiProvider *createConfiguredProvider(QObject *parent)
+{
+    AiProvider *provider = new AiProvider(parent);
+    provider->setStreamEnabled(true);
+    ZcJsonLib config(JsonSettingPath);
+    ZcJsonLib charConfig(ReadCharacterUserConfigPath());
+    configureAiProvider(provider, config, charConfig);
+    return provider;
+}
+
+/*执行提交逻辑（供屏幕捕获回调复用）*/
+bool Dialog::doSubmitCurrentInput(const QString &userInput)
+{
+    if (m_streamDisplayTimer)
+        m_streamDisplayTimer->stop();
+
+    // 取消上一轮在途请求，创建独立 AiProvider
+    cancelActiveChat();
+    AiProvider *provider = createConfiguredProvider(this);
+
+    const QString currentChar = ReadNowSelectChar();
+
+    provider->setSystemPrompt(buildSystemPrompt(currentChar));
+
     m_lastUserInput = userInput;
     ZcJsonLib charConfig(ReadCharacterUserConfigPath());
     m_streamVitsEnabled = charConfig.value("vitsEnable").toBool();
@@ -1560,23 +1487,11 @@ skipPromptBuild:
     m_streamDisplayedChinese.clear();
     m_streamSynthCursor = 0;
     m_vitsPendingTexts.clear();
-    for (QBuffer *file : m_vitsReadyFiles)
-    {
-        if (file)
-            file->deleteLater();
-    }
-    m_vitsReadyFiles.clear();
-    m_vitsInFlightCount = 0;
-    m_vitsSeqNext = 0;
-    m_vitsSeqCursor = 0;
-    if (m_vitsTempFile)
-    {
-        m_vitsTempFile->deleteLater();
-        m_vitsTempFile = nullptr;
-    }
-    if (m_vitsPlayer)
-        m_vitsPlayer->stop();
-    ai->chat(buildUserMessageWithContext(userInput));
+    resetVitsPipeline();
+    const quint64 generation = ++m_chatGeneration;
+    m_activeChatAi = provider;
+    connectChatCallbacks(provider, generation);
+    provider->chat(buildUserMessageWithContext(userInput));
     ui->textEdit->setText("……");
     return true;
 }
@@ -1709,6 +1624,7 @@ void Dialog::startSpeechRecordingFromHotkey()
     m_capturedAudioData.clear();
     m_silentFrameCount = 0;
 
+    m_recordFrame = 0; // 重置保护期计数器
     m_isSpeechRecording = true;
     ui->textEdit->setText(QStringLiteral("录音中……"));
     m_silencePollTimer->start();
@@ -1843,17 +1759,12 @@ void Dialog::exitContinuousMode()
 /*检查所有VITS音频是否播放完毕*/
 bool Dialog::isAllVitsDone() const
 {
-    return m_vitsReadyFiles.isEmpty() && m_vitsInFlightCount == 0 &&
+    return m_vitsReadyFiles.isEmpty() && m_vitsInFlightReplies.isEmpty() &&
            (!m_vitsPlayer ||
             m_vitsPlayer->playbackState() == QMediaPlayer::StoppedState);
 }
 
 /*录音文件路径*/
-QString Dialog::speechRecordFilePath() const
-{
-    return QDir(QDir::tempPath()).filePath("Mandarin/speech_input.pcm");
-}
-
 /*初始化离线语音识别（SenseVoice）*/
 void Dialog::initSpeechRecognizer()
 {
@@ -2003,6 +1914,14 @@ void Dialog::loadMemory()
         m_memoryData = doc.object();
     else
         m_memoryData = QJsonObject();
+}
+
+/* 重载记忆缓存（记忆设置页修改后调用） */
+void Dialog::ReloadMemoryConfig()
+{
+    loadMemory();
+    m_memoryDirty = true;
+    m_cachedSystemPrompt.clear();
 }
 
 /* 保存记忆文件 */
@@ -2869,16 +2788,17 @@ void Dialog::compressContextHistory()
 {
     if (m_contextHistory.size() <= 60)
         return;
+    if (m_contextCompressionInFlight)
+        return;
+    m_contextCompressionInFlight = true;
 
-    // 取最早的20行（10轮对话）送去概括
-    QStringList oldLines;
+    // 快照而非 takeFirst——成功后再替换，失败不需要恢复
     const int compressCount = qMin(20, m_contextHistory.size() - 40);
-    for (int i = 0; i < compressCount; ++i)
-        oldLines.append(m_contextHistory.takeFirst());
-
+    const QStringList oldLines = m_contextHistory.mid(0, compressCount);
     const QString oldText = oldLines.join("\n");
+    const QString contextPath = ReadCharacterContextPath();
+    const quint64 gen = ++m_contextGeneration;
 
-    // 创建独立AI实例
     AiProvider *compressAi = new AiProvider(this);
     compressAi->setStreamEnabled(false);
 
@@ -2893,26 +2813,33 @@ void Dialog::compressContextHistory()
         "请用一句话概括以下对话，50字以内：\n\n%1").arg(oldText);
 
     connect(compressAi, &AiProvider::replyReceived, this,
-            [this, compressAi](const QString &reply)
+            [this, compressAi, gen, compressCount, contextPath, oldLines](const QString &reply)
             {
+                m_contextCompressionInFlight = false;
+                // 校验：generation 一致、角色未切换、快照未变
+                if (gen != m_contextGeneration || contextPath != ReadCharacterContextPath())
+                    return;
+                if (m_contextHistory.size() < compressCount ||
+                    m_contextHistory.mid(0, compressCount) != oldLines)
+                    return;
+
                 QString summary = reply.trimmed();
                 if (!summary.isEmpty())
                 {
-                    m_contextHistory.prepend(
-                        QStringLiteral("角色：[对话摘要] ") + summary);
+                    m_contextHistory.erase(m_contextHistory.begin(),
+                                           m_contextHistory.begin() + compressCount);
+                    m_contextHistory.prepend(QStringLiteral("角色：[对话摘要] ") + summary);
                     scheduleContextSave();
-                }
-                else
-                {
-                    // 概括失败，放回原文
-                    qWarning() << "Context compression: empty AI reply";
                 }
                 compressAi->deleteLater();
             });
 
     connect(compressAi, &AiProvider::errorOccurred, this,
-            [this, compressAi](const QString &error)
+            [this, compressAi, gen](const QString &error)
             {
+                m_contextCompressionInFlight = false;
+                // 旧代际的错误忽略即可，快照未变无需恢复
+                if (gen != m_contextGeneration) return;
                 qWarning() << "Context compression AI error:" << error;
                 compressAi->deleteLater();
             });
@@ -3008,6 +2935,42 @@ void Dialog::onWakeWordDetected(const QString &keyword)
 
 /* ========== 主动对话代理 ========== */
 
+/*启动唯一的主动对话轮询器*/
+void Dialog::startProactiveTimer()
+{
+    if (!m_proactiveEnabled || m_proactiveTimer)
+        return;
+
+    m_proactiveTimer = new QTimer(this);
+    m_proactiveTimer->setInterval(1000);
+    connect(m_proactiveTimer, &QTimer::timeout, this, [this]() {
+#ifdef Q_OS_WIN
+        // 冷却期结束后重置已处理标记，允许同一窗口再次触发
+        if (m_proactiveHandledHwnd != 0 && m_lastProactiveSpeakTime.isValid()) {
+            const int secs = static_cast<int>(
+                m_lastProactiveSpeakTime.secsTo(QDateTime::currentDateTime()));
+            if (secs >= m_proactiveCooldownSec) {
+                m_proactiveHandledHwnd = 0;
+                // 冷却刚到期且在某个窗口上，不必等下一个 10 秒驻留
+                if (m_proactivePendingHwnd != 0)
+                    m_proactiveDwellCount = m_proactiveDwellSec;
+            }
+        }
+        checkProactiveWindow();
+        checkProactiveUserPresence();
+#else
+        checkProactiveUserPresence();
+#endif
+    });
+    m_proactiveTimer->start();
+    m_proactivePendingHwnd = 0;
+    m_proactiveHandledHwnd = 0;
+    m_proactiveDwellCount = 0;
+    qDebug() << "Proactive agent: started | cooldown:"
+             << m_proactiveCooldownSec << "s | dwell:"
+             << m_proactiveDwellSec << "s";
+}
+
 /*初始化主动对话：1 秒轮询窗口标题 + 用户状态*/
 void Dialog::initProactiveAgent()
 {
@@ -3025,19 +2988,7 @@ void Dialog::initProactiveAgent()
     QTimer::singleShot(30000, this, [this]() {
         if (!m_proactiveEnabled)
             return;
-        m_proactiveTimer = new QTimer(this);
-        m_proactiveTimer->setInterval(1000);
-        connect(m_proactiveTimer, &QTimer::timeout, this, [this]() {
-#ifdef Q_OS_WIN
-            checkProactiveWindow();
-            checkProactiveUserPresence();
-#else
-            checkProactiveUserPresence();
-#endif
-        });
-        m_proactiveTimer->start();
-        qDebug() << "Proactive agent: started (after 30s warmup) | cooldown:"
-                 << m_proactiveCooldownSec << "s | dwell:" << m_proactiveDwellSec << "s";
+        startProactiveTimer();
     });
 }
 
@@ -3048,6 +2999,15 @@ void Dialog::checkProactiveWindow()
     HWND fg = GetForegroundWindow();
     if (!fg)
         return;
+
+    // 忽略 Mandarin 自身窗口（dialog/tachie/settings 的默认标题可能是 Form）。
+    DWORD foregroundProcessId = 0;
+    GetWindowThreadProcessId(fg, &foregroundProcessId);
+    if (foregroundProcessId == GetCurrentProcessId())
+    {
+        m_proactiveDwellCount = 0;
+        return;
+    }
 
     wchar_t title[256];
     GetWindowTextW(fg, title, 256);
@@ -3067,25 +3027,18 @@ void Dialog::checkProactiveWindow()
     if (currentHwnd == m_proactivePendingHwnd)
     {
         m_proactivePendingTitle = currentTitle; // 更新为最新标题
+        if (currentHwnd == m_proactiveHandledHwnd)
+            return; // 同一次窗口切换事件已经消费，不在同一窗口重复触发
+
         m_proactiveDwellCount++;
         if (m_proactiveDwellCount >= m_proactiveDwellSec)
         {
-            const int secsSinceLastSpeak =
-                m_lastProactiveSpeakTime.isValid()
-                    ? static_cast<int>(m_lastProactiveSpeakTime.secsTo(
-                          QDateTime::currentDateTime()))
-                    : INT_MAX;
-            if (secsSinceLastSpeak >= m_proactiveCooldownSec && !m_userAway)
-            {
-                m_proactivePendingHwnd = 0;
-                m_proactiveDwellCount = 0;
-                doProactiveSpeak(m_proactivePendingTitle, QStringLiteral("窗口切换"));
-            }
-            else
-            {
-                // 冷却期内只重置计数，保留 HWND 避免同一窗口反复触发"新窗口"日志
-                m_proactiveDwellCount = 0;
-            }
+            // 驻留达到阈值后消费本次窗口切换。即使正处于冷却期，也不应在
+            // 用户一直停留于同一窗口时延迟重复触发。
+            m_proactiveHandledHwnd = currentHwnd;
+            m_proactiveDwellCount = 0;
+            doProactiveSpeak(m_proactivePendingTitle,
+                             QStringLiteral("窗口切换"));
         }
         return;
     }
@@ -3199,18 +3152,120 @@ static QString buildProactivePrompt(const QString &windowTitle,
     return prompt;
 }
 
+/*取消当前聊天（disconnect + delete旧provider，防止旧回复污染）*/
+void Dialog::cancelActiveChat()
+{
+    ++m_chatGeneration;
+
+    if (m_activeChatAi)
+    {
+        m_activeChatAi->disconnect(this);
+        m_activeChatAi->deleteLater();
+        m_activeChatAi = nullptr;
+    }
+}
+
+/*连接 AI 回调（每轮对话绑定 generation 防止旧回复）*/
+void Dialog::connectChatCallbacks(AiProvider *provider, quint64 generation)
+{
+    connect(provider, &AiProvider::replyChunkReceived, this,
+            [this, provider, generation](const QString &chunk)
+            {
+                if (generation != m_chatGeneration || provider != m_activeChatAi)
+                    return;
+                m_streamRawReply += chunk;
+                const int firstSep = m_streamRawReply.indexOf('|');
+                if (firstSep < 0) return;
+                const int secondSep = m_streamRawReply.indexOf('|', firstSep + 1);
+                const int chineseEnd = secondSep < 0 ? m_streamRawReply.size() : secondSep;
+                const QString chinesePartial = m_streamRawReply.mid(firstSep + 1, chineseEnd - firstSep - 1);
+                if (!chinesePartial.isEmpty() && chinesePartial != m_streamDisplayedChinese) {
+                    m_streamDisplayedChinese = chinesePartial;
+                    if (!m_streamDisplayTimer->isActive()) m_streamDisplayTimer->start();
+                }
+                if (m_streamVitsEnabled && m_streamVitsSentenceSplitEnabled && secondSep >= 0) {
+                    const QString jp = m_streamRawReply.mid(secondSep + 1);
+                    if (!jp.isEmpty()) {
+                        int se = findNextSentenceEnd(jp, m_streamSynthCursor);
+                        while (se >= 0) {
+                            const QString sent = jp.mid(m_streamSynthCursor, se - m_streamSynthCursor + 1).trimmed();
+                            m_streamSynthCursor = se + 1;
+                            if (!sent.isEmpty()) VitsGetAndPlay(sent);
+                            se = findNextSentenceEnd(jp, m_streamSynthCursor);
+                        }
+                    }
+                }
+            });
+
+    connect(provider, &AiProvider::replyReceived, this,
+            [this, provider, generation](const QString &reply)
+            {
+                if (generation != m_chatGeneration || provider != m_activeChatAi) return;
+                const QString fr = m_streamRawReply.isEmpty() ? reply : m_streamRawReply;
+                const QString mood = fr.section('|', 0, 0).trimmed();
+                const QString cn = fr.section('|', 1, 1).trimmed();
+                const QString jp = fr.section('|', 2, 2).trimmed();
+                const QString it = fr.section('|', 3, 3).trimmed();
+                m_streamDisplayTimer->stop();
+                ui->pushButton_next->show();
+                ui->textEdit->setText(cn);
+                if (m_streamVitsEnabled) {
+                    if (m_streamVitsSentenceSplitEnabled) {
+                        const QString rj = jp.mid(qMax(0, m_streamSynthCursor)).trimmed();
+                        if (!rj.isEmpty()) VitsGetAndPlay(rj);
+                    } else { if (!jp.isEmpty()) VitsGetAndPlay(jp); }
+                }
+                emit requestSetCharTachie(mood);
+                if (!it.isEmpty())
+                    emit requestShowInnerThought(it);
+                { if (isAllVitsDone() && !m_isSpeechRecording) QTimer::singleShot(m_continuousAudioDelayMs, this, [this]() { emit requestSetCharTachie("default"); }); }
+                const QString ui_ = m_lastUserInput;
+                if (!m_lastUserInput.isEmpty()) { appendHistoryLine("用户：" + m_lastUserInput); m_lastUserInput.clear(); }
+                appendHistoryLine("角色：" + cn);
+                scheduleContextSave();
+                if (!ui_.isEmpty()) { const QString uc = ui_; const QString ac = cn; QTimer::singleShot(200, this, [this, uc, ac]() { extractAndStoreMemory(uc, ac); }); }
+                if (m_continuousMode && !m_streamVitsEnabled && isAllVitsDone() && !m_isSpeechRecording) {
+                    QTimer::singleShot(500, this, [this]() {
+                        if (!isAllVitsDone()) return;
+                        if (!ui->textEdit->isEnabled() && ui->pushButton_next->isVisible()) { ui->textEdit->setEnabled(true); ui->pushButton_next->hide(); ui->textEdit->clear(); }
+                        startSpeechRecordingFromHotkey();
+                    });
+                }
+                m_streamRawReply.clear(); m_streamDisplayedChinese.clear(); m_streamVitsEnabled = false; m_streamSynthCursor = 0;
+                checkVitsPipelineFinished();
+                m_activeChatAi = nullptr;
+                provider->deleteLater();
+            });
+
+    connect(provider, &AiProvider::errorOccurred, this,
+            [this, provider, generation](const QString &error)
+            {
+                if (generation != m_chatGeneration || provider != m_activeChatAi) return;
+                ui->pushButton_next->show(); ui->textEdit->setText(error); ui->textEdit->setEnabled(false);
+                m_lastUserInput.clear(); m_streamRawReply.clear(); m_streamDisplayedChinese.clear();
+                m_streamVitsEnabled = false; m_streamSynthCursor = 0;
+                m_activeChatAi = nullptr;
+                provider->deleteLater();
+            });
+}
+
 /*执行主动对话*/
-void Dialog::doProactiveSpeak(const QString &windowTitle,
-                               const QString &contextHint)
+bool Dialog::doProactiveSpeak(const QString &windowTitle,
+                              const QString &contextHint)
 {
     if (!m_proactiveEnabled)
-        return;
-
-    qDebug() << "[Proactive] 触发:" << contextHint
-             << "| 窗口:" << (windowTitle.isEmpty() ? QStringLiteral("(无)") : windowTitle);
-
-    // 隐藏上一次残留的内心独白
-    emit requestHideInnerThought();
+        return false;
+    if (m_proactiveInFlight)
+    {
+        qDebug() << "[Proactive] skipped | request in flight";
+        return false;
+    }
+    if (m_userAway || m_isSpeechRecording || m_continuousMode ||
+        m_activeChatAi || !isAllVitsDone())
+    {
+        qDebug() << "[Proactive] skipped | application busy";
+        return false;
+    }
 
     if (m_lastProactiveSpeakTime.isValid())
     {
@@ -3218,8 +3273,20 @@ void Dialog::doProactiveSpeak(const QString &windowTitle,
             static_cast<int>(m_lastProactiveSpeakTime.secsTo(
                 QDateTime::currentDateTime()));
         if (secs < m_proactiveCooldownSec)
-            return;
+        {
+            qDebug() << "[Proactive] skipped | cooldown remaining:"
+                     << (m_proactiveCooldownSec - secs) << "s";
+            return false;
+        }
     }
+
+    // 在请求发出时立即进入 in-flight 和冷却，避免窗口/回来/空闲触发源重入。
+    m_proactiveInFlight = true;
+    m_lastProactiveSpeakTime = QDateTime::currentDateTime();
+    m_vitsFinishScheduled = false;
+    qDebug() << "[Proactive] 触发:" << contextHint
+             << "| 窗口:"
+             << (windowTitle.isEmpty() ? QStringLiteral("(无)") : windowTitle);
 
     // 清空上次主动对话的残留文字
     if (ui->textEdit->toPlainText().isEmpty() || !ui->textEdit->isEnabled())
@@ -3244,7 +3311,7 @@ void Dialog::doProactiveSpeak(const QString &windowTitle,
     const QString prompt = buildProactivePrompt(
         windowTitle, contextHint, characterPrompt, memoryContext, location);
 
-    // 创建独立 AiProvider 用于主动对话
+    // 创建独立 AiProvider 用于主动对话（与普通聊天完全隔离）
     AiProvider *proactiveAi = new AiProvider(this);
     proactiveAi->setStreamEnabled(false);
     ZcJsonLib config(JsonSettingPath);
@@ -3252,9 +3319,19 @@ void Dialog::doProactiveSpeak(const QString &windowTitle,
     configureAiProvider(proactiveAi, config, charConfig);
     proactiveAi->setSystemPrompt(prompt);
 
+    const quint64 proactiveGen = ++m_proactiveGeneration;
+    m_activeProactiveAi = proactiveAi;
+
     connect(proactiveAi, &AiProvider::replyReceived, this,
-            [this, proactiveAi](const QString &reply)
+            [this, proactiveAi, proactiveGen](const QString &reply)
             {
+                if (proactiveGen != m_proactiveGeneration ||
+                    proactiveAi != m_activeProactiveAi) {
+                    proactiveAi->deleteLater();
+                    return;
+                }
+                m_proactiveInFlight = false;
+                m_activeProactiveAi = nullptr;
                 const QString mood = reply.section('|', 0, 0).trimmed();
                 const QString chinese =
                     reply.section('|', 1, 1).trimmed();
@@ -3271,7 +3348,6 @@ void Dialog::doProactiveSpeak(const QString &windowTitle,
                 if (!innerThought.isEmpty())
                     emit requestShowInnerThought(innerThought);
 
-                // VITS 合成
                 if (!japanese.isEmpty())
                 {
                     m_streamVitsEnabled = true;
@@ -3281,17 +3357,24 @@ void Dialog::doProactiveSpeak(const QString &windowTitle,
                 appendHistoryLine(QStringLiteral("角色：") + chinese);
                 scheduleContextSave();
 
-                m_lastProactiveSpeakTime = QDateTime::currentDateTime();
                 proactiveAi->deleteLater();
+                checkVitsPipelineFinished();
             });
 
     connect(proactiveAi, &AiProvider::errorOccurred, this,
-            [this, proactiveAi](const QString &error)
+            [this, proactiveAi, proactiveGen](const QString &error)
             {
+                if (proactiveGen != m_proactiveGeneration ||
+                    proactiveAi != m_activeProactiveAi) {
+                    proactiveAi->deleteLater();
+                    return;
+                }
+                m_proactiveInFlight = false;
+                m_activeProactiveAi = nullptr;
                 qWarning() << "Proactive AI error:" << error;
-                emit requestHideInnerThought();
                 proactiveAi->deleteLater();
             });
 
     proactiveAi->chat(QStringLiteral("触发主动对话"));
+    return true;
 }

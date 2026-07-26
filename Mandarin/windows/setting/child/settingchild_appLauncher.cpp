@@ -54,7 +54,6 @@ void SettingChild_AppLauncher::addCard(const QString &keyword,
                                         const QString &path)
 {
     AppCommandCard card;
-    const int index = m_cards.size();
 
     // 外层卡片
     card.area = new ElaScrollPageArea(ui->scrollContent);
@@ -112,24 +111,27 @@ void SettingChild_AppLauncher::addCard(const QString &keyword,
     connect(card.keywordEdit, &QLineEdit::textChanged, this, saveLambda);
     connect(card.pathEdit, &QLineEdit::textChanged, this, saveLambda);
 
-    connect(btnBrowse, &QPushButton::clicked, this, [this, index]() {
-        if (index >= m_cards.size())
-            return;
-        const QString p =
-            QFileDialog::getOpenFileName(this, "选择应用或文件", QString(),
-                                         "所有文件 (*.*);;可执行文件 (*.exe);;快捷方式 (*.lnk)");
-        if (!p.isEmpty() && index < m_cards.size())
-        {
-            m_cards[index].pathEdit->setText(p);
+    connect(btnBrowse, &QPushButton::clicked, this, [this, area = card.area]() {
+        // 按控件指针查找当前索引，避免删除前面卡片后索引错位
+        for (int i = 0; i < m_cards.size(); ++i) {
+            if (m_cards[i].area != area) continue;
+            const QString p =
+                QFileDialog::getOpenFileName(this, "选择应用或文件", QString(),
+                                             "所有文件 (*.*);;可执行文件 (*.exe);;快捷方式 (*.lnk)");
+            if (!p.isEmpty())
+                m_cards[i].pathEdit->setText(p);
             saveAll();
+            return;
         }
     });
 
-    connect(btnDelete, &QPushButton::clicked, this, [this, index]() {
-        if (index < m_cards.size())
-        {
-            removeCard(index);
-            saveAll();
+    connect(btnDelete, &QPushButton::clicked, this, [this, area = card.area]() {
+        for (int i = 0; i < m_cards.size(); ++i) {
+            if (m_cards[i].area == area) {
+                removeCard(i);
+                saveAll();
+                return;
+            }
         }
     });
 }

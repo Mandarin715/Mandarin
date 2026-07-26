@@ -153,6 +153,7 @@ void SettingChild_Memory::RefreshMemoryList()
                 f.close();
             }
             RefreshMemoryList();
+            emit requestReloadMemory();
         });
 
         layout->addWidget(row);
@@ -177,6 +178,7 @@ void SettingChild_Memory::on_pushButton_ClearAll_clicked()
         file.close();
     }
     RefreshMemoryList();
+    emit requestReloadMemory();
     ElaMessageBar::success(ElaMessageBarType::BottomRight, "已清空",
                            "对话记忆已全部清除", 3000, this);
 }

@@ -16,6 +16,9 @@ class SettingChild_Memory : public QWidget
     explicit SettingChild_Memory(QWidget *parent = nullptr);
     ~SettingChild_Memory();
 
+  signals:
+    void requestReloadMemory();
+
   private slots:
     void on_pushButton_ClearAll_clicked();
     void on_pushButton_Refresh_clicked();

@@ -12,6 +12,7 @@
 #include <QDir>
 #include <QEasingCurve>
 #include <QFileInfo>
+#include <QFontMetrics>
 #include <QGraphicsOpacityEffect>
 #include <QImage>
 #include <QLabel>
@@ -49,6 +50,13 @@ Tachie::Tachie(QWidget *parent)
     setWindowFlags(flags);
     //窗口拖拽
     new DragHelper(this);
+
+    // 内心独白的生命周期由 Tachie 统一管理：显示后 20 秒自动淡出。
+    m_innerThoughtTimer = new QTimer(this);
+    m_innerThoughtTimer->setSingleShot(true);
+    m_innerThoughtTimer->setInterval(20000);
+    connect(m_innerThoughtTimer, &QTimer::timeout, this,
+            &Tachie::HideInnerThought);
 
     //延迟加载立绘
     QTimer::singleShot(0, this, [this]()
@@ -407,6 +415,8 @@ void Tachie::SetTachieSize(int size)
     //Windows 下不裁剪窗口形状，避免半透明边缘被硬裁切后出现“略微缩小/边缘异常”。
     this->clearMask();
 #endif
+
+    RepositionInnerThoughtBubble();
 }
 
 //鼠标按下
@@ -499,24 +509,46 @@ void Tachie::RestoreTachieLoc()
 /*内心独白气泡：立绘头顶右上 45°，半透明淡入→停留→语音播完淡出*/
 void Tachie::ShowInnerThought(QString text)
 {
+    text = text.trimmed();
     if (text.isEmpty())
         return;
 
     // 先清理上一个气泡
     HideInnerThought();
 
+    // 恢复原来的父窗口内 QLabel 绘制方式，确保半透明背景稳定显示。
     auto *bubble = new QLabel(text, this);
+    bubble->setTextFormat(Qt::PlainText);
+    bubble->setWordWrap(true);
+    bubble->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+
+    QFont bubbleFont = bubble->font();
+    bubbleFont.setPixelSize(13);
+    bubble->setFont(bubbleFont);
     bubble->setStyleSheet(
         "color: #555; background: rgba(255,255,255,200); "
         "border: 1px solid rgba(180,180,180,120); "
-        "border-radius: 12px; padding: 8px 14px; font-size: 13px;");
-    bubble->adjustSize();
+        "border-radius: 12px; padding: 8px 14px;");
 
-    // 定位：立绘头顶，向右上 45° 偏移
-    const int centerX = width() / 2;
-    const int headY = static_cast<int>(height() * 0.30);
-    const int offset = 50;
-    bubble->move(centerX + offset, headY - offset - bubble->height());
+    // 在 Tachie 画布范围内自动换行，避免长文本横向越界。
+    const QRect available = rect().adjusted(10, 10, -10, -10);
+
+    constexpr int kHorizontalPadding = 30;
+    constexpr int kVerticalPadding = 18;
+    const int maxBubbleWidth = qMax(130, qMin(320, available.width()));
+    const int maxTextWidth = maxBubbleWidth - kHorizontalPadding;
+    const QFontMetrics metrics(bubbleFont);
+    const int naturalWidth = metrics.boundingRect(text).width();
+    const int textWidth = qBound(100, naturalWidth, maxTextWidth);
+    const QRect textRect = metrics.boundingRect(
+        QRect(0, 0, textWidth, qMax(100, available.height())),
+        Qt::TextWordWrap | Qt::TextWrapAnywhere | Qt::AlignLeft, text);
+    bubble->setFixedSize(qMin(maxBubbleWidth,
+                              qMax(130, textRect.width() + kHorizontalPadding)),
+                         qMax(36, textRect.height() + kVerticalPadding));
+
+    m_innerThoughtBubble = bubble;
+    RepositionInnerThoughtBubble();
     bubble->show();
 
     // 淡入
@@ -529,12 +561,52 @@ void Tachie::ShowInnerThought(QString text)
     fadeIn->setEndValue(1.0);
     fadeIn->start(QAbstractAnimation::DeleteWhenStopped);
 
-    m_innerThoughtBubble = bubble;
+    m_innerThoughtTimer->start();
+}
+
+/*将气泡定位到立绘头部附近，并限制在 Tachie 画布内*/
+void Tachie::RepositionInnerThoughtBubble()
+{
+    if (!m_innerThoughtBubble)
+        return;
+
+    const QPoint head(width() / 2, static_cast<int>(height() * 0.30));
+    constexpr int kCanvasMargin = 10;
+    constexpr int kHorizontalOffset = 50;
+    constexpr int kVerticalOffset = 35;
+
+    int x = head.x() + kHorizontalOffset;
+    int y = head.y() - kVerticalOffset - m_innerThoughtBubble->height();
+
+    // 右侧空间不足时翻转到立绘左上方。
+    if (x + m_innerThoughtBubble->width() >
+        width() - kCanvasMargin)
+    {
+        x = head.x() - kHorizontalOffset -
+            m_innerThoughtBubble->width();
+    }
+
+    // 顶部空间不足时改放到头部下方。
+    if (y < kCanvasMargin)
+        y = head.y() + kVerticalOffset;
+
+    const int minX = kCanvasMargin;
+    const int minY = kCanvasMargin;
+    const int maxX = qMax(minX, width() - kCanvasMargin -
+                                    m_innerThoughtBubble->width());
+    const int maxY = qMax(minY, height() - kCanvasMargin -
+                                    m_innerThoughtBubble->height());
+
+    m_innerThoughtBubble->move(qBound(minX, x, maxX),
+                               qBound(minY, y, maxY));
 }
 
 /*隐藏内心独白气泡：淡出后销毁*/
 void Tachie::HideInnerThought()
 {
+    if (m_innerThoughtTimer)
+        m_innerThoughtTimer->stop();
+
     if (!m_innerThoughtBubble)
         return;
 

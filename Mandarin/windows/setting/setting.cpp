@@ -69,10 +69,14 @@ MainWindow::MainWindow(Dialog *dialog, Tachie *tachie, QWidget *parent)
     connect(settingchild_charWin, &SettingChild_Char::requestResetTachieLoc,
             tachie, &Tachie::ResetTachieLoc); //重置立绘位置
     connect(settingchild_charWin, &SettingChild_Char::requestReloadAIConfig,
-            dialog, &Dialog::ReloadAIConfig); //重载AI配置
+            dialog, &Dialog::ReloadCharacterConfig); //角色/prompt变更重载
+    connect(settingchild_memoryWin, &SettingChild_Memory::requestReloadMemory,
+            dialog, &Dialog::ReloadMemoryConfig); //重载记忆缓存
     //获取模型列表后刷新角色页的模型下拉框
     connect(settingchild_llmWin, &SettingChild_LLM::modelListRefreshed,
             settingchild_charWin, &SettingChild_Char::RefreshModelList); //刷新LLM模型列表
+    connect(settingchild_llmWin, &SettingChild_LLM::requestReloadAIConfig,
+            dialog, &Dialog::ReloadProviderConfig); //API Key变更后仅刷新provider配置
     connect(settingchild_vitsWin, &SettingChild_Vits::vitsModelListRefreshed,
             settingchild_charWin, &SettingChild_Char::RefreshVitsModelList); //刷新Vits模型列表
     connect(settingchild_screenCaptureWin,

@@ -19,7 +19,8 @@ class SettingChild_LLM : public QWidget
     ~SettingChild_LLM();
 
   signals:
-    void modelListRefreshed(); //LLM模型列表已刷新
+    void modelListRefreshed();     // LLM模型列表已刷新
+    void requestReloadAIConfig();  // 通知Dialog重载AI配置
 
   private slots:
     void on_pushButton_Openai_Set_clicked();

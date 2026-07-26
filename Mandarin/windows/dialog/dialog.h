@@ -9,6 +9,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QMoveEvent>
+#include <QSet>
 #include <QStringList>
 #include <QTimer>
 #include <QWidget>
@@ -64,7 +65,10 @@ class Dialog : public QWidget
     void requestHideInnerThought();
 
   public slots:
-    void ReloadAIConfig();
+    void ReloadAIConfig();          // 完整重载（角色切换/F5）
+    void ReloadProviderConfig();     // 仅 API Key/BaseURL（LLM 页变更）
+    void ReloadCharacterConfig();    // 角色 prompt/模型/上下文/记忆
+    void ReloadMemoryConfig();       // 仅 memory.json
 
   private:
     /*初始化*/
@@ -100,19 +104,27 @@ class Dialog : public QWidget
     bool isHistoryOpen = false;
     QStringList m_contextHistory;
     QString m_lastHistoryDate;
+    bool m_contextCompressionInFlight = false;
+    quint64 m_contextGeneration = 0;
 
     QString buildUserMessageWithContext(
         const QString &input) const; //构建用户消息，包含上下文
+    QString buildSystemPrompt(const QString &currentChar); //构建系统提示词（含缓存）
 
     void appendHistoryLine(const QString &line); //添加历史记录行
     void tryStartNextVitsRequest();              //添加到Vits请求
-    AiProvider *ai = nullptr;                    //用于AI交互
+    void connectChatCallbacks(AiProvider *provider, quint64 generation);
 
     QString m_lastUserInput;
     QString m_streamRawReply;
     QString m_streamDisplayedChinese;
     QTimer *m_streamDisplayTimer = nullptr; // 流式显示防抖定时器
     bool m_isSpeechRecording = false;
+    // 会话隔离：每轮对话创建独立 AiProvider
+    quint64 m_chatGeneration = 0;
+    AiProvider *m_activeChatAi = nullptr;
+    quint64 m_proactiveGeneration = 0;
+    void cancelActiveChat();
     bool m_globalSpeechHotkeyEnabled = false; //全局录音热键是否启用
     bool m_globalSpeechHotkeyPressed = false; //当前热键是否处于按下录音中
     quint32 m_globalSpeechHotkeyNativeKey = 0; //Ela绑定得到的原生按键值
@@ -130,12 +142,19 @@ class Dialog : public QWidget
     int m_streamSynthCursor = 0;
     QStringList m_vitsPendingTexts;
     QMap<int, QBuffer *> m_vitsReadyFiles; // key=序号，保证并发乱序完成时按原文序播放
-    int m_vitsInFlightCount = 0;
+    QSet<int> m_vitsFailedSeqs;            // 失败的序号集合，播放时跳过
+    QList<QNetworkReply *> m_vitsInFlightReplies; // 在途VITS请求，回溯时abort
     int m_vitsSeqNext = 0;   // 下一个待分配的合成序号
     int m_vitsSeqCursor = 0; // 下一个应播放的序号，保证即使乱序完成也按序播放
     static constexpr int kVitsMaxConcurrent = 3;
+    quint64 m_vitsGeneration = 0;          // VITS 请求代际，abort 后递增
+    bool m_vitsFinishScheduled = false;
+    void resetVitsPipeline();
+    void checkVitsPipelineFinished();
+    void checkVitsServerReady();
     QNetworkAccessManager *m_vitsManager = nullptr;
     QMediaPlayer *m_vitsPlayer = nullptr;
+    bool m_vitsServerReady = false;            // VITS 服务就绪后置 true
     QString m_cachedVitsApiUrl;
     QString m_cachedVitsModel;
     QString m_cachedVitsSpeaker;
@@ -168,7 +187,6 @@ class Dialog : public QWidget
     void startSpeechRecording();
     void startSpeechRecordingFromHotkey();
     void stopSpeechRecording();
-    QString speechRecordFilePath() const;
     void releaseSpeechHotkeyResources();
     // 离线语音识别
     OfflineSpeechRecognizer *m_speechRecognizer = nullptr;
@@ -180,6 +198,7 @@ class Dialog : public QWidget
     QTimer *m_silencePollTimer = nullptr;
     int m_silentFrameCount = 0;
     float m_silenceThreshold = 0.005f; // 静音 RMS 阈值，从配置读取
+    int m_recordFrame = 0;             // 录音帧计数器（每轮重置）
     static constexpr int kSilencePollMs = 100;
     int m_silenceFrameMax = 15; // 静默帧上限，从配置读取，默认 1.5s
     void initWakeWord();
@@ -207,15 +226,19 @@ class Dialog : public QWidget
     QDateTime m_lastProactiveSpeakTime;
     bool m_userAway = false;
     bool m_proactiveEnabled = false;
+    bool m_proactiveInFlight = false;
     int m_proactiveCooldownSec = 600;   // 冷却期，默认 10 分钟
     int m_proactiveDwellSec = 10;       // 窗口驻留确认，默认 10 秒
     int64_t m_proactivePendingHwnd = 0; // 待确认的窗口句柄（比标题更稳定）
+    int64_t m_proactiveHandledHwnd = 0; // 已消费窗口切换事件的句柄
     QString m_proactivePendingTitle;
     int m_proactiveDwellCount = 0;      // 驻留倒计时
+    AiProvider *m_activeProactiveAi = nullptr;
+    void startProactiveTimer();
     void initProactiveAgent();
     void checkProactiveWindow();
     void checkProactiveUserPresence();
-    void doProactiveSpeak(const QString &windowTitle, const QString &contextHint);
+    bool doProactiveSpeak(const QString &windowTitle, const QString &contextHint);
 
     // 联网搜索
     SearchProvider *m_searchProvider = nullptr;
