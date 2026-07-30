@@ -1,14 +1,3 @@
-# Mandarin — AI 桌面宠物
-
- 一个模仿 Galgame 演出效果的 AI 桌宠
-
-<img width="678" height="591" alt="屏幕截图 2026-06-25 170727" src="https://github.com/user-attachments/assets/bb3da77c-8959-4417-ad09-e27dde804561" />
-
-[![GitHub Release](https://img.shields.io/github/v/release/Mandarin715/Mandarin?color=22c55e&style=for-the-badge)](https://github.com/Mandarin715/Mandarin/releases)
-
-
----
-
 ##  项目介绍
 
 让你的桌面上住进一位 Galgame 风格的角色。她可以和你聊天、展示丰富的表情动作、用语音回复你，还能记住关于你的信息。
