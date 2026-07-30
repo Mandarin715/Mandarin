@@ -5,6 +5,8 @@
 
 #include <QWidget>
 
+class QDragEnterEvent;
+class QDropEvent;
 class QSequentialAnimationGroup;
 class QTimer;
 
@@ -23,6 +25,7 @@ class Tachie : public QWidget
 
   signals:
     void requestToggleVisible(); //切换对话框的显示状态
+    void requestFileDrop(QStringList filePaths); //文件拖放到立绘
 
   public slots:
     void SetTachieImg(QString TachieName = "default");
@@ -57,6 +60,8 @@ class Tachie : public QWidget
 
     void mousePressEvent(QMouseEvent *event) override; //为了实现鼠标穿透
     void mouseReleaseEvent(QMouseEvent *event) override;
+    void dragEnterEvent(QDragEnterEvent *event) override;
+    void dropEvent(QDropEvent *event) override;
 };
 
 #endif //TACHIE_H

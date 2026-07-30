@@ -132,6 +132,9 @@ int main(int argc, char *argv[])
     //对话框的开启和关闭
     QObject::connect(&tachieWin, &Tachie::requestToggleVisible, &dialogWin,
                      &Dialog::ToggleVisible);
+    //文件拖放到立绘
+    QObject::connect(&tachieWin, &Tachie::requestFileDrop, &dialogWin,
+                     &Dialog::handleFileDrop);
     //修改立绘图片
     QObject::connect(&dialogWin, &Dialog::requestSetCharTachie, &tachieWin,
                      &Tachie::SetTachieImg);

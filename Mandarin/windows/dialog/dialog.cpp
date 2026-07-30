@@ -14,7 +14,10 @@
 #include <QDebug>
 #include <QDir>
 #include <QFile>
+#include <QClipboard>
 #include <QDesktopServices>
+#include <QGuiApplication>
+#include <QMimeData>
 #include <QProcess>
 
 #ifdef Q_OS_WIN
@@ -598,8 +601,9 @@ void Dialog::initServices()
         qDebug() << "All configs reloaded via F5";
     });
 
-    // 主动对话代理：窗口检测 + 用户状态 + 空闲感知
+    // 主动对话代理 + 剪贴板监控
     initProactiveAgent();
+    initClipboardMonitor();
 
     // AI 回调不再在 initServices 中连接——每轮对话创建独立 AiProvider 并连接回调
 }
@@ -3165,6 +3169,50 @@ void Dialog::cancelActiveChat()
     }
 }
 
+/*文件拖放到立绘——角色吐槽文件名*/
+void Dialog::handleFileDrop(QStringList paths)
+{
+    if (paths.isEmpty() || m_activeChatAi)
+        return; // 正在对话中，不触发
+
+    QStringList names;
+    for (const QString &p : paths) {
+        QFileInfo fi(p);
+        names.append(fi.fileName());
+    }
+    const QString nameStr = names.join("、");
+    const QString input = QStringLiteral("用户向你拖来了文件：") + nameStr +
+                          QStringLiteral("，用角色语气对这件事吐槽一句，15字以内。");
+
+    // 复用普通对话流程
+    doSubmitCurrentInput(input);
+}
+
+/*剪贴板监控——用户复制文字时角色吐槽*/
+void Dialog::initClipboardMonitor()
+{
+    QClipboard *clipboard = QGuiApplication::clipboard();
+    connect(clipboard, &QClipboard::dataChanged, this, [this]() {
+        if (m_clipboardCooldown || m_activeChatAi || m_isSpeechRecording)
+            return;
+        const QMimeData *mime = QGuiApplication::clipboard()->mimeData();
+        if (!mime || !mime->hasText())
+            return;
+        const QString text = mime->text().trimmed();
+        if (text.length() < 5) // 太短不触发
+            return;
+
+        m_clipboardCooldown = true;
+        QTimer::singleShot(60000, this, [this]() { m_clipboardCooldown = false; });
+
+        const QString sample = text.left(50) + (text.size() > 50 ? "..." : "");
+        const QString input = QStringLiteral("用户刚才复制了一段文字：'%1'，"
+                                              "用角色语气对这件事说一句相关的话，15字以内。")
+                                  .arg(sample);
+        doSubmitCurrentInput(input);
+    });
+}
+
 /*连接 AI 回调（每轮对话绑定 generation 防止旧回复）*/
 void Dialog::connectChatCallbacks(AiProvider *provider, quint64 generation)
 {
@@ -3256,16 +3304,10 @@ bool Dialog::doProactiveSpeak(const QString &windowTitle,
     if (!m_proactiveEnabled)
         return false;
     if (m_proactiveInFlight)
-    {
-        qDebug() << "[Proactive] skipped | request in flight";
         return false;
-    }
     if (m_userAway || m_isSpeechRecording || m_continuousMode ||
         m_activeChatAi || !isAllVitsDone())
-    {
-        qDebug() << "[Proactive] skipped | application busy";
         return false;
-    }
 
     if (m_lastProactiveSpeakTime.isValid())
     {
@@ -3273,11 +3315,7 @@ bool Dialog::doProactiveSpeak(const QString &windowTitle,
             static_cast<int>(m_lastProactiveSpeakTime.secsTo(
                 QDateTime::currentDateTime()));
         if (secs < m_proactiveCooldownSec)
-        {
-            qDebug() << "[Proactive] skipped | cooldown remaining:"
-                     << (m_proactiveCooldownSec - secs) << "s";
             return false;
-        }
     }
 
     // 在请求发出时立即进入 in-flight 和冷却，避免窗口/回来/空闲触发源重入。

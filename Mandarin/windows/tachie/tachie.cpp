@@ -16,6 +16,9 @@
 #include <QGraphicsOpacityEffect>
 #include <QImage>
 #include <QLabel>
+#include <QDragEnterEvent>
+#include <QDropEvent>
+#include <QMimeData>
 #include <QMouseEvent>
 #include <QPropertyAnimation>
 #include <QSequentialAnimationGroup>
@@ -41,6 +44,7 @@ Tachie::Tachie(QWidget *parent)
 
     //无边框
     setAttribute(Qt::WA_TranslucentBackground);
+    setAcceptDrops(true);
     Qt::WindowFlags flags = Qt::Tool | Qt::FramelessWindowHint |
                             Qt::WindowStaysOnTopHint;
 #ifdef Q_OS_LINUX
@@ -460,6 +464,28 @@ void Tachie::mouseReleaseEvent(QMouseEvent *event)
         return;
 
     SaveTachieLoc(); //保存立绘位置
+}
+
+/*文件拖放到立绘上——提取文件路径发给 Dialog 处理*/
+void Tachie::dragEnterEvent(QDragEnterEvent *event)
+{
+    if (event->mimeData()->hasUrls())
+        event->acceptProposedAction();
+}
+
+void Tachie::dropEvent(QDropEvent *event)
+{
+    const QList<QUrl> urls = event->mimeData()->urls();
+    if (urls.isEmpty())
+        return;
+
+    QStringList paths;
+    for (const QUrl &url : urls) {
+        if (url.isLocalFile())
+            paths.append(url.toLocalFile());
+    }
+    if (!paths.isEmpty())
+        emit requestFileDrop(paths);
 }
 
 //重置立绘位置

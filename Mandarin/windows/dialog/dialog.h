@@ -40,6 +40,7 @@ class Dialog : public QWidget
 
   public slots:
     void ToggleVisible();
+    void handleFileDrop(QStringList paths);
     void VitsGetAndPlay(QString text);
     void ReloadGeneralConfig();
     void ReloadSpeechInputConfig();
@@ -236,6 +237,8 @@ class Dialog : public QWidget
     AiProvider *m_activeProactiveAi = nullptr;
     void startProactiveTimer();
     void initProactiveAgent();
+    void initClipboardMonitor();
+    bool m_clipboardCooldown = false;
     void checkProactiveWindow();
     void checkProactiveUserPresence();
     bool doProactiveSpeak(const QString &windowTitle, const QString &contextHint);
