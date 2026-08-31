@@ -1,3 +1,5 @@
+[![GitHub License](https://img.shields.io/github/license/Mandarin715/Mandarin?color=ef4444&style=for-the-badge)](LICENSE)
+
 ##  项目介绍
 
 让你的桌面上住进一位 Galgame 风格的角色。她可以和你聊天、展示丰富的表情动作、用语音回复你，还能记住关于你的信息。
@@ -178,3 +180,9 @@
 | [Kimi 视觉模型](https://platform.moonshot.cn/) | 屏幕识别 |
 
 ---
+
+## 📄 许可证
+
+本项目基于 [GPL v3](LICENSE) 开源协议发布。
+
+第三方库（ElaWidgetTools、sherpa-onnx、vits-simple-api 等）遵循各自的开源许可证。
