@@ -96,3 +96,6 @@ _temp_bak/
 
 # 敏感文件（勿提交）
 github-recovery-codes.txt
+
+# 本机开发脚本（dsh web 重启工具，含本机硬编码路径，勿提交）
+restart-dsh-web.ps1
