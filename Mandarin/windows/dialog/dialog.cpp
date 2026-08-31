@@ -1,5 +1,6 @@
 #include "dialog.h"
 #include "history/history.h"
+#include "reminder/reminder.h"
 #include "ui_dialog.h"
 
 #include "../../GlobalConstants.h"
@@ -52,6 +53,7 @@
 #include <QBuffer>
 #include <QElapsedTimer>
 #include <QUrlQuery>
+#include <QRegularExpression>
 #include <QUuid>
 #include <QWheelEvent>
 
@@ -246,6 +248,14 @@ void Dialog::ReloadGeneralConfig()
         historyWin->resize(dialogWidth, historyWin->height());
         if (historyWin->isVisible())
             historyWin->move(x(), y() - historyWin->height());
+    }
+
+    if (reminderWin)
+    {
+        //提醒列表同样贴在对话框上方，宽度跟随。
+        reminderWin->resize(dialogWidth, reminderWin->height());
+        if (reminderWin->isVisible())
+            reminderWin->move(x(), y() - reminderWin->height());
     }
 
     // 主动对话配置热重载
@@ -605,6 +615,14 @@ void Dialog::initServices()
     initProactiveAgent();
     initClipboardMonitor();
 
+    // 日程提醒：加载 + 补触发遗漏 + 每秒轮询
+    loadSchedules();
+    QTimer::singleShot(1500, this, [this]() { catchUpMissedSchedules(); });
+    auto *schedTimer = new QTimer(this);
+    schedTimer->setInterval(1000);
+    connect(schedTimer, &QTimer::timeout, this, [this]() { checkSchedules(); });
+    schedTimer->start();
+
     // AI 回调不再在 initServices 中连接——每轮对话创建独立 AiProvider 并连接回调
 }
 
@@ -620,13 +638,22 @@ Dialog::~Dialog()
 void Dialog::keyPressEvent(QKeyEvent *event)
 {
     keys.append(event->key());
+    // 裸 Enter 不让 QTextEdit 插入换行，提交由 keyReleaseEvent 处理
+    if (event->key() == Qt::Key_Return && !keys.contains(Qt::Key_Shift)) {
+        event->accept();
+        return;
+    }
+    QWidget::keyPressEvent(event);
 }
 void Dialog::keyReleaseEvent(QKeyEvent *event)
 {
-    if (event->key() == Qt::Key_Return)
-        /*发送对话请求*/
-        if (!keys.contains(Qt::Key_Shift)) //过滤Shift换行
+    if (event->key() == Qt::Key_Return) {
+        if (!keys.contains(Qt::Key_Shift)) {
             submitCurrentInput();
+            keys.removeAll(event->key());
+            return;
+        }
+    }
     keys.removeAll(event->key());
 }
 
@@ -642,7 +669,22 @@ void Dialog::on_pushButton_next_clicked()
 /*开关窗口*/
 void Dialog::ToggleVisible()
 {
-    setVisible(!isVisible());
+    const bool show = !isVisible();
+    setVisible(show);
+    // 聊天栏隐藏时，把附属的提醒/历史窗口一起关掉，避免它们残留桌面
+    if (!show)
+    {
+        if (reminderWin && reminderWin->isVisible())
+        {
+            reminderWin->hide();
+            m_reminderOpen = false;
+        }
+        if (historyWin && historyWin->isVisible())
+        {
+            historyWin->hide();
+            isHistoryOpen = false;
+        }
+    }
 }
 
 /*重载ai配置*/
@@ -899,6 +941,174 @@ void Dialog::on_pushButton_history_clicked()
     }
 }
 
+/*显示/隐藏提醒列表（交互式，无需聊天命令）*/
+void Dialog::on_pushButton_reminder_clicked()
+{
+    // 重置静默计时器（查看提醒也是交互）
+    if (m_continuousMode)
+        m_continuousSilenceTimer->start();
+
+    if (!reminderWin)
+    {
+        reminderWin = new reminder(this);
+        connect(reminderWin, &reminder::deleteReminder, this,
+                &Dialog::deleteReminder);
+        connect(reminderWin, &reminder::clearAllReminders, this,
+                &Dialog::clearAllReminders);
+    }
+
+    //提醒列表宽度跟随对话框，保持上下窗口对齐。
+    reminderWin->resize(width(), reminderWin->height());
+    reminderWin->move(this->x(), this->y() - reminderWin->height());
+
+    if (!m_reminderOpen)
+    {
+        reminderWin->show();
+        reminderWin->raise();
+        m_reminderOpen = true;
+        // 必须在 show() 之后刷新：refreshReminderWindow 有 isVisible 守卫，
+        // 提前调用会被跳过导致列表空白。
+        refreshReminderWindow();
+
+        QGraphicsOpacityEffect *opacityEffect =
+            qobject_cast<QGraphicsOpacityEffect *>(reminderWin->graphicsEffect());
+        if (!opacityEffect)
+        {
+            opacityEffect = new QGraphicsOpacityEffect(reminderWin);
+            reminderWin->setGraphicsEffect(opacityEffect);
+        }
+
+        QRect startRect = reminderWin->geometry();
+        QRect endRect = startRect;
+        startRect.moveTop(startRect.top() + 20);
+        reminderWin->setGeometry(startRect);
+        opacityEffect->setOpacity(0.0);
+
+        QPropertyAnimation *opacityAnim =
+            new QPropertyAnimation(opacityEffect, "opacity");
+        opacityAnim->setDuration(150);
+        opacityAnim->setStartValue(0.0);
+        opacityAnim->setEndValue(1.0);
+
+        QPropertyAnimation *moveAnim =
+            new QPropertyAnimation(reminderWin, "geometry");
+        moveAnim->setDuration(150);
+        moveAnim->setStartValue(startRect);
+        moveAnim->setEndValue(endRect);
+
+        QParallelAnimationGroup *group =
+            new QParallelAnimationGroup(reminderWin);
+        group->addAnimation(opacityAnim);
+        group->addAnimation(moveAnim);
+        group->start(QAbstractAnimation::DeleteWhenStopped);
+    }
+    else
+    {
+        m_reminderOpen = false;
+
+        QRect startRect = reminderWin->geometry();
+        QRect endRect = startRect;
+        endRect.moveTop(endRect.top() + 20);
+
+        QGraphicsOpacityEffect *opacityEffect =
+            qobject_cast<QGraphicsOpacityEffect *>(reminderWin->graphicsEffect());
+        if (!opacityEffect)
+        {
+            opacityEffect = new QGraphicsOpacityEffect(reminderWin);
+            reminderWin->setGraphicsEffect(opacityEffect);
+        }
+
+        QPropertyAnimation *opacityAnim =
+            new QPropertyAnimation(opacityEffect, "opacity");
+        opacityAnim->setDuration(150);
+        opacityAnim->setStartValue(1.0);
+        opacityAnim->setEndValue(0.0);
+
+        QPropertyAnimation *moveAnim =
+            new QPropertyAnimation(reminderWin, "geometry");
+        moveAnim->setDuration(150);
+        moveAnim->setStartValue(startRect);
+        moveAnim->setEndValue(endRect);
+
+        QParallelAnimationGroup *group =
+            new QParallelAnimationGroup(reminderWin);
+        group->addAnimation(opacityAnim);
+        group->addAnimation(moveAnim);
+        connect(group, &QParallelAnimationGroup::finished, reminderWin,
+                &QWidget::hide);
+        group->start(QAbstractAnimation::DeleteWhenStopped);
+    }
+}
+
+/*刷新提醒列表内容（仅窗口可见时重建，避免每秒轮询无谓开销）*/
+void Dialog::refreshReminderWindow()
+{
+    if (!reminderWin || !reminderWin->isVisible())
+        return;
+    reminderWin->clearReminders();
+    for (const Schedule &s : m_schedules)
+    {
+        if (s.triggered)
+            continue;
+        QString whenText = s.time.toString("M月d日 HH:mm");
+        bool repeating = false;
+        if (s.repeatSec >= 7 * 24 * 3600)
+        {
+            whenText = QStringLiteral("每周 %1").arg(s.time.toString("HH:mm"));
+            repeating = true;
+        }
+        else if (s.repeatSec >= 24 * 3600)
+        {
+            whenText = QStringLiteral("每天 %1").arg(s.time.toString("HH:mm"));
+            repeating = true;
+        }
+        reminderWin->addReminder(s.id, whenText, s.text, repeating);
+    }
+}
+
+/*删除一条提醒（按 id）*/
+void Dialog::deleteReminder(const QString &id)
+{
+    bool changed = false;
+    for (auto it = m_schedules.begin(); it != m_schedules.end(); ++it)
+    {
+        if (it->id == id)
+        {
+            m_schedules.erase(it);
+            changed = true;
+            break;
+        }
+    }
+    if (changed)
+    {
+        saveSchedules();
+        refreshReminderWindow();
+    }
+}
+
+/*清空全部待触发提醒*/
+void Dialog::clearAllReminders()
+{
+    bool changed = false;
+    for (auto it = m_schedules.begin(); it != m_schedules.end();)
+    {
+        if (!it->triggered)
+        {
+            it = m_schedules.erase(it);
+            changed = true;
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    if (changed)
+    {
+        saveSchedules();
+        refreshReminderWindow();
+    }
+}
+
 /*回退历史*/
 void Dialog::rewindToHistoryIndex(int historyIndex)
 {
@@ -968,6 +1178,11 @@ void Dialog::moveEvent(QMoveEvent *event)
     {
         QPoint offset = event->pos() - lastPos;
         historyWin->move(historyWin->pos() + offset);
+    }
+    if (reminderWin && reminderWin->isVisible())
+    {
+        QPoint offset = event->pos() - lastPos;
+        reminderWin->move(reminderWin->pos() + offset);
     }
     lastPos = event->pos();
     QWidget::moveEvent(event);
@@ -1291,6 +1506,104 @@ bool Dialog::submitCurrentInput()
     // 连续对话模式：每次有效发言都重置2分钟静默计时器
     if (m_continuousMode)
         m_continuousSilenceTimer->start();
+
+    // 日程提醒意图拦截
+    {
+        const QString lowerInput = userInput.toLower();
+
+        // 管理命令：查看提醒
+        const bool wantList =
+            lowerInput.contains(QStringLiteral("查看提醒")) ||
+            lowerInput.contains(QStringLiteral("列出提醒")) ||
+            lowerInput.contains(QStringLiteral("有哪些提醒")) ||
+            lowerInput.contains(QStringLiteral("有什么提醒")) ||
+            lowerInput.contains(QStringLiteral("查看日程")) ||
+            lowerInput.contains(QStringLiteral("我的提醒")) ||
+            lowerInput.contains(QStringLiteral("我的日程"));
+        if (wantList) {
+            QStringList pending;
+            int idx = 1;
+            for (const Schedule &s : m_schedules) {
+                if (s.triggered)
+                    continue;
+                pending << QStringLiteral("%1. %2（%3）")
+                               .arg(QString::number(idx++), s.text,
+                                    s.time.toString("M月d日 HH:mm"));
+            }
+            const QString msg = pending.isEmpty()
+                ? QStringLiteral("当前没有待触发的提醒")
+                : QStringLiteral("你有 %1 条提醒：\n%2")
+                      .arg(pending.size()).arg(pending.join(QStringLiteral("\n")));
+            m_lastUserInput = userInput;
+            ui->textEdit->setText(msg);
+            ui->textEdit->setEnabled(true);
+            ui->label_name->setText(QStringLiteral("她"));
+            ui->pushButton_next->show();
+            return true;
+        }
+
+        // 管理命令：取消提醒（含"所有/全部"则全部取消，否则取消最近一条）
+        const bool wantCancel =
+            lowerInput.contains(QStringLiteral("取消提醒")) ||
+            lowerInput.contains(QStringLiteral("删除提醒")) ||
+            lowerInput.contains(QStringLiteral("取消日程")) ||
+            lowerInput.contains(QStringLiteral("删除日程")) ||
+            (lowerInput.contains(QStringLiteral("取消")) &&
+             lowerInput.contains(QStringLiteral("提醒")));
+        if (wantCancel) {
+            const bool all = lowerInput.contains(QStringLiteral("所有")) ||
+                             lowerInput.contains(QStringLiteral("全部"));
+            int removed = 0;
+            QStringList removedTexts;
+            for (auto it = m_schedules.begin(); it != m_schedules.end();) {
+                if (it->triggered) { ++it; continue; }
+                removedTexts << it->text;
+                it = m_schedules.erase(it);
+                ++removed;
+                if (!all)
+                    break;
+            }
+            const QString msg =
+                removed > 0
+                    ? (all ? QStringLiteral("已取消全部 %1 条提醒").arg(removed)
+                           : QStringLiteral("已取消提醒「%1」")
+                                 .arg(removedTexts.first()))
+                    : QStringLiteral("当前没有可取消的提醒");
+            if (removed > 0)
+            {
+                saveSchedules();
+                refreshReminderWindow();
+            }
+            m_lastUserInput = userInput;
+            ui->textEdit->setText(msg);
+            ui->textEdit->setEnabled(true);
+            ui->label_name->setText(QStringLiteral("她"));
+            ui->pushButton_next->show();
+            showTemporaryMessage(msg);
+            return true;
+        }
+
+        Schedule parsed;
+        if (tryParseSchedule(userInput, parsed)) {
+            m_schedules.append(parsed);
+            saveSchedules();
+            refreshReminderWindow();
+            QString whenText = parsed.time.toString("M月d日 HH:mm");
+            if (parsed.repeatSec >= 7 * 24 * 3600)
+                whenText = QStringLiteral("每周 %1").arg(parsed.time.toString("HH:mm"));
+            else if (parsed.repeatSec >= 24 * 3600)
+                whenText = QStringLiteral("每天 %1").arg(parsed.time.toString("HH:mm"));
+            const QString confirmMsg = QStringLiteral("已设置提醒：%1 提醒「%2」")
+                                           .arg(whenText, parsed.text);
+            ui->textEdit->setText(confirmMsg);
+            ui->textEdit->setEnabled(true);
+            ui->label_name->setText(QStringLiteral("她"));
+            ui->pushButton_next->show();
+            // 确认字样 2.5 秒后自动清除，无需手动清空输入框
+            showTemporaryMessage(confirmMsg);
+            return true;
+        }
+    }
 
     // 屏幕捕获关键词检测
     if (m_screenCaptureEnabled)
@@ -3120,12 +3433,17 @@ static QString buildProactivePrompt(const QString &windowTitle,
                                     const QString &contextHint,
                                     const QString &characterPrompt,
                                     const QString &memoryContext,
-                                    const QString &location)
+                                    const QString &location,
+                                    bool isReminder = false)
 {
     QString prompt;
     prompt += QStringLiteral("[当前时间] %1\n")
                   .arg(QDateTime::currentDateTime().toString("MM-dd hh:mm"));
-    prompt += QStringLiteral("[触发原因] %1\n").arg(contextHint);
+    // 日程提醒：触发原因明确标注为提醒，避免与主动闲聊混同
+    if (isReminder)
+        prompt += QStringLiteral("[日程提醒] %1\n").arg(contextHint);
+    else
+        prompt += QStringLiteral("[触发原因] %1\n").arg(contextHint);
     if (!windowTitle.isEmpty())
         prompt += QStringLiteral("[前台窗口] %1\n").arg(windowTitle);
     if (!location.isEmpty())
@@ -3138,7 +3456,16 @@ static QString buildProactivePrompt(const QString &windowTitle,
         prompt += memoryContext + QStringLiteral("\n");
 
     prompt += QStringLiteral(
-        "请主动发起一句简短自然的对话（20 字以内）。\n\n"
+        "请主动发起一句简短自然的对话（20 字以内）。\n\n");
+    if (isReminder)
+    {
+        // 日程提醒必须围绕提醒内容，禁止跑题闲聊
+        prompt += QStringLiteral(
+            "注意：这是用户设置的日程提醒，请务必围绕提醒内容【%1】提醒用户，"
+            "语气自然、可以温柔催促，但不要偏离主题闲聊。\n\n")
+            .arg(contextHint);
+    }
+    prompt += QStringLiteral(
         "输出格式（严格用\"|\"分隔，不可调换顺序）：\n"
         "心情|中文|日语|内心独白\n\n"
         "要求：\n"
@@ -3211,6 +3538,305 @@ void Dialog::initClipboardMonitor()
                                   .arg(sample);
         doSubmitCurrentInput(input);
     });
+}
+
+/*加载日程列表*/
+void Dialog::loadSchedules()
+{
+    m_schedules.clear();
+    QFile file(SchedulesPath);
+    if (!file.open(QIODevice::ReadOnly))
+        return;
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+    file.close();
+    const QJsonArray arr = doc.object().value("schedules").toArray();
+    for (const QJsonValue &v : arr) {
+        const QJsonObject o = v.toObject();
+        Schedule s;
+        s.id = o.value("id").toString();
+        s.time = QDateTime::fromString(o.value("time").toString(), Qt::ISODate);
+        s.text = o.value("text").toString();
+        s.repeatSec = o.value("repeat").toInt();
+        s.triggered = o.value("triggered").toBool();
+        if (s.time.isValid())
+            m_schedules.append(s);
+    }
+}
+
+/*保存日程列表*/
+void Dialog::saveSchedules() const
+{
+    QJsonArray arr;
+    for (const Schedule &s : m_schedules) {
+        QJsonObject o;
+        o["id"] = s.id;
+        o["time"] = s.time.toString(Qt::ISODate);
+        o["text"] = s.text;
+        o["repeat"] = s.repeatSec;
+        o["triggered"] = s.triggered;
+        arr.append(o);
+    }
+    QJsonObject root;
+    root["schedules"] = arr;
+    QFile file(SchedulesPath);
+    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+}
+
+/*中文数字转阿拉伯数字：一→1 十二→12 二十三→23 十→10*/
+static int chineseToInt(const QString &s)
+{
+    static const QHash<QString, int> digits = {
+        {QStringLiteral("零"), 0}, {QStringLiteral("一"), 1},
+        {QStringLiteral("二"), 2}, {QStringLiteral("两"), 2},
+        {QStringLiteral("三"), 3}, {QStringLiteral("四"), 4},
+        {QStringLiteral("五"), 5}, {QStringLiteral("六"), 6},
+        {QStringLiteral("七"), 7}, {QStringLiteral("八"), 8},
+        {QStringLiteral("九"), 9}};
+
+    if (digits.contains(s))
+        return digits.value(s);
+    if (s.contains(QStringLiteral("十"))) {
+        const QStringList parts = s.split(QStringLiteral("十"));
+        const int tens = parts[0].isEmpty() ? 1 : digits.value(parts[0], 1);
+        const int ones = (parts.size() > 1 && !parts[1].isEmpty())
+                             ? digits.value(parts[1], 0)
+                             : 0;
+        return tens * 10 + ones;
+    }
+    return -1;
+}
+
+/*解析数字文本：阿拉伯或中文都支持*/
+static int parseNumText(const QString &s)
+{
+    bool ok = false;
+    const int n = s.toInt(&ok);
+    if (ok)
+        return n;
+    return chineseToInt(s);
+}
+
+/*规则解析日程意图：提醒我 X时间 做 Y
+  支持：相对时间（N分钟后）、绝对时间（今天/明天/后天/大后天 + 时段 + N点N分）、
+  循环（每天/每周[一二三四五六日天]），内容自动剔除时间表达式*/
+bool Dialog::tryParseSchedule(const QString &input, Schedule &out) const
+{
+    const QString lower = input.toLower();
+    if (!lower.contains(QStringLiteral("提醒")) && !lower.contains(QStringLiteral("记得")))
+        return false;
+
+    QDateTime target;
+    QString text;
+    int repeatSec = 0;
+
+    // 循环周期：每天 → 24h；每周[一二三四五六日天] → 168h + 目标星期
+    const bool daily = lower.contains(QStringLiteral("每天"));
+    const bool weekly = lower.contains(QStringLiteral("每周"));
+    if (daily)
+        repeatSec = 24 * 3600;
+    else if (weekly)
+        repeatSec = 7 * 24 * 3600;
+    int targetDow = 0; // 每周X 的目标星期（Qt：周一=1..周日=7）
+    if (weekly) {
+        static const QHash<QString, int> weekdays = {
+            {QStringLiteral("一"), 1}, {QStringLiteral("二"), 2},
+            {QStringLiteral("三"), 3}, {QStringLiteral("四"), 4},
+            {QStringLiteral("五"), 5}, {QStringLiteral("六"), 6},
+            {QStringLiteral("日"), 7}, {QStringLiteral("天"), 7}};
+        const QRegularExpression weekdayRe(QStringLiteral("每周([一二三四五六日天])"));
+        const QRegularExpressionMatch wm = weekdayRe.match(lower);
+        if (wm.hasMatch())
+            targetDow = weekdays.value(wm.captured(1), 0);
+    }
+
+    QString timeExpr; // 命中的时间表达式（用于从内容中剔除）
+
+    // 相对时间：N分钟后（支持中文数字）
+    const QRegularExpression relRe(
+        QStringLiteral("((?:[0-9]+|[一二三四五六七八九十两]+))\\s*分钟后"));
+    const QRegularExpressionMatch relMatch = relRe.match(lower);
+    if (relMatch.hasMatch()) {
+        const int minutes = parseNumText(relMatch.captured(1));
+        if (minutes <= 0)
+            return false;
+        target = QDateTime::currentDateTime().addSecs(minutes * 60);
+        timeExpr = relMatch.captured(0);
+        repeatSec = 0; // 相对时间不循环
+    }
+    // 绝对时间：今天/明天/后天/大后天 + 时段 + N点N分
+    else {
+        const QRegularExpression timeRe(
+            QStringLiteral("(今天|明天|后天|大后天|早上|上午|中午|下午|晚上|凌晨)?"
+                           "\\s*((?:[0-9]{1,2}|[一二三四五六七八九十两]{1,3}))"
+                           "\\s*(?:点|时)(?:\\s*((?:[0-9]{1,2}|[一二三四五六七八九十两]{1,3}))分?)?"));
+        const QRegularExpressionMatch m = timeRe.match(lower);
+        if (!m.hasMatch())
+            return false;
+
+        int dayOffset = 0;
+        const QString dayWord = m.captured(1);
+        if (dayWord == QStringLiteral("明天")) dayOffset = 1;
+        else if (dayWord == QStringLiteral("后天")) dayOffset = 2;
+        else if (dayWord == QStringLiteral("大后天")) dayOffset = 3;
+
+        int hour = parseNumText(m.captured(2));
+        const int minute = m.captured(3).isEmpty() ? 0 : parseNumText(m.captured(3));
+        // 下午/晚上 且 小时 < 12 → +12（24小时制；凌晨/早上/上午/中午不调整）
+        if ((dayWord == QStringLiteral("下午") ||
+             dayWord == QStringLiteral("晚上")) && hour < 12)
+            hour += 12;
+
+        QDate d = QDate::currentDate().addDays(dayOffset);
+        if (targetDow > 0) {
+            // 找下一个目标星期
+            const int daysAhead = (targetDow - d.dayOfWeek() + 7) % 7;
+            d = d.addDays(daysAhead);
+        }
+        target = QDateTime(d, QTime(hour, minute));
+        if (target <= QDateTime::currentDateTime()) {
+            if (targetDow > 0)
+                target = target.addDays(7);        // 本周已过 → 下周
+            else if (repeatSec > 0)
+                target = target.addDays(1);        // 每天 → 明天同一时刻
+            else if (dayOffset == 0)
+                target = target.addDays(1);        // 一次性且今天已过 → 明天
+        }
+        timeExpr = m.captured(0);
+    }
+
+    if (!target.isValid())
+        return false;
+
+    // 提取提醒内容：找"提醒我/提醒/记得"之后的内容，剔除时间表达式与标点
+    QString rest = input;
+    for (const QString &kw : {QStringLiteral("提醒我"), QStringLiteral("提醒"),
+                              QStringLiteral("记得叫我"), QStringLiteral("记得")}) {
+        const int idx = input.indexOf(kw);
+        if (idx >= 0) {
+            rest = input.mid(idx + kw.size());
+            break;
+        }
+    }
+    if (!timeExpr.isEmpty())
+        rest.remove(timeExpr);
+    while (!rest.isEmpty() && (rest[0].isSpace() || rest[0] == QChar('，') ||
+           rest[0] == QChar('。') || rest[0] == QChar('、') || rest[0] == QChar('！') ||
+           rest[0] == QChar('？')))
+        rest.remove(0, 1);
+    text = rest.section(QStringLiteral("，"), 0, 0)
+               .section(QStringLiteral("。"), 0, 0)
+               .trimmed();
+    if (text.isEmpty())
+        text = QStringLiteral("有件事要提醒你");
+
+    out.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    out.time = target;
+    out.text = text;
+    out.repeatSec = repeatSec;
+    out.triggered = false;
+    return true;
+}
+
+/*每秒轮询：到点触发 + 循环日程推后*/
+void Dialog::checkSchedules()
+{
+    const QDateTime now = QDateTime::currentDateTime();
+    bool changed = false;
+
+    for (auto it = m_schedules.begin(); it != m_schedules.end();) {
+        Schedule &s = *it;
+        if (s.triggered) { ++it; continue; }
+
+        if (now >= s.time) {
+            // 一次性：触发成功后删除；应用忙则保留，下轮重试
+            if (s.repeatSec <= 0) {
+                if (fireSchedule(s, false)) {
+                    it = m_schedules.erase(it);
+                    changed = true;
+                } else {
+                    ++it;
+                }
+                continue;
+            }
+            // 循环：触发后推到下一周期（忙则跳过本轮，下轮再推）
+            if (fireSchedule(s, false)) {
+                while (s.time <= now)
+                    s.time = s.time.addSecs(s.repeatSec);
+                changed = true;
+            }
+        }
+        ++it;
+    }
+
+    if (changed)
+    {
+        saveSchedules();
+        refreshReminderWindow();
+    }
+}
+
+/*触发提醒：走主动对话链路说话，返回是否真正发声（应用忙则false）*/
+bool Dialog::fireSchedule(const Schedule &s, bool missed)
+{
+    const QString phrase = missed
+        ? QStringLiteral("你不在的时候，有件事忘了告诉你：%1")
+        : QStringLiteral("该%1了哦！")
+              .arg(s.text);
+    return doProactiveSpeak(QString(), phrase, /*forced=*/true,
+                            /*isReminder=*/true);
+}
+
+/*启动时补触发遗漏日程（合并播报）*/
+void Dialog::catchUpMissedSchedules()
+{
+    const QDateTime now = QDateTime::currentDateTime();
+    QStringList missed;
+    bool changed = false;
+
+    for (auto it = m_schedules.begin(); it != m_schedules.end();) {
+        Schedule &s = *it;
+        if (s.triggered) { ++it; continue; }
+
+        // 一次性且已过期
+        if (s.repeatSec <= 0 && s.time < now) {
+            const qint64 secsMissed = s.time.secsTo(now);
+            if (secsMissed > 24 * 3600) {
+                // 超过24小时直接丢弃
+                it = m_schedules.erase(it);
+                changed = true;
+                continue;
+            }
+            missed.append(s.text);
+            it = m_schedules.erase(it);
+            changed = true;
+            continue;
+        }
+
+        // 循环且已过期：推到下一周期，不报遗漏
+        if (s.repeatSec > 0 && s.time < now) {
+            while (s.time <= now)
+                s.time = s.time.addSecs(s.repeatSec);
+            changed = true;
+        }
+        ++it;
+    }
+
+    if (!missed.isEmpty()) {
+        QStringList shown = missed.mid(0, 3);
+        QString msg = QStringLiteral("你不在的时候，我帮你记着：%1")
+                          .arg(shown.join(QStringLiteral("、")));
+        if (missed.size() > 3)
+            msg += QStringLiteral("，还有 %1 件。").arg(missed.size() - 3);
+        doProactiveSpeak(QString(), msg, /*forced=*/false,
+                         /*isReminder=*/true);
+    }
+
+    if (changed)
+    {
+        saveSchedules();
+        refreshReminderWindow();
+    }
 }
 
 /*连接 AI 回调（每轮对话绑定 generation 防止旧回复）*/
@@ -3297,11 +3923,12 @@ void Dialog::connectChatCallbacks(AiProvider *provider, quint64 generation)
             });
 }
 
-/*执行主动对话*/
+/*执行主动对话（forced=true 用于日程提醒：跳过开关与冷却检查；isReminder 让提醒内容强制传达）*/
 bool Dialog::doProactiveSpeak(const QString &windowTitle,
-                              const QString &contextHint)
+                              const QString &contextHint, bool forced,
+                              bool isReminder)
 {
-    if (!m_proactiveEnabled)
+    if (!forced && !m_proactiveEnabled)
         return false;
     if (m_proactiveInFlight)
         return false;
@@ -3309,7 +3936,7 @@ bool Dialog::doProactiveSpeak(const QString &windowTitle,
         m_activeChatAi || !isAllVitsDone())
         return false;
 
-    if (m_lastProactiveSpeakTime.isValid())
+    if (!forced && m_lastProactiveSpeakTime.isValid())
     {
         const int secs =
             static_cast<int>(m_lastProactiveSpeakTime.secsTo(
@@ -3318,9 +3945,11 @@ bool Dialog::doProactiveSpeak(const QString &windowTitle,
             return false;
     }
 
-    // 在请求发出时立即进入 in-flight 和冷却，避免窗口/回来/空闲触发源重入。
+    // 在请求发出时立即进入 in-flight，避免窗口/回来/空闲触发源重入。
     m_proactiveInFlight = true;
-    m_lastProactiveSpeakTime = QDateTime::currentDateTime();
+    // 日程提醒（forced）不刷新冷却计时，避免污染主动对话的冷却周期。
+    if (!forced)
+        m_lastProactiveSpeakTime = QDateTime::currentDateTime();
     m_vitsFinishScheduled = false;
     qDebug() << "[Proactive] 触发:" << contextHint
              << "| 窗口:"
@@ -3347,7 +3976,8 @@ bool Dialog::doProactiveSpeak(const QString &windowTitle,
         !manualLoc.isEmpty() ? manualLoc : m_cachedLocation;
 
     const QString prompt = buildProactivePrompt(
-        windowTitle, contextHint, characterPrompt, memoryContext, location);
+        windowTitle, contextHint, characterPrompt, memoryContext, location,
+        isReminder);
 
     // 创建独立 AiProvider 用于主动对话（与普通聊天完全隔离）
     AiProvider *proactiveAi = new AiProvider(this);

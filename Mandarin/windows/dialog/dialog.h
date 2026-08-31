@@ -29,6 +29,7 @@ class Dialog;
 }
 
 class history;
+class reminder;
 
 class Dialog : public QWidget
 {
@@ -53,12 +54,16 @@ class Dialog : public QWidget
   private slots:
     void on_pushButton_next_clicked();
     void on_pushButton_history_clicked();
+    void on_pushButton_reminder_clicked();
     void on_pushButton_screenCapture_clicked();
     void on_pushButton_input_pressed();
     void on_pushButton_input_released();
     void on_checkBox_autoInput_toggled(bool checked);
     void rewindToHistoryIndex(int historyIndex);
     void deleteHistoryItem(int historyIndex);
+    void deleteReminder(const QString &id);
+    void clearAllReminders();
+    void refreshReminderWindow();
 
   signals:
     void requestSetCharTachie(QString TachieName);
@@ -76,6 +81,7 @@ class Dialog : public QWidget
     virtual void paintEvent(QPaintEvent *event) override;
     Ui::Dialog *ui = nullptr;
     history *historyWin = nullptr;
+    reminder *reminderWin = nullptr;
     /*按键事件*/
     //鼠标
     void keyPressEvent(QKeyEvent *event) override;
@@ -103,6 +109,7 @@ class Dialog : public QWidget
     void saveContextHistory() const;
     void stopPendingConversationState();
     bool isHistoryOpen = false;
+    bool m_reminderOpen = false;
     QStringList m_contextHistory;
     QString m_lastHistoryDate;
     bool m_contextCompressionInFlight = false;
@@ -239,9 +246,25 @@ class Dialog : public QWidget
     void initProactiveAgent();
     void initClipboardMonitor();
     bool m_clipboardCooldown = false;
+    // 日程提醒
+    struct Schedule {
+        QString id;
+        QDateTime time;   // 触发时间
+        QString text;     // 提醒内容
+        int repeatSec = 0; // 0=一次性，>0=循环周期（秒）
+        bool triggered = false;
+    };
+    QList<Schedule> m_schedules;
+    void loadSchedules();
+    void saveSchedules() const;
+    bool tryParseSchedule(const QString &input, Schedule &out) const; // 规则解析
+    void checkSchedules();                                            // 每秒轮询
+    bool fireSchedule(const Schedule &s, bool missed);                // 触发提醒（返回是否发声）
+    void catchUpMissedSchedules();                                    // 启动补触发
     void checkProactiveWindow();
     void checkProactiveUserPresence();
-    bool doProactiveSpeak(const QString &windowTitle, const QString &contextHint);
+    bool doProactiveSpeak(const QString &windowTitle, const QString &contextHint,
+                          bool forced = false, bool isReminder = false);
 
     // 联网搜索
     SearchProvider *m_searchProvider = nullptr;

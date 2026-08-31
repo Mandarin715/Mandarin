@@ -29,6 +29,11 @@ inline const QString AnimePluginPath =
     QDir(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation))
         .filePath("Mandarin/Plugin/Anime");
 
+//日程提醒存储位置
+inline const QString SchedulesPath =
+    QDir(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation))
+        .filePath("Mandarin/schedules.json");
+
 //读取当前选中的角色
 inline QString ReadNowSelectChar()
 {

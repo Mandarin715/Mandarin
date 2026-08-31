@@ -129,6 +129,8 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
         windows/dialog/dialog.h windows/dialog/dialog.cpp windows/dialog/dialog.ui
         windows/dialog/history/history.h windows/dialog/history/history.cpp windows/dialog/history/history.ui
         windows/dialog/history/historychild.h windows/dialog/history/historychild.cpp windows/dialog/history/historychild.ui
+        windows/dialog/reminder/reminder.h windows/dialog/reminder/reminder.cpp windows/dialog/reminder/reminder.ui
+        windows/dialog/reminder/reminderchild.h windows/dialog/reminder/reminderchild.cpp windows/dialog/reminder/reminderchild.ui
         GlobalConstants.h
         res.qrc
         utils/CustomScrollBinder.h utils/CustomScrollBinder.cpp

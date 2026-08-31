@@ -235,9 +235,38 @@ QScrollBar:vertical:disabled {
     </widget>
    </item>
    <item row="2" column="1">
-    <widget class="QPushButton" name="pushButton_history">
-     <property name="styleSheet">
-      <string notr="true">QPushButton {
+    <layout class="QHBoxLayout" name="horizontalLayout_2">
+     <item>
+      <widget class="QPushButton" name="pushButton_reminder">
+       <property name="toolTip">
+        <string>查看提醒</string>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">QPushButton {
+    background-color: transparent;
+    border: none;
+    border-radius: 5px;
+    padding: 4px 8px;
+}
+
+QPushButton:hover {
+    border: 2px solid #CCCCCC;
+}
+
+QPushButton:pressed {
+    border: 2px solid #AAAAAA;
+}
+</string>
+       </property>
+       <property name="text">
+        <string>提醒</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="pushButton_history">
+       <property name="styleSheet">
+        <string notr="true">QPushButton {
     background-color: transparent;  /* 无背景 */
     border: none;                   /* 无边框 */
     border-radius: 5px;            /* 圆角 */
@@ -253,15 +282,17 @@ QPushButton:pressed {
     border: 2px solid #AAAAAA;      /* 按下时边框加深 */
 }
 </string>
-     </property>
-     <property name="text">
-      <string/>
-     </property>
-     <property name="icon">
-      <iconset resource="../../res.qrc">
-       <normaloff>:/res/img/ico/log-24.svg</normaloff>:/res/img/ico/log-24.svg</iconset>
-     </property>
-    </widget>
+       </property>
+       <property name="text">
+        <string/>
+       </property>
+       <property name="icon">
+        <iconset resource="../../res.qrc">
+         <normaloff>:/res/img/ico/log-24.svg</normaloff>:/res/img/ico/log-24.svg</iconset>
+       </property>
+      </widget>
+     </item>
+    </layout>
    </item>
    <item row="2" column="0">
     <layout class="QHBoxLayout" name="horizontalLayout">
