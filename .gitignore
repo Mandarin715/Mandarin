@@ -93,3 +93,6 @@ _temp_bak/
 # Office temp files
 ~$*.docx
 *.docx
+
+# 敏感文件（勿提交）
+github-recovery-codes.txt
