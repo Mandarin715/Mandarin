@@ -89,7 +89,7 @@ Documents/Mandarin/
 - **启动桌宠**: 运行 `build2/Release/启动.bat`（自动 cd 到正确目录 → 查找 vits-simple-api 并后台拉起语音服务 → 启动 `Mandarin.exe`；找不到语音服务则纯文本模式）。**不要直接运行 exe、不要从其他目录启动**
 - **跨平台**: 同时支持 macOS（Bundle）和 Linux（X11）
 - **CI**: GitHub Actions，Inno Setup 打包
-- **当前版本**: v1.11.0（CMakeLists/Version.h 为准；`build2/Release/Mandarin-v1.11.0-portable.zip` 为最新打包产物）
+- **当前版本**: v1.12.0（CMakeLists/Version.h 为准；`build2/Release/Mandarin-v1.12.0-portable.zip` 为最新打包产物）
 
 ## 代码风格
 
