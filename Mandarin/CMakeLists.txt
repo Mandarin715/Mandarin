@@ -32,7 +32,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 #find_package(Qt6 COMPONENTS Network REQUIRED)
 #find_package(Qt6 COMPONENTS Multimedia REQUIRED)
 #这样更稳妥一点,同时支持qt5和qt6
-find_package(Qt6 REQUIRED COMPONENTS Widgets Network Multimedia Svg)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Network Multimedia Svg Test)
 set(QT_VERSION_MAJOR 6)
 
 if(APPLE)
@@ -141,6 +141,7 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
         utils/DragHelper.h utils/DragHelper.cpp
         utils/WakeWordDetector.h utils/WakeWordDetector.cpp
         utils/OfflineSpeechRecognizer.h utils/OfflineSpeechRecognizer.cpp
+        utils/ChatLogStore.h utils/ChatLogStore.cpp
         windows/setting/child/settingchild_llm.h windows/setting/child/settingchild_llm.cpp windows/setting/child/settingchild_llm.ui
         windows/setting/child/settingchild_char.h windows/setting/child/settingchild_char.cpp windows/setting/child/settingchild_char.ui
         windows/setting/child/settingchild_vits.h windows/setting/child/settingchild_vits.cpp windows/setting/child/settingchild_vits.ui
@@ -310,4 +311,22 @@ install(TARGETS Mandarin
 
 if(QT_VERSION_MAJOR EQUAL 6)
     qt_finalize_executable(Mandarin)
+endif()
+
+# ---- 单元测试（Qt Test）----
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(test_chatlogstore
+        tests/test_chatlogstore.cpp
+        utils/ChatLogStore.cpp
+    )
+    target_include_directories(test_chatlogstore PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_BINARY_DIR}
+    )
+    target_link_libraries(test_chatlogstore PRIVATE
+        Qt${QT_VERSION_MAJOR}::Test
+        Qt${QT_VERSION_MAJOR}::Core
+    )
+    add_test(NAME test_chatlogstore COMMAND test_chatlogstore)
 endif()

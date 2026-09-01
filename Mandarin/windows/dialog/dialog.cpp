@@ -1,6 +1,9 @@
 #include "dialog.h"
 #include "history/history.h"
 #include "reminder/reminder.h"
+#include "../../utils/ChatLogStore.h"
+
+#include <QRandomGenerator>
 #include "ui_dialog.h"
 
 #include "../../GlobalConstants.h"
@@ -290,7 +293,7 @@ void Dialog::ReloadGeneralConfig()
 }
 
 
-/*加载上下文历史*/
+/*加载上下文历史（chat.jsonl，含旧版 context.json 一次性迁移）*/
 void Dialog::loadContextHistory()
 {
     m_contextHistory.clear();
@@ -298,20 +301,54 @@ void Dialog::loadContextHistory()
     if (contextPath.isEmpty())
         return;
 
-    ZcJsonLib contextConfig(contextPath);
-    const QJsonArray historyArray =
-        contextConfig.value("history", QJsonValue(QJsonArray())).toArray();
-    for (const QJsonValue &value : historyArray)
+    const QString charDir = QFileInfo(contextPath).absolutePath();
+    const QString logPath = QDir(charDir).filePath(QStringLiteral("chat.jsonl"));
+
+    // 角色切换时重建 ChatLogStore（路径随角色变化）
+    if (m_chatLog)
     {
-        const QString line = value.toString();
-        if (!line.isEmpty())
+        delete m_chatLog;
+        m_chatLog = nullptr;
+    }
+    m_chatLog = new ChatLogStore(logPath, this);
+
+    // 旧版迁移：无 chat.jsonl 且有 context.json → 迁移后改名留档
+    if (!m_chatLog->exists() && QFile::exists(contextPath))
+    {
+        m_chatLog->migrateFromLegacy(contextPath, logPath);
+        QFile::rename(contextPath, contextPath + QStringLiteral(".legacy"));
+    }
+
+    // 从 chat.jsonl 重建上下文视图（日期标记按 time 合成，不落盘）
+    const QJsonArray messages = m_chatLog->loadMessages();
+    m_lastHistoryDate.clear();
+    QDate lastDate;
+    for (const QJsonValue &value : messages)
+    {
+        const QJsonObject o = value.toObject();
+        const QString role = o.value("role").toString();
+        const QString content = o.value("content").toString();
+        if (content.isEmpty())
+            continue;
+        const QDate d =
+            QDateTime::fromString(o.value("time").toString(), Qt::ISODate).date();
+        if (d.isValid() && d != lastDate)
         {
-            m_contextHistory.append(line);
-            // 记录最后一条日期标记，避免当天重复插入
-            if (line.startsWith('[') && line.endsWith(']') && line.contains(QStringLiteral("月")))
-                m_lastHistoryDate = line.mid(1, line.size() - 2);
+            lastDate = d;
+            m_contextHistory.append(QStringLiteral("[%1]").arg(d.toString("M月d日")));
+        }
+        if (role == QStringLiteral("user"))
+            m_contextHistory.append(QStringLiteral("用户：") + content);
+        else if (role == QStringLiteral("assistant"))
+        {
+            if (o.value("meta").toObject().value("summary").toBool())
+                m_contextHistory.append(QStringLiteral("角色：[对话摘要] ") + content);
+            else
+                m_contextHistory.append(QStringLiteral("角色：") + content);
         }
     }
+    if (lastDate.isValid())
+        m_lastHistoryDate = lastDate.toString("M月d日");
 }
 
 /*构建用户消息，包含上下文*/
@@ -326,7 +363,7 @@ QString Dialog::buildUserMessageWithContext(const QString &input) const
            input;
 }
 
-/*添加历史记录行*/
+/*添加历史记录行（同时立即持久化到 chat.jsonl，日期标记不入库）*/
 void Dialog::appendHistoryLine(const QString &line)
 {
     if (line.isEmpty())
@@ -339,46 +376,47 @@ void Dialog::appendHistoryLine(const QString &line)
         m_contextHistory.append(QStringLiteral("[%1]").arg(today));
     }
     m_contextHistory.append(line);
-    // 历史超过60行时异步AI压缩
+    // 立即持久化原始消息（提交即落盘，不依赖 2 秒防抖）
+    if (m_chatLog)
+    {
+        if (line.startsWith(QStringLiteral("用户：")))
+            m_chatLog->appendMessage(QStringLiteral("user"), line.mid(3));
+        else if (line.startsWith(QStringLiteral("角色：")))
+            m_chatLog->appendMessage(QStringLiteral("assistant"), line.mid(3));
+    }
+    // 历史超过60行时异步AI压缩（仅内存视图，不落盘）
     if (m_contextHistory.size() > 60)
         compressContextHistory();
 }
 
-/*保存上下文历史*/
-void Dialog::saveContextHistory() const
+/*构造一条结构化消息（id/time 自动生成）*/
+static QJsonObject makeChatMessage(const QString &role, const QString &content)
 {
-    const QString contextPath = ReadCharacterContextPath();
-    if (contextPath.isEmpty())
-        return;
-
-    const QFileInfo fileInfo(contextPath);
-    QDir().mkpath(fileInfo.absolutePath());
-
-    QJsonArray historyArray;
-    for (const QString &line : m_contextHistory)
-        historyArray.append(line);
-
-    ZcJsonLib contextConfig(contextPath);
-    contextConfig.setValue("history", QJsonValue(historyArray));
+    QJsonObject o;
+    o["id"] = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    o["role"] = role;
+    o["content"] = content;
+    const QDateTime now = QDateTime::currentDateTime();
+    o["time"] = now.toOffsetFromUtc(now.offsetFromUtc()).toString(Qt::ISODate);
+    return o;
 }
 
-void Dialog::scheduleContextSave()
+/*按内存视图重建 chat.jsonl（回退/删除后同步持久化）*/
+void Dialog::syncChatLogFromView()
 {
-    m_contextDirty = true;
-    if (!m_contextSaveTimer)
+    if (!m_chatLog)
+        return;
+    QJsonArray messages;
+    for (const QString &line : m_contextHistory)
     {
-        m_contextSaveTimer = new QTimer(this);
-        m_contextSaveTimer->setSingleShot(true);
-        m_contextSaveTimer->setInterval(2000);
-        connect(m_contextSaveTimer, &QTimer::timeout, this, [this]() {
-            if (m_contextDirty)
-            {
-                saveContextHistory();
-                m_contextDirty = false;
-            }
-        });
+        if (line.startsWith(QStringLiteral("用户：")))
+            messages.append(makeChatMessage(QStringLiteral("user"), line.mid(3)));
+        else if (line.startsWith(QStringLiteral("角色：[对话摘要] ")))
+            continue; // 压缩摘要不入库（磁盘只存原始消息）
+        else if (line.startsWith(QStringLiteral("角色：")))
+            messages.append(makeChatMessage(QStringLiteral("assistant"), line.mid(3)));
     }
-    m_contextSaveTimer->start();
+    m_chatLog->rewrite(messages);
 }
 
 /*停止当前对话的残留状态*/
@@ -1118,7 +1156,7 @@ void Dialog::rewindToHistoryIndex(int historyIndex)
     //先停掉当前会话残留，再把历史截断到目标位置
     stopPendingConversationState();
     m_contextHistory = m_contextHistory.mid(0, historyIndex + 1);
-    scheduleContextSave();
+    syncChatLogFromView();
 
     const QString selectedLine = m_contextHistory.at(historyIndex);
     if (selectedLine.startsWith(QStringLiteral("用户：")))
@@ -1154,7 +1192,7 @@ void Dialog::deleteHistoryItem(int historyIndex)
         return;
 
     m_contextHistory.removeAt(historyIndex);
-    scheduleContextSave();
+    syncChatLogFromView();
 
     // 刷新历史窗口
     if (historyWin && isHistoryOpen)
@@ -3146,7 +3184,6 @@ void Dialog::compressContextHistory()
                     m_contextHistory.erase(m_contextHistory.begin(),
                                            m_contextHistory.begin() + compressCount);
                     m_contextHistory.prepend(QStringLiteral("角色：[对话摘要] ") + summary);
-                    scheduleContextSave();
                 }
                 compressAi->deleteLater();
             });
@@ -3266,7 +3303,7 @@ void Dialog::startProactiveTimer()
         if (m_proactiveHandledHwnd != 0 && m_lastProactiveSpeakTime.isValid()) {
             const int secs = static_cast<int>(
                 m_lastProactiveSpeakTime.secsTo(QDateTime::currentDateTime()));
-            if (secs >= m_proactiveCooldownSec) {
+            if (secs >= m_currentCooldownSec) {
                 m_proactiveHandledHwnd = 0;
                 // 冷却刚到期且在某个窗口上，不必等下一个 10 秒驻留
                 if (m_proactivePendingHwnd != 0)
@@ -3295,6 +3332,7 @@ void Dialog::initProactiveAgent()
     m_proactiveEnabled = settings.value("general/ProactiveEnable", false).toBool();
     m_proactiveCooldownSec =
         settings.value("general/ProactiveCooldownMinutes", 10).toInt() * 60;
+    m_currentCooldownSec = m_proactiveCooldownSec;
     m_proactiveDwellSec =
         qMax(5, settings.value("general/ProactiveDwellSeconds", 10).toInt());
 
@@ -3391,7 +3429,7 @@ void Dialog::checkProactiveUserPresence()
                 ? static_cast<int>(m_lastProactiveSpeakTime.secsTo(
                       QDateTime::currentDateTime()))
                 : INT_MAX;
-        if (secsSinceLastSpeak >= m_proactiveCooldownSec)
+        if (secsSinceLastSpeak >= m_currentCooldownSec)
         {
             doProactiveSpeak(QString(), QStringLiteral("用户回来"));
         }
@@ -3405,23 +3443,26 @@ void Dialog::checkProactiveUserPresence()
         return;
     }
 
-    // 空闲 10 分钟轻度问候
-    static bool idle10mFired = false;
-    if (!m_userAway && idleMs > 10 * 60 * 1000 && !idle10mFired)
+    // 空闲轻度问候（阈值随机 10~20 分钟，避免固定节律的机器感）
+    static bool idleGreetFired = false;
+    if (!m_userAway && idleMs > m_idleGreetThresholdMs && !idleGreetFired)
     {
-        idle10mFired = true;
+        idleGreetFired = true;
         const int secsSinceLastSpeak =
             m_lastProactiveSpeakTime.isValid()
                 ? static_cast<int>(m_lastProactiveSpeakTime.secsTo(
                       QDateTime::currentDateTime()))
                 : INT_MAX;
-        if (secsSinceLastSpeak >= m_proactiveCooldownSec)
+        if (secsSinceLastSpeak >= m_currentCooldownSec)
         {
             doProactiveSpeak(QString(), QStringLiteral("空闲问候"));
         }
+        // 下次空闲问候阈值随机化（10~20 分钟）
+        m_idleGreetThresholdMs =
+            (10 + QRandomGenerator::global()->bounded(11)) * 60 * 1000;
     }
     if (idleMs < 60 * 1000)
-        idle10mFired = false;
+        idleGreetFired = false;
 
 #else
     Q_UNUSED(this);
@@ -3432,13 +3473,25 @@ void Dialog::checkProactiveUserPresence()
 static QString buildProactivePrompt(const QString &windowTitle,
                                     const QString &contextHint,
                                     const QString &characterPrompt,
-                                    const QString &memoryContext,
                                     const QString &location,
-                                    bool isReminder = false)
+                                    bool isReminder = false,
+                                    const QStringList &recentLines = QStringList())
 {
     QString prompt;
     prompt += QStringLiteral("[当前时间] %1\n")
                   .arg(QDateTime::currentDateTime().toString("MM-dd hh:mm"));
+    // 时段感知（清晨/上午/中午/下午/晚上/深夜）
+    const int hour = QTime::currentTime().hour();
+    QString timeWord;
+    if (hour < 5) timeWord = QStringLiteral("深夜");
+    else if (hour < 8) timeWord = QStringLiteral("清晨");
+    else if (hour < 11) timeWord = QStringLiteral("上午");
+    else if (hour < 13) timeWord = QStringLiteral("中午");
+    else if (hour < 18) timeWord = QStringLiteral("下午");
+    else if (hour < 23) timeWord = QStringLiteral("晚上");
+    else timeWord = QStringLiteral("深夜");
+    prompt += QStringLiteral("[时段] %1\n").arg(timeWord);
+
     // 日程提醒：触发原因明确标注为提醒，避免与主动闲聊混同
     if (isReminder)
         prompt += QStringLiteral("[日程提醒] %1\n").arg(contextHint);
@@ -3452,11 +3505,9 @@ static QString buildProactivePrompt(const QString &windowTitle,
     prompt += QStringLiteral("\n---\n\n");
     if (!characterPrompt.isEmpty())
         prompt += QStringLiteral("%1\n\n").arg(characterPrompt);
-    if (!memoryContext.isEmpty())
-        prompt += memoryContext + QStringLiteral("\n");
 
     prompt += QStringLiteral(
-        "请主动发起一句简短自然的对话（20 字以内）。\n\n");
+        "请主动发起一句简短自然的对话（30 字以内）。\n\n");
     if (isReminder)
     {
         // 日程提醒必须围绕提醒内容，禁止跑题闲聊
@@ -3464,6 +3515,23 @@ static QString buildProactivePrompt(const QString &windowTitle,
             "注意：这是用户设置的日程提醒，请务必围绕提醒内容【%1】提醒用户，"
             "语气自然、可以温柔催促，但不要偏离主题闲聊。\n\n")
             .arg(contextHint);
+    }
+    else
+    {
+        // 窗口相关触发：围绕窗口搭话，避免万能开场白
+        if (!windowTitle.isEmpty())
+            prompt += QStringLiteral(
+                "注意：触发与前台窗口有关，尽量围绕窗口内容自然搭话，"
+                "避免\"在看什么\"\"天气不错\"等万能开场白。\n\n");
+        // 防重复：最近主动说过的话
+        if (!recentLines.isEmpty())
+            prompt += QStringLiteral(
+                "你最近主动说过：%1。\n"
+                "不要重复这些内容或类似的开场白，换个新话题。\n\n")
+                .arg(recentLines.join(QStringLiteral("；")));
+        // 话题延续：用户刚回复过就顺着聊
+        prompt += QStringLiteral(
+            "若用户刚刚回复过你，请延续刚才的话题继续聊，而不是重新开场。\n\n");
     }
     prompt += QStringLiteral(
         "输出格式（严格用\"|\"分隔，不可调换顺序）：\n"
@@ -3896,7 +3964,6 @@ void Dialog::connectChatCallbacks(AiProvider *provider, quint64 generation)
                 const QString ui_ = m_lastUserInput;
                 if (!m_lastUserInput.isEmpty()) { appendHistoryLine("用户：" + m_lastUserInput); m_lastUserInput.clear(); }
                 appendHistoryLine("角色：" + cn);
-                scheduleContextSave();
                 if (!ui_.isEmpty()) { const QString uc = ui_; const QString ac = cn; QTimer::singleShot(200, this, [this, uc, ac]() { extractAndStoreMemory(uc, ac); }); }
                 if (m_continuousMode && !m_streamVitsEnabled && isAllVitsDone() && !m_isSpeechRecording) {
                     QTimer::singleShot(500, this, [this]() {
@@ -3935,13 +4002,17 @@ bool Dialog::doProactiveSpeak(const QString &windowTitle,
     if (m_userAway || m_isSpeechRecording || m_continuousMode ||
         m_activeChatAi || !isAllVitsDone())
         return false;
+    // 用户正在输入框打字/聚焦时不打扰（日程提醒 forced 除外）
+    if (!forced && ui->textEdit->hasFocus() &&
+        !ui->textEdit->toPlainText().trimmed().isEmpty())
+        return false;
 
     if (!forced && m_lastProactiveSpeakTime.isValid())
     {
         const int secs =
             static_cast<int>(m_lastProactiveSpeakTime.secsTo(
                 QDateTime::currentDateTime()));
-        if (secs < m_proactiveCooldownSec)
+        if (secs < m_currentCooldownSec)
             return false;
     }
 
@@ -3949,7 +4020,14 @@ bool Dialog::doProactiveSpeak(const QString &windowTitle,
     m_proactiveInFlight = true;
     // 日程提醒（forced）不刷新冷却计时，避免污染主动对话的冷却周期。
     if (!forced)
+    {
         m_lastProactiveSpeakTime = QDateTime::currentDateTime();
+        // 冷却随机化（0.8~1.5 × 配置），打破固定节律的机器感
+        const double factor =
+            0.8 + QRandomGenerator::global()->generateDouble() * 0.7;
+        m_currentCooldownSec =
+            qMax(60, static_cast<int>(m_proactiveCooldownSec * factor));
+    }
     m_vitsFinishScheduled = false;
     qDebug() << "[Proactive] 触发:" << contextHint
              << "| 窗口:"
@@ -3963,12 +4041,11 @@ bool Dialog::doProactiveSpeak(const QString &windowTitle,
         ui->pushButton_next->hide();
     }
 
-    // 构建精简 prompt
+    // 构建精简 prompt（不注入记忆：避免个人信息被生硬套用）
     ZcJsonLib roleConfig(CharacterAssestPath + "/" + ReadNowSelectChar() +
                          "/config.json");
     const QString characterPrompt =
         roleConfig.value("prompt").toString().trimmed();
-    const QString memoryContext = buildMemoryContext();
     QSettings iniSettings(IniSettingPath, QSettings::IniFormat);
     const QString manualLoc =
         iniSettings.value("general/Location").toString().trimmed();
@@ -3976,8 +4053,8 @@ bool Dialog::doProactiveSpeak(const QString &windowTitle,
         !manualLoc.isEmpty() ? manualLoc : m_cachedLocation;
 
     const QString prompt = buildProactivePrompt(
-        windowTitle, contextHint, characterPrompt, memoryContext, location,
-        isReminder);
+        windowTitle, contextHint, characterPrompt, location,
+        isReminder, m_recentProactiveLines);
 
     // 创建独立 AiProvider 用于主动对话（与普通聊天完全隔离）
     AiProvider *proactiveAi = new AiProvider(this);
@@ -3991,7 +4068,7 @@ bool Dialog::doProactiveSpeak(const QString &windowTitle,
     m_activeProactiveAi = proactiveAi;
 
     connect(proactiveAi, &AiProvider::replyReceived, this,
-            [this, proactiveAi, proactiveGen](const QString &reply)
+            [this, proactiveAi, proactiveGen, forced](const QString &reply)
             {
                 if (proactiveGen != m_proactiveGeneration ||
                     proactiveAi != m_activeProactiveAi) {
@@ -4008,6 +4085,14 @@ bool Dialog::doProactiveSpeak(const QString &windowTitle,
                 const QString innerThought =
                     reply.section('|', 3, 3).trimmed();
 
+                // 记录最近主动发言（防重复，保留最近 5 条；日程提醒不参与）
+                if (!forced)
+                {
+                    m_recentProactiveLines.append(chinese);
+                    while (m_recentProactiveLines.size() > 5)
+                        m_recentProactiveLines.removeFirst();
+                }
+
                 ui->pushButton_next->show();
                 ui->textEdit->setText(chinese);
                 ui->textEdit->setEnabled(false);
@@ -4023,7 +4108,6 @@ bool Dialog::doProactiveSpeak(const QString &windowTitle,
                 }
 
                 appendHistoryLine(QStringLiteral("角色：") + chinese);
-                scheduleContextSave();
 
                 proactiveAi->deleteLater();
                 checkVitsPipelineFinished();

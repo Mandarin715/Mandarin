@@ -30,6 +30,7 @@ class Dialog;
 
 class history;
 class reminder;
+class ChatLogStore;
 
 class Dialog : public QWidget
 {
@@ -105,8 +106,9 @@ class Dialog : public QWidget
     void reloadAppLauncherConfig(const ZcJsonLib &config);
     void reloadContinuousHotkeyConfig(const ZcJsonLib &config);
     //历史
-    void loadContextHistory(); //加载上下文历史
-    void saveContextHistory() const;
+    void loadContextHistory();   //加载上下文历史（chat.jsonl，含旧版迁移）
+    void syncChatLogFromView();  //回退/删除后按内存视图重写 chat.jsonl
+    ChatLogStore *m_chatLog = nullptr;
     void stopPendingConversationState();
     bool isHistoryOpen = false;
     bool m_reminderOpen = false;
@@ -212,10 +214,6 @@ class Dialog : public QWidget
     void initWakeWord();
     void startWakeWord();
     void stopWakeWord();
-    // 上下文历史延迟写入
-    QTimer *m_contextSaveTimer = nullptr;
-    bool m_contextDirty = false;
-    void scheduleContextSave();
     void onWakeWordDetected(const QString &keyword);
     // 应用调用
     QJsonArray m_cachedAppCommands;
@@ -236,6 +234,9 @@ class Dialog : public QWidget
     bool m_proactiveEnabled = false;
     bool m_proactiveInFlight = false;
     int m_proactiveCooldownSec = 600;   // 冷却期，默认 10 分钟
+    int m_currentCooldownSec = 600;     // 当前生效冷却（每次说话后随机化 0.8~1.5×）
+    int m_idleGreetThresholdMs = 10 * 60 * 1000; // 空闲问候阈值（触发后随机化 10~20 分钟）
+    QStringList m_recentProactiveLines; // 最近主动发言（防重复，最多 5 条）
     int m_proactiveDwellSec = 10;       // 窗口驻留确认，默认 10 秒
     int64_t m_proactivePendingHwnd = 0; // 待确认的窗口句柄（比标题更稳定）
     int64_t m_proactiveHandledHwnd = 0; // 已消费窗口切换事件的句柄
