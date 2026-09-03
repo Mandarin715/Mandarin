@@ -100,3 +100,16 @@ github-recovery-codes.txt
 # 本机开发脚本（dsh web 启动/重启工具，含本机硬编码路径，勿提交）
 restart-dsh-web.ps1
 start-dsh-web.ps1
+
+# 远程访问（frp 隧道）运行目录：含私钥 key.pem/证书/配置/frpc.exe，勿提交
+frp/
+
+# 远程访问一次性运维脚本（vps/frp/tailscale 排查工具，勿提交）
+archive-vps-tools.ps1
+vps-*.py
+vps-*.ps1
+frpc-*.ps1
+frpc-*.py
+ts-*.ps1
+probe-*.ps1
+ssh-test.py
