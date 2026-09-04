@@ -225,6 +225,7 @@ class Dialog : public QWidget
     void captureAndAnalyzeScreen();
     void analyzeScreenWithVision(const QByteArray &imageBase64,
                                   const QString &userMessage);
+    void showVisionFailureMessage(const QString &message); // 视觉分析失败：显式报错，不再静默转聊天
     static QStringList screenCaptureTriggerKeywords();
     bool doSubmitCurrentInput(const QString &userInput);
     // 主动对话

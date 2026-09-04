@@ -2784,16 +2784,27 @@ void Dialog::analyzeScreenWithVision(const QByteArray &imageBase64,
     ZcJsonLib config(JsonSettingPath);
     const QString serverSelect =
         config.value("screenCapture/Server", "Kimi").toString();
-    const QString apiKey =
-        config.value("screenCapture/ApiKey").toString();
+    QString apiKey =
+        config.value("screenCapture/" + serverSelect + "/ApiKey").toString();
+    if (apiKey.trimmed().isEmpty())
+        apiKey = config.value("screenCapture/ApiKey").toString(); // 旧版单一共享 key（迁移前兜底）
+    // 默认模型按服务商取，避免切到 DeepSeek 却拿 moonshot 默认值去请求
+    const QString defaultModel =
+        serverSelect == "DeepSeek"
+            ? QStringLiteral("deepseek-v4-flash-vision-exp")
+            : serverSelect == "OpenAI"
+                  ? QStringLiteral("gpt-4o-mini")
+                  : serverSelect == "Kimi"
+                        ? QStringLiteral("kimi-k2.6")
+                        : QStringLiteral("moonshot-v1-8k-vision-preview");
     const QString model =
-        config.value("screenCapture/Model", "moonshot-v1-8k-vision-preview").toString();
+        config.value("screenCapture/Model", defaultModel).toString();
 
     if (apiKey.isEmpty())
     {
         qWarning() << "Vision API: no API key configured for screen capture";
-        m_visionInFlight = false;
-        doSubmitCurrentInput(userMessage);
+        showVisionFailureMessage(
+            QStringLiteral("屏幕捕获未配置 API Key：请在设置中为当前服务商填写 Key"));
         return;
     }
 
@@ -2801,6 +2812,8 @@ void Dialog::analyzeScreenWithVision(const QByteArray &imageBase64,
     QString apiUrl;
     if (serverSelect == "Kimi")
         apiUrl = QStringLiteral("https://api.moonshot.cn/v1/chat/completions");
+    else if (serverSelect == "DeepSeek")
+        apiUrl = QStringLiteral("https://api.deepseek.com/v1/chat/completions");
     else if (serverSelect == "OpenAI")
         apiUrl = QStringLiteral("https://api.openai.com/v1/chat/completions");
     else if (serverSelect == "Custom")
@@ -2810,8 +2823,8 @@ void Dialog::analyzeScreenWithVision(const QByteArray &imageBase64,
         if (baseUrl.isEmpty())
         {
             qWarning() << "Vision API: Custom server selected but no BaseUrl configured";
-            m_visionInFlight = false;
-            doSubmitCurrentInput(userMessage);
+            showVisionFailureMessage(
+                QStringLiteral("自定义服务商未配置 BaseUrl：请在设置中填写"));
             return;
         }
         apiUrl = baseUrl + "/v1/chat/completions";
@@ -2819,8 +2832,8 @@ void Dialog::analyzeScreenWithVision(const QByteArray &imageBase64,
     else
     {
         qWarning() << "Vision API: unknown server" << serverSelect;
-        m_visionInFlight = false;
-        doSubmitCurrentInput(userMessage);
+        showVisionFailureMessage(
+            QStringLiteral("未知的屏幕捕获服务商：") + serverSelect);
         return;
     }
 
@@ -2859,7 +2872,9 @@ void Dialog::analyzeScreenWithVision(const QByteArray &imageBase64,
     QJsonObject body;
     body["model"] = model;
     body["messages"] = messages;
-    body["max_tokens"] = 500;
+    // deepseek-v4-flash-vision-exp 为思考模型，默认会把 max_tokens 全耗在“思考”上导致 content 为空，
+    // 故提高预算留足应答空间（Kimi/OpenAI 无此问题，提高无副作用）。
+    body["max_tokens"] = 2000;
     body["stream"] = false;
 
     QUrl url(apiUrl);
@@ -2878,16 +2893,23 @@ void Dialog::analyzeScreenWithVision(const QByteArray &imageBase64,
                 reply->deleteLater();
                 m_visionInFlight = false;
 
+                const QByteArray rawBody = reply->readAll();
+
                 if (reply->error() != QNetworkReply::NoError)
                 {
-                    qWarning() << "Vision API error:" << reply->errorString()
-                               << "- falling back to text-only mode";
-                    doSubmitCurrentInput(userMessage);
+                    const int httpStatus =
+                        reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+                    QString errMsg =
+                        QStringLiteral("屏幕分析失败：") + reply->errorString();
+                    if (httpStatus > 0)
+                        errMsg += QStringLiteral("（HTTP %1）").arg(httpStatus);
+                    qWarning() << "Vision API error:" << reply->errorString();
+                    showVisionFailureMessage(errMsg);
                     return;
                 }
 
                 const QJsonDocument responseDoc =
-                    QJsonDocument::fromJson(reply->readAll());
+                    QJsonDocument::fromJson(rawBody);
                 const QJsonObject responseObj = responseDoc.object();
                 const QJsonArray choices =
                     responseObj.value("choices").toArray();
@@ -2899,14 +2921,42 @@ void Dialog::analyzeScreenWithVision(const QByteArray &imageBase64,
                         choices.first().toObject();
                     const QJsonObject message =
                         firstChoice.value("message").toObject();
-                    visionResult = message.value("content").toString().trimmed();
+                    const QJsonValue contentVal = message.value("content");
+                    if (contentVal.isString())
+                    {
+                        visionResult = contentVal.toString().trimmed();
+                    }
+                    else if (contentVal.isArray())
+                    {
+                        // 部分多模态接口返回 content 为 [{type:'text',text:...}] 数组
+                        for (const QJsonValue &part : contentVal.toArray())
+                        {
+                            const QJsonObject partObj = part.toObject();
+                            if (partObj.value("type").toString() == "text")
+                            {
+                                visionResult =
+                                    partObj.value("text").toString().trimmed();
+                                if (!visionResult.isEmpty())
+                                    break;
+                            }
+                        }
+                    }
+                }
+
+                // 思考模型（如 deepseek-v4-flash-vision-exp）：content 为空时退回读 reasoning_content
+                if (visionResult.isEmpty() && !choices.isEmpty())
+                {
+                    const QJsonObject fc = choices.first().toObject();
+                    const QJsonObject msg = fc.value("message").toObject();
+                    visionResult =
+                        msg.value("reasoning_content").toString().trimmed();
                 }
 
                 if (visionResult.isEmpty())
                 {
-                    qWarning() << "Vision API returned empty content"
-                               << "- falling back to text-only mode";
-                    doSubmitCurrentInput(userMessage);
+                    qWarning() << "Vision API returned empty content";
+                    showVisionFailureMessage(
+                        QStringLiteral("视觉模型未返回内容，请检查服务商/模型配置"));
                     return;
                 }
 
@@ -2935,6 +2985,17 @@ void Dialog::analyzeScreenWithVision(const QByteArray &imageBase64,
                     doSubmitCurrentInput(enhancedInput);
                 }
             });
+}
+
+/*视觉分析失败：显式报错，避免把指令静默转入聊天造成“当成对话”的误解*/
+void Dialog::showVisionFailureMessage(const QString &message)
+{
+    m_visionInFlight = false;
+    m_lastUserInput.clear();
+    ui->textEdit->setText(message);
+    ui->textEdit->setEnabled(true);
+    ui->label_name->setText(QStringLiteral("你"));
+    ui->pushButton_next->show();
 }
 
 /*AI搜索意图分类：判断是否需要联网搜索*/

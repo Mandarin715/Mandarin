@@ -131,7 +131,7 @@
        <item>
         <widget class="ElaText" name="label_Desc">
          <property name="font"><font><pointsize>9</pointsize></font></property>
-         <property name="text"><string>提示：Kimi 推荐模型 moonshot-v1-8k-vision-preview，OpenAI 推荐 gpt-4o-mini。API Key 与对话模型分开配置，互不影响。</string></property>
+         <property name="text"><string>提示：Kimi 推荐模型 moonshot-v1-8k-vision-preview，DeepSeek 推荐 deepseek-v4-flash-vision-exp，OpenAI 推荐 gpt-4o-mini。API Key 与对话模型分开配置，互不影响。</string></property>
          <property name="wordWrap"><bool>true</bool></property>
         </widget>
        </item>

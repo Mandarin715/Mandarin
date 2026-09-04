@@ -113,3 +113,6 @@ frpc-*.py
 ts-*.ps1
 probe-*.ps1
 ssh-test.py
+# 远程访问重启脚本（aproxy/frpc，勿提交）
+restart-aproxy-ws.ps1
+restart-frpc-task.ps1
