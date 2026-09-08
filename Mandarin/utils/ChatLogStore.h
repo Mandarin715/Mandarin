@@ -41,4 +41,5 @@ class ChatLogStore : public QObject
 
   private:
     QString m_logPath;
+    bool m_dirReady = false; // 目录只需创建一次，避免每次追加都 mkpath
 };

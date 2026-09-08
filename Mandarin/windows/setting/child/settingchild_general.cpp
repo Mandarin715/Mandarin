@@ -7,6 +7,9 @@
 #include <QDir>
 #include <QSettings>
 #include <QSignalBlocker>
+#include <QMediaDevices>
+#include <QCameraDevice>
+#include "ZcJsonLib.h"
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -48,6 +51,33 @@ SettingChild_General::SettingChild_General(QWidget *parent)
         const QSignalBlocker cooldownBlocker(ui->spinBox_ProactiveCooldown);
         ui->spinBox_ProactiveCooldown->setValue(
             settings.value("general/ProactiveCooldownMinutes", 10).toInt());
+    }
+
+    // 摄像头感知（config.json，独立于 INI 的 general/*）
+    {
+        ZcJsonLib camConfig(JsonSettingPath);
+        const bool camEnable =
+            camConfig.value("cameraPerception/Enable", false).toBool();
+        const QSignalBlocker camBlocker(ui->ToggleSwitch_CameraPerceptionEnable);
+        ui->ToggleSwitch_CameraPerceptionEnable->setIsToggled(camEnable);
+
+        ui->comboBox_CameraDevice->clear();
+        const QList<QCameraDevice> cams = QMediaDevices::videoInputs();
+        for (const QCameraDevice &cam : cams)
+            ui->comboBox_CameraDevice->addItem(cam.description());
+        const QString savedDev =
+            camConfig.value("cameraPerception/Device").toString();
+        if (!savedDev.isEmpty())
+        {
+            const int idx = ui->comboBox_CameraDevice->findText(savedDev);
+            if (idx >= 0)
+            {
+                const QSignalBlocker deviceBlocker(ui->comboBox_CameraDevice);
+                ui->comboBox_CameraDevice->setCurrentIndex(idx);
+            }
+        }
+        // 无摄像头时隐藏设备选择
+        ui->widget_CameraDevice->setVisible(!cams.isEmpty());
     }
 }
 
@@ -161,4 +191,20 @@ void SettingChild_General::on_spinBox_ProactiveCooldown_valueChanged(int value)
     QSettings settings(IniSettingPath, QSettings::IniFormat);
     settings.setValue("general/ProactiveCooldownMinutes", value);
     emit generalConfigChanged();
+}
+
+/*摄像头感知开关*/
+void SettingChild_General::on_ToggleSwitch_CameraPerceptionEnable_toggled(bool checked)
+{
+    ZcJsonLib config(JsonSettingPath);
+    config.setValue("cameraPerception/Enable", checked);
+    emit cameraPerceptionConfigChanged();
+}
+
+/*摄像头设备选择*/
+void SettingChild_General::on_comboBox_CameraDevice_currentTextChanged(const QString &text)
+{
+    ZcJsonLib config(JsonSettingPath);
+    config.setValue("cameraPerception/Device", text);
+    emit cameraPerceptionConfigChanged();
 }

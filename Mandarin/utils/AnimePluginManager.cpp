@@ -27,14 +27,29 @@ bool AnimePluginManager::Reload()
     for (const QFileInfo &pluginFile : pluginFiles)
     {
         AnimePluginDefinition plugin;
-        QString error;
+        const QString path = pluginFile.filePath();
+        const qint64 mtimeMs = pluginFile.lastModified().toMSecsSinceEpoch();
+        const qint64 size = pluginFile.size();
 
-        //加载插件
-        if (!LoadAnimePluginFromFile(pluginFile.filePath(), plugin, error))
+        //命中缓存（mtime+size 未变）则跳过磁盘读取与 JSON 解析
+        const QPair<qint64, qint64> stamp = m_fileStamps.value(path, {-1, -1});
+        if (stamp.first == mtimeMs && stamp.second == size &&
+            m_fileCache.contains(path))
         {
-            m_lastErrors.append(
-                QString("插件加载失败[%1]: %2").arg(pluginFile.fileName()).arg(error));
-            continue;
+            plugin = m_fileCache.value(path);
+        }
+        else
+        {
+            QString error;
+            //加载插件
+            if (!LoadAnimePluginFromFile(path, plugin, error))
+            {
+                m_lastErrors.append(
+                    QString("插件加载失败[%1]: %2").arg(pluginFile.fileName()).arg(error));
+                continue;
+            }
+            m_fileStamps[path] = {mtimeMs, size};
+            m_fileCache[path] = plugin;
         }
 
         //拒绝重复插件名，防止设置界面无法区分

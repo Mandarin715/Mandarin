@@ -74,6 +74,7 @@ void SearchProvider::requestAccessToken()
     QNetworkRequest request(url);
     request.setHeader(QNetworkRequest::ContentTypeHeader,
                       "application/x-www-form-urlencoded");
+    request.setTransferTimeout(15000); // 防止挂起时 m_searchInFlight 永久锁死
 
     QNetworkReply *reply = m_network->post(request, url.query().toUtf8());
 
@@ -195,6 +196,7 @@ void SearchProvider::doSearch(const QString &query)
         request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
         request.setRawHeader("X-Appbuilder-Authorization",
                              ("Bearer " + authToken).toUtf8());
+        request.setTransferTimeout(15000); // 防止挂起时 m_searchInFlight 永久锁死
 
         QJsonObject body;
         QJsonArray messages;
@@ -228,6 +230,7 @@ void SearchProvider::doSearch(const QString &query)
 
         QNetworkRequest request(url);
         request.setRawHeader("Accept", "application/json");
+        request.setTransferTimeout(15000); // 防止挂起时 m_searchInFlight 永久锁死
 
         if (!m_apiKey.isEmpty())
             request.setRawHeader("Authorization",
@@ -244,10 +247,16 @@ void SearchProvider::doSearch(const QString &query)
 
 void SearchProvider::onSearchReplyFinished()
 {
-    if (!m_activeReply)
+    // 只认领属于当前请求的 reply：旧（被 abort 的）reply 的 finished 可能晚到，
+    // 若不辨 sender 会误取/误删新的在飞请求，导致搜索结果丢失。
+    QNetworkReply *reply = qobject_cast<QNetworkReply *>(sender());
+    if (!reply)
         return;
-
-    QNetworkReply *reply = m_activeReply;
+    if (reply != m_activeReply)
+    {
+        reply->deleteLater();
+        return;
+    }
     m_activeReply = nullptr;
     reply->deleteLater();
 

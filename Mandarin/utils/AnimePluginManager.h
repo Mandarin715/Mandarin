@@ -4,6 +4,7 @@
 
 #include <QHash>
 #include <QList>
+#include <QPair>
 #include <QString>
 #include <QStringList>
 
@@ -33,4 +34,8 @@ class AnimePluginManager
     QList<AnimePluginDefinition> m_plugins;
     QStringList m_animationUniqueKeys;
     QStringList m_lastErrors;
+
+    // 插件文件解析缓存：mtime+size 未变则跳过磁盘读取与 JSON 解析
+    QHash<QString, QPair<qint64, qint64>> m_fileStamps; // path -> (mtime_ms, size)
+    QHash<QString, AnimePluginDefinition> m_fileCache;  // path -> 已解析定义
 };

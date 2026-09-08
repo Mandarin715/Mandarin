@@ -136,6 +136,29 @@ void Tachie::ApplyInteractiveRegionFullWindow()
 }
 #endif
 
+/*立绘解码缓存：路径 + mtime 未变则复用，避免反复解码大图*/
+QPixmap Tachie::loadTachiePixmapCached(const QString &filePath)
+{
+    const qint64 mtimeMs =
+        QFileInfo(filePath).lastModified().toMSecsSinceEpoch();
+    if (m_pixmapCache.contains(filePath) &&
+        m_pixmapCacheStamp.value(filePath) == mtimeMs)
+    {
+        return m_pixmapCache.value(filePath);
+    }
+    QPixmap pm;
+    if (!pm.load(filePath))
+        return QPixmap();
+    if (m_pixmapCache.size() >= 8) // 有界缓存
+    {
+        m_pixmapCache.clear();
+        m_pixmapCacheStamp.clear();
+    }
+    m_pixmapCache.insert(filePath, pm);
+    m_pixmapCacheStamp.insert(filePath, mtimeMs);
+    return pm;
+}
+
 //设置立绘
 void Tachie::SetTachieImg(QString TachieName)
 {
@@ -166,7 +189,10 @@ void Tachie::SetTachieImg(QString TachieName)
     for (const QString &candidate : candidates)
     {
         const QString filePath = tachieDir.filePath(candidate);
-        if (QFileInfo::exists(filePath) && loadedPixmap.load(filePath))
+        if (!QFileInfo::exists(filePath))
+            continue;
+        loadedPixmap = loadTachiePixmapCached(filePath);
+        if (!loadedPixmap.isNull())
         {
             loaded = true;
             break;
@@ -185,7 +211,8 @@ void Tachie::SetTachieImg(QString TachieName)
             {
                 continue;
             }
-            if (loadedPixmap.load(tachieDir.filePath(fileName)))
+            loadedPixmap = loadTachiePixmapCached(tachieDir.filePath(fileName));
+            if (!loadedPixmap.isNull())
             {
                 loaded = true;
                 break;
@@ -255,6 +282,7 @@ void Tachie::TryPlayAnimationForAction(const QString &actionName)
     struct ScaleSequenceState
     {
         QRect baseImageRect;
+        QPixmap intermediate; // 预缩放到最大倍率的中间图，动画每帧只缩它（避免对原始大图逐帧平滑缩放）
         bool initialized = false;
     };
     auto scaleSequenceState = std::make_shared<ScaleSequenceState>();
@@ -265,6 +293,16 @@ void Tachie::TryPlayAnimationForAction(const QString &actionName)
             return;
         // 锁定整段缩放动画的基准矩形，避免多 step 累积漂移。
         scaleSequenceState->baseImageRect = ui->label_tachie1->geometry();
+        // 一次性预生成"最大倍率 2.0"的中间图
+        if (!NowTachie.isNull() && !scaleSequenceState->baseImageRect.isEmpty())
+        {
+            const int mw = qMax(
+                1, qRound(scaleSequenceState->baseImageRect.width() * 2.0));
+            const int mh = qMax(
+                1, qRound(scaleSequenceState->baseImageRect.height() * 2.0));
+            scaleSequenceState->intermediate = NowTachie.scaled(
+                mw, mh, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+        }
         scaleSequenceState->initialized = true;
     };
 
@@ -340,9 +378,13 @@ void Tachie::TryPlayAnimationForAction(const QString &actionName)
 
                 if (!NowTachie.isNull())
                 {
+                    // 优先缩预生成的中间图（远小于原始立绘），显著降低每帧 CPU/拷贝
+                    const QPixmap &src = scaleSequenceState->intermediate.isNull()
+                                             ? NowTachie
+                                             : scaleSequenceState->intermediate;
                     const QPixmap scaledPixmap =
-                        NowTachie.scaled(w, h, Qt::IgnoreAspectRatio,
-                                         Qt::SmoothTransformation);
+                        src.scaled(w, h, Qt::IgnoreAspectRatio,
+                                   Qt::SmoothTransformation);
                     ui->label_tachie1->setPixmap(scaledPixmap);
                     ui->label_tachie1->setGeometry(x, y, w, h);
                     _scaledImg = scaledPixmap.toImage();

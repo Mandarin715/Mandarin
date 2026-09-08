@@ -68,13 +68,26 @@ bool WakeWordDetector::init(const QString &modelDir, const QStringList &keywords
     config.keywords_threshold = threshold;
 
     m_spotter = new KeywordSpotter(KeywordSpotter::Create(config));
-    if (!m_spotter)
+    // Create() 失败时返回的是包装空指针的对象，Get() 才反映真实创建结果
+    if (!m_spotter || !m_spotter->Get())
     {
-        qWarning() << "WakeWordDetector: failed to create keyword spotter";
+        qWarning() << "WakeWordDetector: failed to create keyword spotter "
+                      "(missing/invalid model?)";
+        delete m_spotter;
+        m_spotter = nullptr;
         return false;
     }
 
     m_stream = new OnlineStream(m_spotter->CreateStream());
+    if (!m_stream || !m_stream->Get())
+    {
+        qWarning() << "WakeWordDetector: failed to create online stream";
+        delete m_stream;
+        m_stream = nullptr;
+        delete m_spotter;
+        m_spotter = nullptr;
+        return false;
+    }
     m_initialized = true;
     qDebug() << "WakeWordDetector: initialized, threshold=" << threshold;
     return true;
@@ -99,8 +112,12 @@ void WakeWordDetector::start()
 
     if (!device.isFormatSupported(format))
     {
-        qWarning() << "WakeWordDetector: 16kHz mono format not supported, using nearest";
-        format = device.preferredFormat();
+        const QAudioFormat preferred = device.preferredFormat();
+        qWarning() << "WakeWordDetector: device does not support 16kHz/mono/Int16 "
+                      "(preferred:" << preferred.sampleRate() << "Hz,"
+                   << preferred.channelCount() << "ch) - wake word disabled";
+        // 不做重采样就直接送 KWS 会得到乱码音频（永远不触发），宁可明确禁用
+        return;
     }
 
     m_audioSource = new QAudioSource(device, format, this);

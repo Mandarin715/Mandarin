@@ -18,7 +18,8 @@ struct SearchResult
 };
 
 /// 联网搜索提供者，封装搜索 API 调用。
-/// 支持百度千帆、SearXNG、Bing、SerpAPI 等多种后端。
+/// 百度千帆走专用 POST 分支；其余走通用 GET（适用于 SearXNG 及自带鉴权的自定义端点）。
+/// 注意：Bing 需 Ocp-Apim-Subscription-Key、SerpAPI 需 api_key/engine 参数，当前均未实现。
 class SearchProvider : public QObject
 {
     Q_OBJECT

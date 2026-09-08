@@ -5,6 +5,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QSaveFile>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QRegularExpression>
@@ -19,7 +20,11 @@ ChatLogStore::ChatLogStore(const QString &logPath, QObject *parent)
 void ChatLogStore::appendMessage(const QString &role, const QString &content,
                                  const QJsonObject &meta)
 {
-    QDir().mkpath(QFileInfo(m_logPath).absolutePath());
+    if (!m_dirReady)
+    {
+        QDir().mkpath(QFileInfo(m_logPath).absolutePath());
+        m_dirReady = true;
+    }
 
     QJsonObject obj;
     obj["id"] = QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -68,14 +73,16 @@ bool ChatLogStore::exists() const
     return QFile::exists(m_logPath);
 }
 
-/*整文件重写（回退/删除后同步持久化）：临时文件 + rename 原子替换*/
+/*整文件重写（回退/删除后同步持久化）：QSaveFile 原子提交，崩溃不会丢历史*/
 void ChatLogStore::rewrite(const QJsonArray &messages)
 {
     QDir().mkpath(QFileInfo(m_logPath).absolutePath());
-    const QString tmpPath = m_logPath + QStringLiteral(".tmp");
-    QFile out(tmpPath);
+    QSaveFile out(m_logPath);
     if (!out.open(QIODevice::WriteOnly | QIODevice::Text))
+    {
+        qWarning() << "ChatLogStore: cannot open for rewrite:" << m_logPath;
         return;
+    }
     for (const QJsonValue &v : messages)
     {
         if (!v.isObject())
@@ -83,9 +90,8 @@ void ChatLogStore::rewrite(const QJsonArray &messages)
         out.write(QJsonDocument(v.toObject()).toJson(QJsonDocument::Compact));
         out.write("\n");
     }
-    out.close();
-    QFile::remove(m_logPath);
-    QFile::rename(tmpPath, m_logPath);
+    if (!out.commit())
+        qWarning() << "ChatLogStore: commit failed:" << m_logPath;
 }
 
 QString ChatLogStore::logPath() const

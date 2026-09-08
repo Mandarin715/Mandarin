@@ -41,6 +41,9 @@ class Tachie : public QWidget
     QPoint _scaledImgTopLeft{0, 0};     //缓存图片在窗口内左上角位置
     bool _tachiePosRestoreDone = false; //位置恢复完成后才允许自动保存
     AnimePluginManager m_animePluginManager;
+    QHash<QString, QPixmap> m_pixmapCache;    // 立绘解码缓存：路径 -> pixmap（避免反复解码大图）
+    QHash<QString, qint64> m_pixmapCacheStamp; // 路径 -> mtime_ms
+    QPixmap loadTachiePixmapCached(const QString &filePath);
     QSequentialAnimationGroup *m_activeAnimationGroup = nullptr;
     QWidget *m_innerThoughtBubble = nullptr;
     QTimer *m_innerThoughtTimer = nullptr;

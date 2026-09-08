@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(Mandarin VERSION 1.13.0 LANGUAGES CXX)
+project(Mandarin VERSION 1.14.0 LANGUAGES CXX)
 
 if(APPLE)
     set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "Build universal binaries")
@@ -24,7 +24,7 @@ set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 #find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets)
@@ -142,6 +142,7 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
         utils/WakeWordDetector.h utils/WakeWordDetector.cpp
         utils/OfflineSpeechRecognizer.h utils/OfflineSpeechRecognizer.cpp
         utils/ChatLogStore.h utils/ChatLogStore.cpp
+        utils/FaceDetector.h utils/FaceDetector.cpp
         windows/setting/child/settingchild_llm.h windows/setting/child/settingchild_llm.cpp windows/setting/child/settingchild_llm.ui
         windows/setting/child/settingchild_char.h windows/setting/child/settingchild_char.cpp windows/setting/child/settingchild_char.ui
         windows/setting/child/settingchild_vits.h windows/setting/child/settingchild_vits.cpp windows/setting/child/settingchild_vits.ui
@@ -236,12 +237,25 @@ endif()
 
 # 3. Windows 专用链接
 if(WIN32)
+    # C++/WinRT（Windows.Media.FaceAnalysis）头文件目录
+    if(DEFINED CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION)
+        set(MANDARIN_WINRT_INC
+            "C:/Program Files (x86)/Windows Kits/10/Include/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/cppwinrt")
+    else()
+        set(MANDARIN_WINRT_INC
+            "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/cppwinrt")
+    endif()
+    target_include_directories(Mandarin PRIVATE ${MANDARIN_WINRT_INC})
+
     target_link_libraries(Mandarin PRIVATE
         ${ZCAILIB_WIN_LIB}
         ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/sherpa-onnx/lib/sherpa-onnx-cxx-api.lib
         ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ElaWidgetTools/lib/elawidgettools.lib
         ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ZcWidgetTools/lib/ZcWidgetTools.lib
         ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ZcJsonLib/lib/ZcJsonLib.lib
+        windowsapp.lib
+        ole32.lib
+        oleaut32.lib
     )
 
     # 延迟加载 ONNX 相关 DLL，仅唤醒词检测需要（已延迟 500ms 初始化）

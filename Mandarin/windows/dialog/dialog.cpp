@@ -45,6 +45,12 @@
 #include <QTimer>
 #include <QMediaDevices>
 #include <QMediaPlayer>
+#include <QCamera>
+#include <QCameraDevice>
+#include <QMediaCaptureSession>
+#include <QVideoSink>
+#include <QVideoFrame>
+#include <QImage>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
@@ -59,6 +65,7 @@
 #include <QRegularExpression>
 #include <QUuid>
 #include <QWheelEvent>
+#include <thread>
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -349,6 +356,27 @@ void Dialog::loadContextHistory()
     }
     if (lastDate.isValid())
         m_lastHistoryDate = lastDate.toString("M月d日");
+
+    // 上下文预算：长期使用后只保留最近 60 行（摘要行始终保留），
+    // 避免首条消息把整部历史发给 API 造成延迟/费用爆炸甚至超限 400。
+    static constexpr int kMaxContextLines = 60;
+    if (m_contextHistory.size() > kMaxContextLines)
+    {
+        QStringList summaries;
+        QStringList rest;
+        for (const QString &line : m_contextHistory)
+        {
+            if (line.startsWith(QStringLiteral("角色：[对话摘要] ")))
+                summaries.append(line);
+            else
+                rest.append(line);
+        }
+        const int keep = qMax(1, kMaxContextLines - summaries.size());
+        if (rest.size() > keep)
+            rest = rest.mid(rest.size() - keep);
+        m_contextHistory = summaries;
+        m_contextHistory += rest;
+    }
 }
 
 /*构建用户消息，包含上下文*/
@@ -357,10 +385,15 @@ QString Dialog::buildUserMessageWithContext(const QString &input) const
     if (m_contextHistory.isEmpty())
         return input;
 
+    // 字符预算兜底：即便单行很长，也不会把整段历史塞进请求
+    static constexpr int kMaxContextChars = 8000;
+    QString joined = m_contextHistory.join(QStringLiteral("\n"));
+    if (joined.size() > kMaxContextChars)
+        joined = joined.right(kMaxContextChars);
+
     return QStringLiteral(
                "以下是你和用户最近的对话，请延续上下文并保持人设一致：\n") +
-           m_contextHistory.join("\n") + QStringLiteral("\n\n用户当前输入：") +
-           input;
+           joined + QStringLiteral("\n\n用户当前输入：") + input;
 }
 
 /*添加历史记录行（同时立即持久化到 chat.jsonl，日期标记不入库）*/
@@ -406,15 +439,48 @@ void Dialog::syncChatLogFromView()
 {
     if (!m_chatLog)
         return;
+
+    // 保留原始 id/time/meta：与磁盘上的原消息按顺序对齐复用，
+    // 避免回退/删除时用当前时间重建、把日期时间线整体抹平。
+    const QJsonArray original = m_chatLog->loadMessages();
+    int cursor = 0;
     QJsonArray messages;
     for (const QString &line : m_contextHistory)
     {
+        QString role;
+        QString content;
         if (line.startsWith(QStringLiteral("用户：")))
-            messages.append(makeChatMessage(QStringLiteral("user"), line.mid(3)));
+        {
+            role = QStringLiteral("user");
+            content = line.mid(3);
+        }
         else if (line.startsWith(QStringLiteral("角色：[对话摘要] ")))
             continue; // 压缩摘要不入库（磁盘只存原始消息）
         else if (line.startsWith(QStringLiteral("角色：")))
-            messages.append(makeChatMessage(QStringLiteral("assistant"), line.mid(3)));
+        {
+            role = QStringLiteral("assistant");
+            content = line.mid(3);
+        }
+        else
+            continue;
+
+        QJsonObject msg;
+        bool matched = false;
+        for (int i = cursor; i < original.size(); ++i)
+        {
+            const QJsonObject o = original.at(i).toObject();
+            if (o.value("role").toString() == role &&
+                o.value("content").toString() == content)
+            {
+                msg = o; // 复用原始 id/time/meta
+                cursor = i + 1;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched)
+            msg = makeChatMessage(role, content);
+        messages.append(msg);
     }
     m_chatLog->rewrite(messages);
 }
@@ -552,7 +618,7 @@ void Dialog::initServices()
     reloadAIConfig(config);
     reloadSpeechInputConfig(config);
     QTimer::singleShot(500, this, &Dialog::initWakeWord);          // 延迟加载唤醒词ONNX
-    QTimer::singleShot(500, this, &Dialog::initSpeechRecognizer); // 延迟加载语音识别模型
+    QTimer::singleShot(3000, this, &Dialog::initSpeechRecognizer); // 错峰加载，避免两个模型同拍阻塞
 
     // 轮询定时器：每100ms读取音频+检测语音活动，静音超限自动停止
     // 录音前 1 秒为保护期，防止麦克风预热期误触发停止
@@ -669,15 +735,35 @@ Dialog::~Dialog()
 {
     releaseSpeechHotkeyResources();
     stopWakeWord();
+    if (m_presenceCamera)
+    {
+        m_presenceCamera->stop();
+        m_presenceCamera->deleteLater();
+        m_presenceCamera = nullptr;
+    }
+    if (m_presenceCaptureSession)
+    {
+        m_presenceCaptureSession->deleteLater();
+        m_presenceCaptureSession = nullptr;
+    }
+    if (m_presenceVideoSink)
+    {
+        m_presenceVideoSink->deleteLater();
+        m_presenceVideoSink = nullptr;
+    }
+    delete m_faceDetector;
+    m_faceDetector = nullptr;
     delete ui;
 }
 
 /*按键相关*/
 void Dialog::keyPressEvent(QKeyEvent *event)
 {
-    keys.append(event->key());
-    // 裸 Enter 不让 QTextEdit 插入换行，提交由 keyReleaseEvent 处理
-    if (event->key() == Qt::Key_Return && !keys.contains(Qt::Key_Shift)) {
+    // 裸 Enter 不插入换行（提交在 keyRelease 处理）；Shift+Enter 交给基类换行。
+    // 用事件自带的 modifiers 判断 Shift，避免手工跟踪按键列表在失焦后残留导致回车失效。
+    if (event->key() == Qt::Key_Return &&
+        !(event->modifiers() & Qt::ShiftModifier))
+    {
         event->accept();
         return;
     }
@@ -685,14 +771,13 @@ void Dialog::keyPressEvent(QKeyEvent *event)
 }
 void Dialog::keyReleaseEvent(QKeyEvent *event)
 {
-    if (event->key() == Qt::Key_Return) {
-        if (!keys.contains(Qt::Key_Shift)) {
-            submitCurrentInput();
-            keys.removeAll(event->key());
-            return;
-        }
+    if (event->key() == Qt::Key_Return &&
+        !(event->modifiers() & Qt::ShiftModifier))
+    {
+        submitCurrentInput();
+        return;
     }
-    keys.removeAll(event->key());
+    QWidget::keyReleaseEvent(event);
 }
 
 /*点击继续*/
@@ -866,6 +951,16 @@ void Dialog::reloadContinuousHotkeyConfig(const ZcJsonLib &config)
         g_speechHotkeyOwner = this;
         g_speechHotkeyHook =
             SetWindowsHookExW(WH_KEYBOARD_LL, SpeechHotkeyHookProc, nullptr, 0);
+        if (!g_speechHotkeyHook)
+        {
+            qWarning() << "Failed to install speech hotkey hook";
+            g_speechHotkeyOwner = nullptr;
+        }
+    }
+    else if (!m_continuousHotkeyEnabled && g_speechHotkeyHook)
+    {
+        // 关闭连续热键时卸载全局键盘钩子，避免常驻系统造成输入延迟
+        releaseSpeechHotkeyResources();
     }
 #endif
 }
@@ -1205,6 +1300,8 @@ void Dialog::deleteHistoryItem(int historyIndex)
                 historyWin->addChildWindow(i, QStringLiteral("你"), line.mid(3));
             else if (line.startsWith(QStringLiteral("角色：")))
                 historyWin->addChildWindow(i, QStringLiteral("她"), line.mid(3));
+            else
+                historyWin->addChildWindow(i, QStringLiteral("记录"), line);
         }
     }
 }
@@ -1519,6 +1616,31 @@ void Dialog::tryStartNextVitsPlayback()
              << "| muted:" << m_vitsAudioOutput->isMuted();
 }
 
+/*本地启发式：输入是否"可能"需要联网搜索。
+  用于跳过每轮一次的 LLM 意图分类——纯闲聊/情绪表达直接走对话，省掉一次往返。*/
+static bool looksLikeSearchIntent(const QString &input)
+{
+    const QString t = input.trimmed();
+    if (t.size() < 4) // "嗯""哈哈"之类不搜
+        return false;
+    static const QStringList kHints = {
+        QStringLiteral("什么"),   QStringLiteral("怎么"),   QStringLiteral("为什么"),
+        QStringLiteral("哪"),     QStringLiteral("谁"),     QStringLiteral("多少"),
+        QStringLiteral("几"),     QStringLiteral("何时"),   QStringLiteral("今天"),
+        QStringLiteral("现在"),   QStringLiteral("最近"),   QStringLiteral("最新"),
+        QStringLiteral("目前"),   QStringLiteral("当前"),   QStringLiteral("实时"),
+        QStringLiteral("天气"),   QStringLiteral("新闻"),   QStringLiteral("价格"),
+        QStringLiteral("多少钱"), QStringLiteral("怎么样"), QStringLiteral("有没有"),
+        QStringLiteral("是不是"), QStringLiteral("什么时候"), QStringLiteral("在哪"),
+        QStringLiteral("推荐"),   QStringLiteral("怎么办")};
+    for (const QString &h : kHints)
+    {
+        if (t.contains(h))
+            return true;
+    }
+    return t.contains(QLatin1Char('?')) || t.contains(QChar(0xFF1F));
+}
+
 /*提交当前输入*/
 bool Dialog::submitCurrentInput()
 {
@@ -1726,9 +1848,10 @@ bool Dialog::submitCurrentInput()
         }
     }
 
-    // AI 搜索意图分类：无显式关键词时，让 AI 判断是否需要搜索
+    // AI 搜索意图分类：无显式关键词时，仅对"疑似需要实时信息"的输入才让 AI 判断是否需要搜索，
+    // 纯闲聊直接走对话，省掉每轮一次的 LLM 往返（延迟/费用减半）。
     if (m_searchEnabled && m_searchProvider->isEnabled() &&
-        !m_classifierInFlight)
+        !m_classifierInFlight && looksLikeSearchIntent(userInput))
     {
         classifyAndSearch(userInput);
         return true;
@@ -2005,8 +2128,9 @@ void Dialog::stopSpeechRecording()
 
     m_isSpeechRecording = false;
 
-    // 录音结束后重新开启语音唤醒（如果之前被 onWakeWordDetected 停止了）
-    startWakeWord();
+    // 录音结束后重新开启语音唤醒（仅在唤醒词启用时；关闭后不应被录音重新拉起）
+    if (m_wakeWordEnabled)
+        startWakeWord();
 
     // 没有捕获到有效音频（太短）
     const int minBytes = 16000 * 2 * 1; // 至少1秒（16kHz, 16-bit, mono）
@@ -2020,19 +2144,42 @@ void Dialog::stopSpeechRecording()
         return;
     }
 
-    // 离线语音识别（SenseVoice），直接使用内存中的 PCM 数据
-    QString recognizedText;
-    if (m_speechRecognizer && m_speechRecognizer->isInitialized())
-    {
-        recognizedText = m_speechRecognizer->recognize(m_capturedAudioData).trimmed();
-    }
-    else
+    // 离线语音识别（SenseVoice）：放到工作线程解码，避免解码期间冻结 UI
+    if (!m_speechRecognizer || !m_speechRecognizer->isInitialized())
     {
         const QString msg = QStringLiteral("语音识别模型未就绪，请确保 models/sense-voice/ 目录包含模型文件");
         ui->textEdit->setText(msg);
         showTemporaryMessage(msg);
+        m_capturedAudioData.clear();
+        return;
     }
+    if (m_asrBusy.exchange(true))
+        return; // 上一次识别仍在进行，忽略本次
+    const QByteArray pcm = m_capturedAudioData;
     m_capturedAudioData.clear();
+    std::thread(
+        [this, pcm]()
+        {
+            const QString text =
+                m_speechRecognizer ? m_speechRecognizer->recognize(pcm).trimmed()
+                                   : QString();
+            QMetaObject::invokeMethod(
+                this,
+                [this, text]()
+                {
+                    m_asrBusy = false;
+                    applyRecognizedText(text);
+                },
+                Qt::QueuedConnection);
+        })
+        .detach();
+    return;
+}
+
+/*识别结果过滤/上屏/自动发送（主线程）*/
+void Dialog::applyRecognizedText(const QString &recognizedTextIn)
+{
+    QString recognizedText = recognizedTextIn;
 
     // ── 识别结果过滤：拒绝环境噪音/无意义输出 ──
     if (!recognizedText.isEmpty())
@@ -2114,7 +2261,9 @@ void Dialog::exitContinuousMode()
 /*检查所有VITS音频是否播放完毕*/
 bool Dialog::isAllVitsDone() const
 {
-    return m_vitsReadyFiles.isEmpty() && m_vitsInFlightReplies.isEmpty() &&
+    // 必须与 checkVitsPipelineFinished 一致：含待合成队列，否则会在语音未播完时误判"已完成"
+    return m_vitsPendingTexts.isEmpty() && m_vitsReadyFiles.isEmpty() &&
+           m_vitsInFlightReplies.isEmpty() &&
            (!m_vitsPlayer ||
             m_vitsPlayer->playbackState() == QMediaPlayer::StoppedState);
 }
@@ -2123,6 +2272,10 @@ bool Dialog::isAllVitsDone() const
 /*初始化离线语音识别（SenseVoice）*/
 void Dialog::initSpeechRecognizer()
 {
+    // 识别在途时不重建（工作线程正在用 recognizer，删除会崩溃）
+    if (m_asrBusy)
+        return;
+
     // 先清理旧实例
     if (m_speechRecognizer)
     {
@@ -2754,8 +2907,14 @@ void Dialog::captureAndAnalyzeScreen()
     if (m_visionInFlight)
         return;
 
-    const QByteArray jpegData = captureScreenToJpeg();
-    if (jpegData.isEmpty())
+    const QString userMessage = m_lastUserInput.isEmpty()
+        ? QStringLiteral("帮我看看屏幕上的内容")
+        : m_lastUserInput;
+
+    // 抓屏 + 缩放留在主线程（屏幕访问）；JPEG 编码 + base64 放工作线程避免 UI 冻结
+    QScreen *screen = QGuiApplication::primaryScreen();
+    QPixmap pixmap = screen ? screen->grabWindow(0) : QPixmap();
+    if (pixmap.isNull())
     {
         const QString msg = QStringLiteral("屏幕捕获失败，请重试");
         ui->textEdit->setText(msg);
@@ -2767,13 +2926,43 @@ void Dialog::captureAndAnalyzeScreen()
         return;
     }
 
-    const QByteArray imageBase64 = jpegData.toBase64();
-    const QString userMessage = m_lastUserInput.isEmpty()
-        ? QStringLiteral("帮我看看屏幕上的内容")
-        : m_lastUserInput;
+    QImage image = pixmap.toImage();
+    const int maxDim = 1920;
+    if (image.width() > maxDim || image.height() > maxDim)
+        image = image.scaled(maxDim, maxDim, Qt::KeepAspectRatio,
+                             Qt::SmoothTransformation);
 
     m_visionInFlight = true;
-    analyzeScreenWithVision(imageBase64, userMessage);
+    std::thread(
+        [this, image, userMessage]()
+        {
+            QByteArray jpeg;
+            QBuffer buffer(&jpeg);
+            buffer.open(QIODevice::WriteOnly);
+            image.save(&buffer, "JPEG", 70);
+            buffer.close();
+            const QByteArray b64 = jpeg.toBase64();
+            QMetaObject::invokeMethod(
+                this,
+                [this, b64, userMessage]()
+                {
+                    if (b64.isEmpty())
+                    {
+                        m_visionInFlight = false;
+                        const QString msg = QStringLiteral("屏幕捕获失败，请重试");
+                        ui->textEdit->setText(msg);
+                        showTemporaryMessage(msg);
+                        ui->textEdit->setEnabled(true);
+                        ui->label_name->setText(QStringLiteral("你"));
+                        ui->pushButton_next->show();
+                        m_lastUserInput.clear();
+                        return;
+                    }
+                    analyzeScreenWithVision(b64, userMessage);
+                },
+                Qt::QueuedConnection);
+        })
+        .detach();
 }
 
 /*发送截图到视觉AI分析*/
@@ -2881,6 +3070,7 @@ void Dialog::analyzeScreenWithVision(const QByteArray &imageBase64,
     QNetworkRequest request(url);
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
     request.setRawHeader("Authorization", ("Bearer " + apiKey).toUtf8());
+    request.setTransferTimeout(30000); // 防止服务端不回包时 m_visionInFlight 永久锁死
 
     QNetworkReply *reply =
         m_visionManager->post(request,
@@ -3234,10 +3424,16 @@ void Dialog::compressContextHistory()
                 m_contextCompressionInFlight = false;
                 // 校验：generation 一致、角色未切换、快照未变
                 if (gen != m_contextGeneration || contextPath != ReadCharacterContextPath())
+                {
+                    compressAi->deleteLater();
                     return;
+                }
                 if (m_contextHistory.size() < compressCount ||
                     m_contextHistory.mid(0, compressCount) != oldLines)
+                {
+                    compressAi->deleteLater();
                     return;
+                }
 
                 QString summary = reply.trimmed();
                 if (!summary.isEmpty())
@@ -3397,6 +3593,9 @@ void Dialog::initProactiveAgent()
     m_proactiveDwellSec =
         qMax(5, settings.value("general/ProactiveDwellSeconds", 10).toInt());
 
+    // 摄像头感知（仅 Windows，未启用时回退键鼠推断）
+    initCameraPerception();
+
     if (!m_proactiveEnabled)
         return;
 
@@ -3469,7 +3668,24 @@ void Dialog::checkProactiveWindow()
 #endif
 }
 
-/*用户状态检测：离开/回来*/
+/*摄像头感知日志：写文件（便于排查相机开启时机）*/
+static void cameraLog(const QString &msg)
+{
+    static const QString logPath =
+        QFileInfo(JsonSettingPath).absolutePath() +
+        QStringLiteral("/cameraPerception.log");
+    QFile f(logPath);
+    if (f.open(QIODevice::Append | QIODevice::Text))
+    {
+        f.write(QStringLiteral("[%1] %2\n")
+                    .arg(QDateTime::currentDateTime().toString("HH:mm:ss.zzz"),
+                         msg)
+                    .toUtf8());
+        f.close();
+    }
+}
+
+/*用户状态检测：离开/回来（摄像头感知优先，不可用则回退键鼠推断）*/
 void Dialog::checkProactiveUserPresence()
 {
 #ifdef Q_OS_WIN
@@ -3480,6 +3696,93 @@ void Dialog::checkProactiveUserPresence()
 
     const quint32 tick = lii.dwTime;
     const quint32 idleMs = GetTickCount() - tick;
+    const QDateTime now = QDateTime::currentDateTime();
+
+    // 摄像头感知未启用或不可用 → 回退旧键鼠推断
+    if (!m_cameraPerceptionEnabled || m_cameraFallbackToKeyboard)
+    {
+        checkPresenceByKeyboard(idleMs);
+        return;
+    }
+
+    // 正在短开验证 → 交给异步回调处理
+    if (m_cameraVerifying)
+        return;
+
+    // 用户回来：键鼠动了 → 直接确认回来（无需开摄像头）
+    if (m_userAway && idleMs < 3000)
+    {
+        m_userAway = false;
+        const int secsSinceLastSpeak =
+            m_lastProactiveSpeakTime.isValid()
+                ? static_cast<int>(m_lastProactiveSpeakTime.secsTo(now))
+                : INT_MAX;
+        if (secsSinceLastSpeak >= m_currentCooldownSec)
+            doProactiveSpeak(QString(), QStringLiteral("用户回来"));
+        m_lastAwayRecheckTime = QDateTime();
+        return;
+    }
+
+    // 离开期间：每 m_cameraAwayRecheckSec 短检一次（用户坐回不碰键鼠也能发现）
+    if (m_userAway)
+    {
+        const int secsSince = m_lastAwayRecheckTime.isValid()
+            ? static_cast<int>(m_lastAwayRecheckTime.secsTo(now))
+            : m_cameraAwayRecheckSec;
+        if (secsSince >= m_cameraAwayRecheckSec)
+        {
+            m_lastAwayRecheckTime = now;
+            cameraLog(QStringLiteral("away-recheck: 触发验证"));
+            beginCameraValidation();
+        }
+        return;
+    }
+
+    // 怀疑：idle 超过阈值，且距上次验证 >= 阈值（防止每 tick 重复短开相机）
+    const bool suspicionDue =
+        !m_lastCameraVerifyTime.isValid() ||
+        m_lastCameraVerifyTime.secsTo(now) >= m_cameraVerifyIdleSec;
+    if (idleMs > static_cast<quint32>(m_cameraVerifyIdleSec) * 1000 &&
+        suspicionDue)
+    {
+        m_lastCameraVerifyTime = now;
+        cameraLog(QStringLiteral("suspicion: idleMs=%1 s 触发验证")
+                      .arg(idleMs / 1000));
+        beginCameraValidation();
+        return;
+    }
+
+    // 用户刚有输入（最近 3 秒内）才重置验证计时，避免把"在场"验证后的计时立刻清空导致频繁开相机
+    if (idleMs < 3000)
+        m_lastCameraVerifyTime = QDateTime();
+
+    // 空闲轻度问候（阈值随机 10~20 分钟，避免固定节律的机器感）
+    static bool idleGreetFired = false;
+    if (idleMs > static_cast<quint32>(m_idleGreetThresholdMs) && !idleGreetFired)
+    {
+        idleGreetFired = true;
+        const int secsSinceLastSpeak =
+            m_lastProactiveSpeakTime.isValid()
+                ? static_cast<int>(m_lastProactiveSpeakTime.secsTo(now))
+                : INT_MAX;
+        if (secsSinceLastSpeak >= m_currentCooldownSec)
+            doProactiveSpeak(QString(), QStringLiteral("空闲问候"));
+        // 下次空闲问候阈值随机化（10~20 分钟）
+        m_idleGreetThresholdMs =
+            (10 + QRandomGenerator::global()->bounded(11)) * 60 * 1000;
+    }
+    if (idleMs < 60 * 1000)
+        idleGreetFired = false;
+#else
+    Q_UNUSED(this);
+#endif
+}
+
+/*摄像头不可用时回退的键鼠推断（原逻辑）*/
+void Dialog::checkPresenceByKeyboard(quint32 idleMs)
+{
+#ifdef Q_OS_WIN
+    const QDateTime now = QDateTime::currentDateTime();
 
     // 用户回来检测
     if (m_userAway && idleMs < 3000)
@@ -3487,13 +3790,10 @@ void Dialog::checkProactiveUserPresence()
         m_userAway = false;
         const int secsSinceLastSpeak =
             m_lastProactiveSpeakTime.isValid()
-                ? static_cast<int>(m_lastProactiveSpeakTime.secsTo(
-                      QDateTime::currentDateTime()))
+                ? static_cast<int>(m_lastProactiveSpeakTime.secsTo(now))
                 : INT_MAX;
         if (secsSinceLastSpeak >= m_currentCooldownSec)
-        {
             doProactiveSpeak(QString(), QStringLiteral("用户回来"));
-        }
         return;
     }
 
@@ -3504,30 +3804,202 @@ void Dialog::checkProactiveUserPresence()
         return;
     }
 
-    // 空闲轻度问候（阈值随机 10~20 分钟，避免固定节律的机器感）
+    // 空闲轻度问候（阈值随机 10~20 分钟）
     static bool idleGreetFired = false;
-    if (!m_userAway && idleMs > m_idleGreetThresholdMs && !idleGreetFired)
+    if (!m_userAway && idleMs > static_cast<quint32>(m_idleGreetThresholdMs) &&
+        !idleGreetFired)
     {
         idleGreetFired = true;
         const int secsSinceLastSpeak =
             m_lastProactiveSpeakTime.isValid()
-                ? static_cast<int>(m_lastProactiveSpeakTime.secsTo(
-                      QDateTime::currentDateTime()))
+                ? static_cast<int>(m_lastProactiveSpeakTime.secsTo(now))
                 : INT_MAX;
         if (secsSinceLastSpeak >= m_currentCooldownSec)
-        {
             doProactiveSpeak(QString(), QStringLiteral("空闲问候"));
-        }
-        // 下次空闲问候阈值随机化（10~20 分钟）
         m_idleGreetThresholdMs =
             (10 + QRandomGenerator::global()->bounded(11)) * 60 * 1000;
     }
     if (idleMs < 60 * 1000)
         idleGreetFired = false;
-
 #else
-    Q_UNUSED(this);
+    Q_UNUSED(idleMs);
 #endif
+}
+
+/*初始化摄像头感知：读取配置（检测器仅在启用时创建）*/
+void Dialog::initCameraPerception()
+{
+    ReloadCameraPerceptionConfig();
+}
+
+/*读取摄像头感知配置（设置页变更后重载）*/
+void Dialog::ReloadCameraPerceptionConfig()
+{
+    ZcJsonLib config(JsonSettingPath);
+    m_cameraPerceptionEnabled =
+        config.value("cameraPerception/Enable", false).toBool();
+    m_cameraPerceptionDevice =
+        config.value("cameraPerception/Device").toString();
+    m_cameraVerifyIdleSec =
+        config.value("cameraPerception/VerifyIdleSec", 600).toInt();
+    m_cameraAwayRecheckSec =
+        config.value("cameraPerception/AwayRecheckSec", 180).toInt();
+
+    // 仅在启用时才创建检测器（避免默认关闭时也初始化 COM，防止影响其他功能）
+    if (m_cameraPerceptionEnabled && !m_faceDetector)
+        m_faceDetector = new FaceDetector();
+
+    // 未启用 / 检测器不可用 / 无摄像头 → 回退键鼠推断
+    if (!m_cameraPerceptionEnabled || !m_faceDetector ||
+        !m_faceDetector->isSupported() ||
+        QMediaDevices::videoInputs().isEmpty())
+    {
+        m_cameraFallbackToKeyboard = true;
+        return;
+    }
+    m_cameraFallbackToKeyboard = false;
+}
+
+/*短开摄像头验证：开始突发抓帧 → 人脸检测 → 立即关闭*/
+void Dialog::beginCameraValidation()
+{
+    if (m_cameraVerifying)
+        return;
+    if (!m_faceDetector || !m_faceDetector->isSupported())
+    {
+        m_cameraFallbackToKeyboard = true;
+        return;
+    }
+
+    const QList<QCameraDevice> cameras = QMediaDevices::videoInputs();
+    if (cameras.isEmpty())
+    {
+        m_cameraFallbackToKeyboard = true;
+        return;
+    }
+
+    QCameraDevice dev;
+    if (!m_cameraPerceptionDevice.isEmpty())
+    {
+        for (const QCameraDevice &c : cameras)
+        {
+            if (c.description() == m_cameraPerceptionDevice)
+            {
+                dev = c;
+                break;
+            }
+        }
+    }
+    if (dev.isNull())
+        dev = cameras.first();
+
+    m_presenceCaptureSession = new QMediaCaptureSession(this);
+    m_presenceCamera = new QCamera(dev, this);
+    m_presenceVideoSink = new QVideoSink(this);
+    m_presenceCaptureSession->setCamera(m_presenceCamera);
+    m_presenceCaptureSession->setVideoSink(m_presenceVideoSink);
+    m_cameraVerifying = true;
+    const int seq = ++m_cameraValidateSeq;
+
+    connect(m_presenceVideoSink, &QVideoSink::videoFrameChanged, this,
+            [this, seq](const QVideoFrame &frame)
+            {
+                if (seq != m_cameraValidateSeq)
+                    return;
+                if (!frame.isValid())
+                    return;
+                const QImage img = frame.toImage();
+                if (img.isNull())
+                    return;
+                cameraLog(QStringLiteral("frame: %1x%2")
+                              .arg(img.width())
+                              .arg(img.height()));
+                int count = 0;
+                const bool ok = m_faceDetector->detectFace(img, &count);
+                finishCameraValidation(ok && count > 0);
+            });
+
+    // 安全超时：3 秒内未拿到帧则放弃（按"不确定"处理，不误判离开）
+    m_cameraTimeoutTimer = new QTimer(this);
+    m_cameraTimeoutTimer->setSingleShot(true);
+    m_cameraTimeoutTimer->setInterval(3000);
+    connect(m_cameraTimeoutTimer, &QTimer::timeout, this,
+            [this, seq]()
+            {
+                if (seq != m_cameraValidateSeq)
+                    return;
+                cameraLog(QStringLiteral("timeout: 3s 内无帧，放弃"));
+                finishCameraValidation(false);
+            });
+    m_cameraTimeoutTimer->start();
+
+    cameraLog(QStringLiteral("begin validation: 相机启动 (设备=%1)")
+                  .arg(dev.description()));
+    m_presenceCamera->start();
+}
+
+/*验证结束：按人脸有无决定"离开/回来/在场"*/
+void Dialog::finishCameraValidation(bool facePresent)
+{
+    if (m_presenceCamera)
+    {
+        m_presenceCamera->stop();
+        m_presenceCamera->deleteLater();
+        m_presenceCamera = nullptr;
+    }
+    if (m_presenceCaptureSession)
+    {
+        m_presenceCaptureSession->deleteLater();
+        m_presenceCaptureSession = nullptr;
+    }
+    if (m_presenceVideoSink)
+    {
+        m_presenceVideoSink->deleteLater();
+        m_presenceVideoSink = nullptr;
+    }
+    if (m_cameraTimeoutTimer)
+    {
+        m_cameraTimeoutTimer->stop();
+        m_cameraTimeoutTimer->deleteLater();
+        m_cameraTimeoutTimer = nullptr;
+    }
+    if (!m_cameraVerifying)
+        return;
+    m_cameraVerifying = false;
+
+    const bool wasAway = m_userAway;
+    if (facePresent)
+    {
+        if (wasAway)
+        {
+            // 不碰键鼠坐回来 → 回来问候（受冷却约束）
+            m_userAway = false;
+            m_lastAwayRecheckTime = QDateTime();
+            const int secs = m_lastProactiveSpeakTime.isValid()
+                ? static_cast<int>(m_lastProactiveSpeakTime.secsTo(
+                      QDateTime::currentDateTime()))
+                : INT_MAX;
+            if (secs >= m_currentCooldownSec)
+                doProactiveSpeak(QString(), QStringLiteral("用户回来"));
+        }
+        // 在场（看视频/发呆）→ 不判离开；m_lastCameraVerifyTime 已记录，等下次怀疑间隔重查
+    }
+    else
+    {
+        if (!wasAway)
+        {
+            m_userAway = true;
+            m_lastAwayRecheckTime = QDateTime::currentDateTime();
+        }
+        else
+        {
+            m_lastAwayRecheckTime = QDateTime::currentDateTime();
+        }
+    }
+    cameraLog(QStringLiteral("finish: face=%1 wasAway=%2 -> %3")
+                  .arg(facePresent ? 1 : 0)
+                  .arg(wasAway ? 1 : 0)
+                  .arg(m_userAway ? "离开" : (facePresent && wasAway ? "回来" : "在场")));
 }
 
 /*构建主动对话 Prompt（精简，不包含对话历史）*/
@@ -3626,10 +4098,17 @@ void Dialog::cancelActiveChat()
 }
 
 /*文件拖放到立绘——角色吐槽文件名*/
+/*统一"忙碌"判定：任一轮对话/分类/搜索/视觉/主动对话在途时，不再接受新的输入入口*/
+bool Dialog::isChatBusy() const
+{
+    return m_activeChatAi || m_classifierInFlight || m_searchInFlight ||
+           m_visionInFlight || m_proactiveInFlight;
+}
+
 void Dialog::handleFileDrop(QStringList paths)
 {
-    if (paths.isEmpty() || m_activeChatAi)
-        return; // 正在对话中，不触发
+    if (paths.isEmpty() || isChatBusy())
+        return; // 正在对话/分类/搜索/视觉中，不触发
 
     QStringList names;
     for (const QString &p : paths) {
@@ -3649,7 +4128,7 @@ void Dialog::initClipboardMonitor()
 {
     QClipboard *clipboard = QGuiApplication::clipboard();
     connect(clipboard, &QClipboard::dataChanged, this, [this]() {
-        if (m_clipboardCooldown || m_activeChatAi || m_isSpeechRecording)
+        if (m_clipboardCooldown || isChatBusy() || m_isSpeechRecording)
             return;
         const QMimeData *mime = QGuiApplication::clipboard()->mimeData();
         if (!mime || !mime->hasText())

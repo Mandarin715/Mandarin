@@ -18,6 +18,7 @@ class SettingChild_General : public QWidget
 
   signals:
     void generalConfigChanged(); //通知主窗口刷新通用配置
+    void cameraPerceptionConfigChanged(); //通知主窗口刷新摄像头感知配置
 
   private slots:
     void on_spinBox_DialogWidth_valueChanged(int arg1);
@@ -26,6 +27,8 @@ class SettingChild_General : public QWidget
     void on_lineEdit_Location_textChanged(const QString &arg1);
     void on_ToggleSwitch_ProactiveEnable_toggled(bool checked);
     void on_spinBox_ProactiveCooldown_valueChanged(int value);
+    void on_ToggleSwitch_CameraPerceptionEnable_toggled(bool checked);
+    void on_comboBox_CameraDevice_currentTextChanged(const QString &text);
 
   private:
     Ui::SettingChild_General *ui;

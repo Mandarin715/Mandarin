@@ -94,6 +94,8 @@ MainWindow::MainWindow(Dialog *dialog, Tachie *tachie, QWidget *parent)
             dialog, &Dialog::ReloadAppLauncherConfig); //刷新应用调用配置
     connect(settingchild_generalWin, &SettingChild_General::generalConfigChanged,
             dialog, &Dialog::ReloadGeneralConfig); //刷新通用配置
+    connect(settingchild_generalWin, &SettingChild_General::cameraPerceptionConfigChanged,
+            dialog, &Dialog::ReloadCameraPerceptionConfig); //刷新摄像头感知配置
 }
 
 MainWindow::~MainWindow()

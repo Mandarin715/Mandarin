@@ -3,6 +3,7 @@
 
 #include "AiProvider.h"
 #include "../../utils/SearchProvider.h"
+#include "../../utils/FaceDetector.h"
 #include "ZcJsonLib.h"
 #include <QDateTime>
 #include <QEvent>
@@ -12,6 +13,11 @@
 #include <QSet>
 #include <QStringList>
 #include <QTimer>
+#include <atomic>
+
+class QCamera;
+class QVideoSink;
+class QMediaCaptureSession;
 #include <QWidget>
 
 class QAudioOutput;
@@ -47,6 +53,7 @@ class Dialog : public QWidget
     void ReloadGeneralConfig();
     void ReloadSpeechInputConfig();
     void ReloadScreenCaptureConfig();
+    void ReloadCameraPerceptionConfig();
     void ReloadSearchConfig();
     void ReloadAppLauncherConfig();
     void ReloadContinuousHotkeyConfig();
@@ -201,6 +208,8 @@ class Dialog : public QWidget
     // 离线语音识别
     OfflineSpeechRecognizer *m_speechRecognizer = nullptr;
     void initSpeechRecognizer();
+    void applyRecognizedText(const QString &recognizedText); // 识别结果过滤/上屏/自动发送
+    std::atomic_bool m_asrBusy{false}; // 工作线程识别在途，防并发/防误删
     // 语音唤醒
     WakeWordDetector *m_wakeWordDetector = nullptr;
     bool m_wakeWordEnabled = false;
@@ -228,6 +237,7 @@ class Dialog : public QWidget
     void showVisionFailureMessage(const QString &message); // 视觉分析失败：显式报错，不再静默转聊天
     static QStringList screenCaptureTriggerKeywords();
     bool doSubmitCurrentInput(const QString &userInput);
+    bool isChatBusy() const; // 任一轮对话/分类/搜索/视觉/主动对话在途
     // 主动对话
     QTimer *m_proactiveTimer = nullptr;
     QDateTime m_lastProactiveSpeakTime;
@@ -267,6 +277,26 @@ class Dialog : public QWidget
     void checkProactiveUserPresence();
     bool doProactiveSpeak(const QString &windowTitle, const QString &contextHint,
                           bool forced = false, bool isReminder = false);
+
+    // 摄像头感知（v1 仅 Windows：平时摄像头关，仅"怀疑"短开验证人脸）
+    FaceDetector *m_faceDetector = nullptr;
+    bool m_cameraPerceptionEnabled = false;
+    QString m_cameraPerceptionDevice;   // 所选摄像头描述（空=自动选第一个）
+    int m_cameraVerifyIdleSec = 600;    // 怀疑阈值：无输入秒数触发验证
+    int m_cameraAwayRecheckSec = 180;   // 离开期间短检间隔
+    bool m_cameraFallbackToKeyboard = false; // 摄像头不可用/被拒 → 回退键鼠推断
+    bool m_cameraVerifying = false;     // 正在短开相机验证
+    QCamera *m_presenceCamera = nullptr;
+    QVideoSink *m_presenceVideoSink = nullptr;
+    QMediaCaptureSession *m_presenceCaptureSession = nullptr;
+    QTimer *m_cameraTimeoutTimer = nullptr; // 验证突发安全超时（3s 无帧则放弃）
+    int m_cameraValidateSeq = 0;        // 校验序号，防过期回调
+    QDateTime m_lastCameraVerifyTime;   // 上次验证时间（怀疑间隔 gating）
+    QDateTime m_lastAwayRecheckTime;    // 离开期间上次短检时间
+    void initCameraPerception();
+    void checkPresenceByKeyboard(quint32 idleMs); // 摄像头不可用时回退键鼠推断
+    void beginCameraValidation();
+    void finishCameraValidation(bool facePresent);
 
     // 联网搜索
     SearchProvider *m_searchProvider = nullptr;
