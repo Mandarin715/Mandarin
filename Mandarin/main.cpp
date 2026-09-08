@@ -12,6 +12,7 @@
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QNetworkProxy>
 #include <QPalette>
 #include <QStandardPaths>
 #include <QSystemTrayIcon>
@@ -103,6 +104,10 @@ int main(int argc, char *argv[])
     qputenv("QT_QPA_PLATFORM", "xcb");
 #endif
     QApplication a(argc, argv);
+
+    // 桌宠调用的均为国内 API（DeepSeek/Kimi/百度）+ 本地 VITS，绕过系统代理：
+    // 否则系统代理（如 Clash）一开一关/挂掉就会让聊天、视觉、主动对话全部请求失败。
+    QNetworkProxy::setApplicationProxy(QNetworkProxy(QNetworkProxy::NoProxy));
 
     // Keep text readable on all platforms when system uses dark mode.
     QPalette labelPalette = a.palette();
