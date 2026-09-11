@@ -342,5 +342,17 @@ if(BUILD_TESTING)
         Qt${QT_VERSION_MAJOR}::Test
         Qt${QT_VERSION_MAJOR}::Core
     )
+    # 测试产物输出到独立目录，避免 test_chatlogstore.exe / Qt6Test.dll 落进
+    # Release 打包目录而被误打进便携包；同时把所需 Qt DLL 拷到测试目录以便运行。
+    set_target_properties(test_chatlogstore PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_custom_command(TARGET test_chatlogstore POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Test>"
+            "$<TARGET_FILE_DIR:test_chatlogstore>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Core>"
+            "$<TARGET_FILE_DIR:test_chatlogstore>"
+    )
     add_test(NAME test_chatlogstore COMMAND test_chatlogstore)
 endif()
