@@ -87,6 +87,7 @@ Documents/Mandarin/
 
 - **Windows**: CMake + MSVC 2022，构建目录 `build/`（旧，Release）和 `build2/`（当前，Debug + Release）
 - **启动桌宠**: 运行 `build2/Release/启动.bat`（自动 cd 到正确目录 → 查找 vits-simple-api 并后台拉起语音服务 → 启动 `Mandarin.exe`；找不到语音服务则纯文本模式）。**不要直接运行 exe、不要从其他目录启动**
+- **⚠️ AI 不要自动启动桌宠**：构建/验证完即可，**启动由用户自己来**。AI 只在用户明确要求时才运行 `启动.bat`；不要为了"验证"或"方便"擅自拉起。（需要验证编译结果时用构建产物存在性/报错来判断，不必启动 GUI）
 - **跨平台**: 同时支持 macOS（Bundle）和 Linux（X11）
 - **CI**: GitHub Actions，Inno Setup 打包
 - **当前版本**: v1.12.0（CMakeLists/Version.h 为准；`build2/Release/Mandarin-v1.12.0-portable.zip` 为最新打包产物）

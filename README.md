@@ -76,7 +76,8 @@
 - [x] 本地应用调用
 - [x] 联网搜索
 - [x] 主动对话
-- [ ] 视觉感知
+- [x] 日程提醒
+- [x] 视觉感知（摄像头人脸检测，实验性，默认关闭）
 - [x] 内心独白
 - [x] 聊天记录持久化
 - [ ] live2D模型支持
@@ -121,22 +122,22 @@
 
 > 仅文字对话可跳过此步。开启后桌宠会自动判断是否需要联网查询。
 
-1. 申请搜索 API（任选一个）：
+1. 申请搜索 API：
    - [百度千帆 AI 搜索](https://console.bce.baidu.com/qianfan/ais/console/applicationConsole/application) — 免费额度，国内首选
-   - [SearXNG](https://docs.searxng.org/) — 自部署，无限制
-   - [Bing Web Search](https://portal.azure.com/) — Azure 订阅
-   - [SerpAPI](https://serpapi.com/) — 付费，稳定
+   - [SearXNG](https://docs.searxng.org/) — 自部署，无限制（在「自定义」中填 Base URL 即可）
 2. 设置 → 「联网搜索」→ 填入 API Key / Base URL
-3. 对话中直接说"帮我搜一下xxx"即可触发
+3. 对话中直接说"帮我搜一下xxx"即可触发（也可直接用自然语言提问，桌宠会自动判断是否需要联网）
 
 ### Step 5：屏幕识别（可选）
 
 > 桌宠可以"看到"你的屏幕内容并和你讨论。
 
-1. 申请 [Kimi 视觉模型 API Key](https://platform.moonshot.cn/)（默认，推荐）
-2. 或使用 OpenAI 兼容的视觉 API（如 GPT-4V）
-3. 设置 → 「屏幕捕获」→ 填入 API Key
-4. 对话中说"看看屏幕"或点击截图按钮触发
+1. 选一个视觉模型服务商（设置 → 「屏幕捕获」→ 服务商下拉）：
+   - **DeepSeek 视觉** — 国内可用，推荐
+   - **Kimi（Moonshot）** — 视觉模型请选当前可用型号（如 `kimi-k2.6`；旧的 `moonshot-v1-*-vision-preview` 已废弃）
+   - **OpenAI**（如 `gpt-4o-mini`）或任意 OpenAI 兼容的视觉 API（选 Custom 填 Base URL）
+2. 填入对应服务商的 API Key（与对话模型的 Key 分开配置）
+3. 对话中说"看看屏幕"或点击截图按钮触发
 
 ### Step 6：应用调用（可选）
 
