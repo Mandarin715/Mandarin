@@ -170,12 +170,11 @@ static int findNextSentenceEnd(const QString &text, int start)
     return -1;
 }
 
-// 需要附加本地城市名的查询关键词
+// 需要附加本地城市名的查询关键词（只保留真正依赖地理位置的词；
+// "今天/现在/当前/实时/新闻"等通用时效词不算，否则会把城市误加进无关查询）
 static const QStringList kLocationDependentKeywords = {
-    QStringLiteral("天气"), QStringLiteral("新闻"), QStringLiteral("附近"),
-    QStringLiteral("本地"), QStringLiteral("周边"), QStringLiteral("今天"),
-    QStringLiteral("今日"), QStringLiteral("现在"), QStringLiteral("当前"),
-    QStringLiteral("实时"), QStringLiteral("房价"), QStringLiteral("招聘"),
+    QStringLiteral("天气"), QStringLiteral("附近"), QStringLiteral("本地"),
+    QStringLiteral("周边"), QStringLiteral("房价"), QStringLiteral("招聘"),
     QStringLiteral("外卖"), QStringLiteral("快递"), QStringLiteral("美食"),
     QStringLiteral("医院"), QStringLiteral("银行"), QStringLiteral("药店"),
     QStringLiteral("超市"), QStringLiteral("商场"), QStringLiteral("电影院"),
@@ -1616,29 +1615,55 @@ void Dialog::tryStartNextVitsPlayback()
              << "| muted:" << m_vitsAudioOutput->isMuted();
 }
 
-/*本地启发式：输入是否"可能"需要联网搜索。
-  用于跳过每轮一次的 LLM 意图分类——纯闲聊/情绪表达直接走对话，省掉一次往返。*/
-static bool looksLikeSearchIntent(const QString &input)
+/*极窄的"纯寒暄"白名单：只有这些才跳过 AI 搜索意图分类、直接走对话。
+  其余全部交给分类器判定（更智能；代价是每条消息多一次 LLM 往返）。*/
+static bool isTrivialChitchat(const QString &input)
 {
     const QString t = input.trimmed();
-    if (t.size() < 4) // "嗯""哈哈"之类不搜
+    if (t.isEmpty() || t.size() > 12) // 稍长的一律交给分类器
         return false;
-    static const QStringList kHints = {
-        QStringLiteral("什么"),   QStringLiteral("怎么"),   QStringLiteral("为什么"),
-        QStringLiteral("哪"),     QStringLiteral("谁"),     QStringLiteral("多少"),
-        QStringLiteral("几"),     QStringLiteral("何时"),   QStringLiteral("今天"),
-        QStringLiteral("现在"),   QStringLiteral("最近"),   QStringLiteral("最新"),
-        QStringLiteral("目前"),   QStringLiteral("当前"),   QStringLiteral("实时"),
-        QStringLiteral("天气"),   QStringLiteral("新闻"),   QStringLiteral("价格"),
-        QStringLiteral("多少钱"), QStringLiteral("怎么样"), QStringLiteral("有没有"),
-        QStringLiteral("是不是"), QStringLiteral("什么时候"), QStringLiteral("在哪"),
-        QStringLiteral("推荐"),   QStringLiteral("怎么办")};
-    for (const QString &h : kHints)
+    static const QStringList kChitchat = {
+        QStringLiteral("你好"),   QStringLiteral("您好"),   QStringLiteral("在吗"),
+        QStringLiteral("在么"),   QStringLiteral("在不在"), QStringLiteral("早"),
+        QStringLiteral("早安"),   QStringLiteral("早上好"), QStringLiteral("中午好"),
+        QStringLiteral("下午好"), QStringLiteral("晚上好"), QStringLiteral("晚安"),
+        QStringLiteral("哈哈"),   QStringLiteral("哈哈哈"), QStringLiteral("嗯"),
+        QStringLiteral("嗯嗯"),   QStringLiteral("哦"),     QStringLiteral("噢"),
+        QStringLiteral("唉"),     QStringLiteral("谢谢"),   QStringLiteral("谢谢你"),
+        QStringLiteral("感谢"),   QStringLiteral("好的"),   QStringLiteral("好呀"),
+        QStringLiteral("行"),     QStringLiteral("可以"),   QStringLiteral("拜拜"),
+        QStringLiteral("再见"),   QStringLiteral("嘿嘿"),   QStringLiteral("嘻嘻"),
+        QStringLiteral("么么"),   QStringLiteral("抱抱"),   QStringLiteral("辛苦了"),
+        QStringLiteral("没事"),   QStringLiteral("算了")};
+    for (const QString &w : kChitchat)
     {
-        if (t.contains(h))
+        if (t == w)
             return true;
     }
-    return t.contains(QLatin1Char('?')) || t.contains(QChar(0xFF1F));
+    // 纯标点/空白也算寒暄
+    for (const QChar &c : t)
+    {
+        if (!c.isPunct() && !c.isSpace())
+            return false;
+    }
+    return true;
+}
+
+/*否定/不满表达：用于"上一轮是搜索"时自动重搜（纯规则，不调 LLM）*/
+static bool isNegationAboutLast(const QString &input)
+{
+    static const QStringList kNeg = {
+        QStringLiteral("不对"),   QStringLiteral("不是"),   QStringLiteral("错了"),
+        QStringLiteral("过时"),   QStringLiteral("旧的"),   QStringLiteral("旧消息"),
+        QStringLiteral("早换"),   QStringLiteral("换了"),   QStringLiteral("不准"),
+        QStringLiteral("假的"),   QStringLiteral("重新"),   QStringLiteral("换个"),
+        QStringLiteral("最新的"), QStringLiteral("搜新的")};
+    for (const QString &w : kNeg)
+    {
+        if (input.contains(w))
+            return true;
+    }
+    return false;
 }
 
 /*提交当前输入*/
@@ -1808,12 +1833,17 @@ bool Dialog::submitCurrentInput()
         }
         if (searchTriggered)
         {
-            const QString searchQuery = extractSearchQuery(userInput);
+            QString searchQuery = extractSearchQuery(userInput);
+            // 追问式重搜（如"你再搜搜""重新搜"）：提取不出有效词就沿用上次搜索词
+            if (searchQuery.size() <= 2 && !m_lastSearchQuery.isEmpty())
+                searchQuery = m_lastSearchQuery;
             // 如果提取的查询就是触发词本身（如只输入"搜索"），降级为普通对话
             if (!searchQuery.isEmpty() &&
                 !searchTriggerKeywords().contains(searchQuery))
             {
                 m_lastUserInput = userInput;
+                m_lastSearchQuery = searchQuery;
+                m_lastTurnWasSearch = true;
                 ui->textEdit->setText(
                     QStringLiteral("正在搜索：%1……").arg(searchQuery));
                 executeSearch(searchQuery, userInput);
@@ -1848,15 +1878,31 @@ bool Dialog::submitCurrentInput()
         }
     }
 
-    // AI 搜索意图分类：无显式关键词时，仅对"疑似需要实时信息"的输入才让 AI 判断是否需要搜索，
-    // 纯闲聊直接走对话，省掉每轮一次的 LLM 往返（延迟/费用减半）。
+    // 否定重搜：上一轮是搜索 + 用户表示否定/不满 → 直接重搜上次查询（附"最新"偏向新结果）
+    if (m_searchEnabled && m_searchProvider->isEnabled() && !m_searchInFlight &&
+        m_lastTurnWasSearch && !m_lastSearchQuery.isEmpty() &&
+        isNegationAboutLast(userInput))
+    {
+        QString q = m_lastSearchQuery;
+        if (!q.contains(QStringLiteral("最新")))
+            q += QStringLiteral(" 最新");
+        m_lastUserInput = userInput;
+        m_lastSearchQuery = q;
+        m_lastTurnWasSearch = true;
+        ui->textEdit->setText(QStringLiteral("正在重新搜索：%1……").arg(q));
+        executeSearch(q, userInput);
+        return true;
+    }
+
+    // AI 搜索意图分类：除"纯寒暄"外都交给分类器判定（更智能；代价是每条多一次 LLM 往返）
     if (m_searchEnabled && m_searchProvider->isEnabled() &&
-        !m_classifierInFlight && looksLikeSearchIntent(userInput))
+        !m_classifierInFlight && !isTrivialChitchat(userInput))
     {
         classifyAndSearch(userInput);
         return true;
     }
 
+    m_lastTurnWasSearch = false; // 本轮为普通对话
     return doSubmitCurrentInput(userInput);
 }
 
@@ -2772,6 +2818,10 @@ QStringList Dialog::searchTriggerKeywords()
         QStringLiteral("查查"),     QStringLiteral("搜索"),
         QStringLiteral("上网搜"),   QStringLiteral("搜搜看"),
         QStringLiteral("网上查查"), QStringLiteral("百度一下"),
+        // 追问式重新搜索："你再搜搜" / "重新搜一下" / "再查查"
+        QStringLiteral("再搜"),     QStringLiteral("搜搜"),
+        QStringLiteral("重新搜"),   QStringLiteral("再查"),
+        QStringLiteral("重新查"),
     };
     return triggers;
 }
@@ -3212,13 +3262,17 @@ void Dialog::classifyAndSearch(const QString &userInput)
         "- 纯聊天：问候、心情、日常闲聊\n"
         "- 通用知识：数学、物理、编程语法、历史常识\n"
         "- 翻译、写作、建议等不需要实时数据的请求\n"
-        "严格只回复一行，格式：NO 或 YES|搜索关键词\n"
+        "需要先反问（ASK）：用户想搜，但**没说清搜索主题/对象**"
+        "（如只问\"现在卡池是谁\"却没说哪个游戏）\n"
+        "严格只回复一行，格式：NO 或 YES|搜索关键词 或 ASK|反问\n"
         "示例：\n"
         "今天天气 → YES|天气\n"
         "你好 → NO\n"
         "介绍一下原神 → YES|原神 介绍\n"
         "Python列表怎么用 → NO\n"
-        "最近有什么好玩的游戏 → YES|热门游戏推荐"));
+        "最近有什么好玩的游戏 → YES|热门游戏推荐\n"
+        "现在卡池是谁 → ASK|哪个游戏的卡池呢？\n"
+        "原神现在卡池是谁 → YES|原神 卡池"));
 
     classifier->chat(userInput);
 
@@ -3278,6 +3332,8 @@ void Dialog::classifyAndSearch(const QString &userInput)
                             }
                         }
 
+                        m_lastSearchQuery = searchQuery;
+                        m_lastTurnWasSearch = true;
                         ui->textEdit->setText(
                             QStringLiteral("正在搜索：%1……").arg(searchQuery));
                         executeSearch(searchQuery, userInput);
@@ -3285,7 +3341,28 @@ void Dialog::classifyAndSearch(const QString &userInput)
                     }
                 }
 
+                if (trimmed.startsWith("ASK", Qt::CaseInsensitive))
+                {
+                    // 缺搜索主题 → 走正常对话管线，让角色用自己的语气反问（带语音/立绘/独白）
+                    QString hint;
+                    const int pipe = trimmed.indexOf('|');
+                    if (pipe >= 0)
+                        hint = trimmed.mid(pipe + 1).trimmed();
+                    m_lastUserInput = userInput;
+                    m_lastTurnWasSearch = false;
+                    QString msg = userInput +
+                        QStringLiteral("\n\n[系统提示] 用户想让你联网搜索，但没说清搜索主题。"
+                                       "请用一句话（15字内）、以你的角色语气反问确认要搜什么，"
+                                       "不要直接回答、也不要编造内容。");
+                    if (!hint.isEmpty())
+                        msg += QStringLiteral("（可参考这样问：") + hint +
+                               QStringLiteral("）");
+                    doSubmitCurrentInput(msg);
+                    return;
+                }
+
                 // 不需要搜索，走正常对话
+                m_lastTurnWasSearch = false;
                 doSubmitCurrentInput(userInput);
             });
 
@@ -3295,6 +3372,7 @@ void Dialog::classifyAndSearch(const QString &userInput)
                 classifier->deleteLater();
                 m_classifierInFlight = false;
                 // 分类器出错，降级为正常对话
+                m_lastTurnWasSearch = false;
                 doSubmitCurrentInput(userInput);
             });
 }

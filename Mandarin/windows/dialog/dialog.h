@@ -304,6 +304,8 @@ class Dialog : public QWidget
     bool m_searchAutoSearch = false;
     bool m_searchInFlight = false;
     QString m_pendingSearchUserMessage;
+    QString m_lastSearchQuery; // 上次搜索词（供"再搜搜"这类追问式重搜沿用）
+    bool m_lastTurnWasSearch = false; // 上一轮是否由搜索触发（供否定重搜）
     void executeSearch(const QString &query, const QString &userMessage);
     static QStringList searchTriggerKeywords();
     static QString extractSearchQuery(const QString &userInput);
