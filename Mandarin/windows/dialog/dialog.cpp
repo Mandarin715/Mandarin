@@ -4275,7 +4275,7 @@ bool Dialog::tryParseSchedule(const QString &input, Schedule &out) const
     // 绝对时间：今天/明天/后天/大后天 + 时段 + N点N分
     else {
         const QRegularExpression timeRe(
-            QStringLiteral("(今天|明天|后天|大后天|早上|上午|中午|下午|晚上|凌晨)?"
+            QStringLiteral("(今天|明天|后天|大后天|早上|上午|中午|下午|傍晚|晚上|凌晨)?"
                            "\\s*((?:[0-9]{1,2}|[一二三四五六七八九十两]{1,3}))"
                            "\\s*(?:点|时)(?:\\s*((?:[0-9]{1,2}|[一二三四五六七八九十两]{1,3}))分?)?"));
         const QRegularExpressionMatch m = timeRe.match(lower);
@@ -4290,9 +4290,15 @@ bool Dialog::tryParseSchedule(const QString &input, Schedule &out) const
 
         int hour = parseNumText(m.captured(2));
         const int minute = m.captured(3).isEmpty() ? 0 : parseNumText(m.captured(3));
-        // 下午/晚上 且 小时 < 12 → +12（24小时制；凌晨/早上/上午/中午不调整）
-        if ((dayWord == QStringLiteral("下午") ||
-             dayWord == QStringLiteral("晚上")) && hour < 12)
+        const bool explicitPm = (dayWord == QStringLiteral("下午") ||
+                                 dayWord == QStringLiteral("晚上") ||
+                                 dayWord == QStringLiteral("傍晚"));
+        const bool explicitAm = (dayWord == QStringLiteral("早上") ||
+                                 dayWord == QStringLiteral("上午") ||
+                                 dayWord == QStringLiteral("凌晨") ||
+                                 dayWord == QStringLiteral("中午"));
+        // 下午/傍晚/晚上 且 小时 < 12 → +12（24小时制；凌晨/早上/上午/中午不调整）
+        if (explicitPm && hour < 12)
             hour += 12;
 
         QDate d = QDate::currentDate().addDays(dayOffset);
@@ -4301,8 +4307,15 @@ bool Dialog::tryParseSchedule(const QString &input, Schedule &out) const
             const int daysAhead = (targetDow - d.dayOfWeek() + 7) % 7;
             d = d.addDays(daysAhead);
         }
+        const QDateTime now0 = QDateTime::currentDateTime();
         target = QDateTime(d, QTime(hour, minute));
-        if (target <= QDateTime::currentDateTime()) {
+        // 裸小时（未说上午/下午）：若按"上午"算今天已过，则大概率指当天下午/晚上同一钟点
+        if (!explicitPm && !explicitAm && hour < 12 && target <= now0) {
+            const QDateTime pmSameDay(d, QTime(hour + 12, minute));
+            if (pmSameDay > now0)
+                target = pmSameDay;
+        }
+        if (target <= now0) {
             if (targetDow > 0)
                 target = target.addDays(7);        // 本周已过 → 下周
             else if (repeatSec > 0)
