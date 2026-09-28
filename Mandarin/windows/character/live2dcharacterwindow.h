@@ -78,11 +78,27 @@ class Live2DCharacterWindow : public CharacterWindowBase
        20 次 × 150ms ≈ 3s > 一个循环，够把动作走满一遍；只做一次布局，成本可接受。*/
     static constexpr int kProbeSamples = 20;
     static constexpr int kProbeSampleIntervalMs = 150;
-    /*人物高度目标占比：留出 (1-ratio)/2 的上下余量。
-       0.84 → 上下各 8% 余量，人物在屏幕上的尺寸只比原来小 16%，同时杜绝边缘裁切。
+    /*人物目标占比：**横竖同一个值**，于是画布四边留出 (1-ratio)/2 的余量。
+       0.84 → 四边各 8% 余量，人物在屏幕上的尺寸只比"贴边铺满"小 16%，同时杜绝边缘裁切。
+       为什么横竖必须同值：画布宽高比取的是人物真实宽高比，两个方向的余量才会一样宽；
+       以前只盯纵向（横向占比 = 纵向占比 × 人物宽高比，实测只有 0.36），
+       人物就缩在画布中间、两侧空出一大片。
        （取 0.84 而不是贴着 0.88：探针是在一段动作上求并集，真实帧的姿势仍会有
        几个像素的出入，余量要留得比"刚好"更宽一点才稳。）*/
-    static constexpr double kTargetFigureHeightRatio = 0.84;
+    static constexpr double kTargetFigureRatio = 0.84;
+    /*实测校正：最多做几轮"量占比 → 按比例修正"。
+       两个方向的缩放在渲染器里是**解耦**的（横向 fitX 不影响纵向几何），按比例修正一次
+       就是精确解，所以正常情况第一轮就收敛；留到两轮只是兜底（例如首帧渲染与测量之间
+       姿势恰好跳了一下）。绝不允许更多轮：再多只会在两个解之间来回摆。*/
+    static constexpr int kMaxCorrectionRounds = 2;
+    /*判定"占比已经到位"的容差（占画布的比例）*/
+    static constexpr double kCorrectionTolerance = 0.02;
+    /*一次测量取几帧求并集、帧间隔多少毫秒。
+       为什么要并集：待机动作/呼吸会让姿势移动，单帧包围盒可能恰好偏松，按它校正会把
+       人物放得比"整段动作都装得下"更大，动作一摆就贴边。取 2 帧（间隔 120ms）是
+       成本与稳健性的折中：多渲一帧约几毫秒，比裁掉人物便宜得多。*/
+    static constexpr int kMeasuredFramePasses = 2;
+    static constexpr int kMeasuredFrameIntervalMs = 120;
     static constexpr int kRegionRefreshInterval = 10;
     static constexpr int kDefaultFps = 60;
     static constexpr int kMinFps = 5;
@@ -93,8 +109,12 @@ class Live2DCharacterWindow : public CharacterWindowBase
     static constexpr double kMaxScreenHeightRatio = 0.85; //逻辑窗口高度上限：可用屏高的 85%
     static constexpr double kMinCanvasSide = 32;
     static constexpr double kMaxCanvasSide = 8192;
+    static constexpr double kMinDisplayRatio = 0.05;
+    static constexpr double kMaxDisplayRatio = 1.0;
+    /*人物宽高比的可用范围：探针彻底失败时才用兜底值（3:4）*/
+    static constexpr double kMinFigureAspect = 0.05;
+    static constexpr double kMaxFigureAspect = 20.0;
     static constexpr double kFallbackFigureAspect = 3.0 / 4.0; //探针失败时的兜底宽高比
-    static constexpr double kFallbackHeightRatio = kTargetFigureHeightRatio;
 
     void onFrameTick();              //定时器回调：渲染一帧并登记
     void refreshInteractiveRegion(); //低频重算交互区（构建 QBitmap 很贵，不能每帧做）
@@ -112,8 +132,13 @@ class Live2DCharacterWindow : public CharacterWindowBase
     void applyRenderScaleFromConfig();
 
     /*探针渲染：量出人物可见范围在绘制输出空间里的跨度（见 Live2DOffscreenRenderer::
-      probeFigureMetrics），据此定画布宽高比与显示比例。*/
+      probeFigureMetrics），据此定画布宽高比与目标占比。*/
     void probeFigureMetrics();
+
+    /*量当前画布上人物实际占多少（横/竖各一个 0~1 的比例）。
+      在 kMeasuredFramePasses 个真实帧上求包围盒并集，避免"单帧偏松"把人物放大到贴边。
+      量与校正都不依赖任何解析换算 —— 这是「人物必须真的填满画布」唯一的可信依据。*/
+    bool measureFigureOccupancy(double *fractionX, double *fractionY);
 
     /*量当前登记帧（m_scaledImg，物理像素）里人物可见部分的包围盒。
       layout 时用它实测校正显示比例，不依赖解析换算。*/
@@ -135,14 +160,18 @@ class Live2DCharacterWindow : public CharacterWindowBase
     bool m_renderingFrame = false;
 
     /*人物几何（探针实测）
-      m_figureAspect：人物可见范围在**目标画布比例**下的宽/高。画布按它定宽高比，
-      人物才不会横向溢出。
-      m_figureSpanY：人物可见范围在**探针（1:1）比例**下的高度跨度。渲染器的缩放是在
-      探针空间里算的，所以显示比例要用它，见 relayoutContent。
-      m_displayRatio：人物高度占画布高度的目标比例，交给渲染器 setDisplayHeightRatio。*/
+      m_figureAspect：人物**真实**宽高比（宽/高），画布就取这个宽高比 ——
+      这样人物在四个方向留一样宽的余量，也不会被拉伸。
+      m_figureSpanX / m_figureSpanY：人物可见范围在**自然缩放**的输出空间里的宽/高跨度。
+      渲染器的摆放缩放是 fit = 2*目标占比/跨度，所以这两个值要跟探针同一把尺子（见
+      Live2DOffscreenRenderer::probeFigureMetrics）。
+      m_displayRatioX / m_displayRatioY：人物在画布 x/y 方向各占的目标比例，交给
+      setDisplayRatios。两个方向分别给是"不拉伸还占满"的必要条件（见渲染器头注释）。*/
     double m_figureAspect = kFallbackFigureAspect;
-    double m_figureSpanY = kFallbackHeightRatio;
-    double m_displayRatio = kFallbackHeightRatio;
+    double m_figureSpanX = 2.0;
+    double m_figureSpanY = 2.0;
+    double m_displayRatioX = kTargetFigureRatio;
+    double m_displayRatioY = kTargetFigureRatio;
 
     /*最近一帧对应的**逻辑**画布尺寸。
       为什么不实时用 m_scaledImg.size()/dpr 推：窗口一旦映射到屏幕，devicePixelRatioF()

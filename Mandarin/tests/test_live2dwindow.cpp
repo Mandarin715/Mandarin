@@ -49,6 +49,7 @@ class TestLive2DWindow : public QObject
     void shapesWindowFromRenderedModel();
     void animatesAcrossFrames();
     void keepsWholeFigureInsideCanvas();
+    void fillsFrameInBothAxes();
     void loadsModelByDirectoryName();
     void reportsFullPipelineFrameCost();
 
@@ -678,6 +679,107 @@ void TestLive2DWindow::keepsWholeFigureInsideCanvas()
                             .arg(figure.height())));
 }
 
+/*「人物到底有没有把画布填满」——这条测试钉住 Bug C（画布宽度按**被污染的探针宽高比**定，
+   于是画布比人物宽 2.2~2.35 倍：人物只占画布宽度的 36~38%，左右各空出约 250 逻辑像素）。
+
+   观察量：真实渲染帧里 alpha 包围盒占**画布宽度**与**画布高度**的比例。
+   高度占比本来就被 relayoutContent 的「实测校正」钉在 0.84 上（所以光看高度永远发现不了
+   这个 bug），必须在宽度方向也断言。判据取 60%：远高于修复前的 36~38%（一定失败），
+   又比目标 84% 松一截，给不同模型/不同姿势留余量。
+
+   为什么对**本机所有模型**都跑（atri / miku / 樱花miku）：画布宽高比来自探针度量，
+   这个 bug 对所有模型都成立，只在 miku 上测会漏掉"换了模型又不灵"（miku 双马尾横向铺开，
+   症状本来就轻一些）。顺带把每个模型的窗口抓图存成 window-grab-<模型名>.png ——
+   本项目不许自动启动桌宠，抓图是人工目视"人物是否填满画面"的唯一证据。*/
+void TestLive2DWindow::fillsFrameInBothAxes()
+{
+    static const char *const kModels[] = {"atri", "miku", "樱花miku"};
+
+    int checked = 0;
+    for (const char *rawName : kModels)
+    {
+        const QString modelName = QString::fromUtf8(rawName);
+        const QString dir = modelDirFor(modelName);
+        if (!QFileInfo::exists(dir))
+        {
+            qInfo("跳过 %s（本机没有该模型目录，禁二传不入库）", rawName);
+            continue;
+        }
+
+        Live2DCharacterWindow window;
+        window.reloadContent(modelName);
+        QVERIFY2(window.isModelLoaded(),
+                 qPrintable(QStringLiteral("模型 %1 装载失败，无法验证画布填充").arg(modelName)));
+
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        QCoreApplication::processEvents();
+
+        // 冻住帧循环后再自己渲一帧：保证「量的帧」就是布局校正之后的那一帧
+        window.hide();
+        QCoreApplication::processEvents();
+        QVERIFY2(window.renderFrameNow(), "渲染失败，无法量画布填充");
+
+        const QSize logical = window.contentSize();
+        QVERIFY2(!logical.isEmpty(), "contentSize() 为空");
+        const QImage frame = window.renderedImage();
+        QVERIFY2(!frame.isNull(), "渲染帧为空");
+
+        QRect bounds;
+        QVERIFY2(opaqueBounds(frame, 32, &bounds), "渲染帧里没有任何不透明像素");
+
+        // 渲染帧是**物理**像素，画布是**逻辑**像素：两者只差一个统一比例，按比例折回画布坐标。
+        const double toLogical = static_cast<double>(logical.width()) / frame.width();
+        const double figureWidth = bounds.width() * toLogical;
+        const double figureHeight = bounds.height() * toLogical;
+        const double occupancyWidth = figureWidth / logical.width();
+        const double occupancyHeight = figureHeight / logical.height();
+
+        qInfo("画布填充验证[%s]：逻辑画布=%dx%d，渲染帧=%dx%d，人物包围盒(帧像素)=%d,%d %dx%d "
+              "→ 画布内人物=%.1fx%.1f，**宽度占比=%.4f**，高度占比=%.4f",
+              rawName, logical.width(), logical.height(), frame.width(), frame.height(), bounds.x(),
+              bounds.y(), bounds.width(), bounds.height(), figureWidth, figureHeight,
+              occupancyWidth, occupancyHeight);
+
+        // 抓图：人工目视证据
+        const QPixmap grabbed = window.grab();
+        QVERIFY2(!grabbed.isNull(), "window.grab() 失败，无法留人工复查证据");
+        const QString grabPath =
+            QDir(QCoreApplication::applicationDirPath())
+                .absoluteFilePath(QStringLiteral("../live2d-probe/window-grab-%1.png").arg(modelName));
+        QDir().mkpath(QFileInfo(grabPath).absolutePath());
+        QVERIFY2(grabbed.save(grabPath), qPrintable(QStringLiteral("写不出 %1").arg(grabPath)));
+
+        /*宽度占比：这是本次修复的核心判据（修复前 0.36~0.38）。
+           人物必须在**两个方向**都接近目标占比，否则就是"画布比人物宽出一大截、
+           人物缩在中间"。*/
+        QVERIFY2(occupancyWidth >= 0.60,
+                 qPrintable(QStringLiteral("[%1] 人物只占画布宽度的 %2%（要求 ≥60%）："
+                                           "画布 %3x%4 比人物 %5x%6 宽太多，"
+                                           "人物被挤在中间，两侧全是空白")
+                                .arg(modelName)
+                                .arg(occupancyWidth * 100.0, 0, 'f', 1)
+                                .arg(logical.width())
+                                .arg(logical.height())
+                                .arg(figureWidth, 0, 'f', 1)
+                                .arg(figureHeight, 0, 'f', 1)));
+
+        /*高度占比：钉住既有的垂直目标（窗口侧的 kTargetFigureRatio = 0.84）。
+           上下留 ~8% 余量 ⇒ 允许 0.75~0.92 的区间，既能抓住"垂直方向退化"，
+           又不会因为探针与真实帧的姿势差异而偶发失败。*/
+        QVERIFY2(occupancyHeight >= 0.75 && occupancyHeight <= 0.92,
+                 qPrintable(QStringLiteral("[%1] 人物占画布高度的 %2%，偏离垂直目标 84% "
+                                           "（允许 75%~92%）")
+                                .arg(modelName)
+                                .arg(occupancyHeight * 100.0, 0, 'f', 1)));
+
+        ++checked;
+    }
+
+    if (checked == 0)
+        QSKIP("本机没有 atri / miku / 樱花miku 任何一个模型目录（禁二传，不入库）");
+}
+
 /*模型入口文件名不一定等于目录名 —— 这条测试钉住宽松查找。
 
   实机用例：`Live2D/atri/` 目录里的入口是 `atri_8.model3.json`（不是 atri.model3.json）。
@@ -741,9 +843,11 @@ void TestLive2DWindow::loadsModelByDirectoryName()
   控件侧的开销（QImage 拷贝、updateRenderedImage）与周期性的 QBitmap mask
   完全可能反超渲染本身。这条测试是把「能不能上高帧率」变成数字的地方。
 
-  两种配置都量：高帧率档（120fps / 1.5x，用户实际在用的档位）与**代码默认值** 60fps / 1.0x
-  —— 后者才是「弱机器开箱行为」的真实成本。
-  两种配置都写进**临时**配置文件（见 initTestCase），用户的 config.ini 全程只读。*/
+  三种配置都量：用户实际在用的档位（120fps，缩放 1.0 与 1.5 各一档 —— 这是"8.33ms 帧预算
+  到底够不够"的唯一依据）与**代码默认值** 60fps / 1.0x（「弱机器开箱行为」的真实成本）。
+  三种配置都写进**临时**配置文件（见 initTestCase），用户的 config.ini 全程只读。
+  注：帧率档位只影响定时器间隔，不影响这里的每帧成本 —— 两条 1.0x 行本就该给出同一个数字，
+  分列出来是为了让"1.0x 该是多少"在日志里直接可查，不必自己推。*/
 void TestLive2DWindow::reportsFullPipelineFrameCost()
 {
     const QString dir = modelDir();
@@ -758,6 +862,7 @@ void TestLive2DWindow::reportsFullPipelineFrameCost()
         double scale;
     } configurations[] = {
         {"用户档位 120fps/1.5x", 120, 1.5},
+        {"用户档位 120fps/1.0x", 120, 1.0},
         {"代码默认值 60fps/1.0x", 60, 1.0},
     };
 

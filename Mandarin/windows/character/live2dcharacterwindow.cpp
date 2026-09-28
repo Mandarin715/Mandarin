@@ -216,20 +216,28 @@ void Live2DCharacterWindow::reloadContent(const QString &contentName)
         m_pendingModelName = modelName;
 }
 
-/*画布尺寸启发式（v2）：
+/*画布尺寸启发式（v3）：
 
-  1) 先按**正方形**探针渲一帧，由渲染器把人物包围盒换算回模型画布像素，得到人物宽高比；
+  1) 在**测量模式**下按正方形探针渲一帧帧取样（变换固定，见 probeFigureMetrics），
+     得到人物在一整段待机动作上占过的最大范围，以及它的**真实宽高比**；
   2) 逻辑人物高 = 基准高 900 × (m_tachieSizePercent/100)；
-  3) 画布高 = 人物高 / kTargetFigureHeightRatio（人物只占画布高的 88%，上下各留 6%）；
-     画布宽 = 画布高 × 人物宽高比 —— 画布与人物包围盒同宽高比，两条边同时留出余量；
+  3) 画布高 = 人物高 / kTargetFigureRatio（人物只占画布高的 84%，上下各留 8%）；
+     画布宽 = 画布高 × 人物真实宽高比 —— 画布与人物的形状一致，左右也各留 8%；
   4) 逻辑尺寸再夹进屏幕可用高度/宽度的 85%（2560x1440@125% 只有 2048x1152 逻辑像素，
-     不夹的话大立绘会被屏幕裁掉），夹取时**始终保比例**。
+     不夹的话大立绘会被屏幕裁掉），夹取时**始终保比例**；
+  5) 真正落定尺寸靠**实测校正**：量真实帧里人物占画布多少，按比例修正两个方向的目标占比。
 
-  为什么 v1（画布 = 人物包围盒 / 占比、零余量）会裁掉人物：
-  画布宽 = 画布高 × 人物宽高比 且 画布高 = 人物高 / 人物高占比，两式合起来等价于
-  "画布恰好等于人物包围盒"，人物四边全部贴边；再加上模型画布里人物本身是偏的，
-  右边自然先被切掉。现在多了 12% 的余量，且渲染器会把人物**搬回画布中心**再做等比缩放，
-  偏置不再体现为某一侧被切。
+  为什么 v2（画布宽 = 画布高 × 探针宽高比 × 画布高/画布宽）会把人物挤扁到 36%：
+  那个"再乘画布高/画布宽"的换算本来是想补偿"投影分支的各向异性"，可投影分支早就被
+  分轴摆放 Scale 覆盖掉了（CubismMatrix44::Scale 是直接赋值），于是它成了纯粹的误差 ——
+  实测把 atri 的宽高比从 0.436 抬到 0.524，画布宽随之定成 779（真实只需 409），
+  人物横向只占 36%，两侧各空 250 逻辑像素。
+
+  为什么单靠"改画布宽度"修不好：v2 的渲染器只给一个**等比**摆放因子，人物的像素宽高比
+  = 模型宽高比 × 画布宽高比，横向占比被钉死在 `目标占比 × 人物宽高比 / 画布宽高比` ——
+  实测画布宽取 400/600/779/938/1200 时横向占比恒为 0.357，改宽度毫无作用。
+  所以渲染器改成**横竖分别缩放**（见 setDisplayRatios 的说明），画布宽高比再由人物
+  真实宽高比给出，两个方向才能同时到位且不拉伸。
 
   注意：character/live2dScale **只放大渲染分辨率**，不改变这里的逻辑尺寸
   （逻辑尺寸直接决定屏幕上的大小，见 renderAndRegisterFrame）。*/
@@ -241,23 +249,25 @@ void Live2DCharacterWindow::relayoutContent()
     // 重排期间置位，避免 paintEvent 在自检「画布 vs 窗口」时递归进来
     m_renderingFrame = true;
 
-    // 探针必须在定尺寸之前跑：宽高比与显示比例都来自它
+    // 探针必须在定尺寸之前跑：宽高比与目标占比都来自它
     probeFigureMetrics();
 
     const int targetFigureHeight =
         std::max(1, static_cast<int>(std::lround(kBaseCanvasHeight *
                                                 (m_tachieSizePercent / 100.0))));
     int canvasHeight = clampInt(
-        static_cast<int>(std::lround(targetFigureHeight /
-                                     std::max(1e-3, kTargetFigureHeightRatio))),
+        static_cast<int>(std::lround(targetFigureHeight / kTargetFigureRatio)),
         static_cast<int>(kMinCanvasSide), static_cast<int>(kMaxCanvasSide));
+    /*画布宽度 = 画布高度 × 人物**真实**宽高比：画布与人物同形状，四边余量一样宽。
+      这是"人物填满画布"与"不拉伸"能同时成立的前提（分轴摆放把像素宽高比变成画布宽高比，
+      所以画布宽高比必须等于人物真实宽高比）。*/
     int canvasWidth = clampInt(
         static_cast<int>(std::lround(canvasHeight * m_figureAspect)),
         static_cast<int>(kMinCanvasSide), static_cast<int>(kMaxCanvasSide));
 
     /*屏幕夹取：先按可用高度夹，再按可用宽度夹，**始终保比例**（不拉伸人物）。
-      夹取后按同一个比例回算另一条边 —— 画布宽高比不能被破坏，否则渲染器那套
-      "宽度与高度各算一次缩放取较大者"就会退化成单边受限，人物在另一边贴边。*/
+      夹取后按同一个比例回算另一条边 —— 画布宽高比不能被破坏，否则人物会被横向或纵向
+      拉伸（分轴摆放的像素宽高比就等于画布宽高比）。*/
     if (QScreen *screen = QGuiApplication::primaryScreen())
     {
         const QRect available = screen->availableGeometry();
@@ -285,29 +295,20 @@ void Live2DCharacterWindow::relayoutContent()
 
     const QSize canvasSize(canvasWidth, canvasHeight);
 
-    /*显示比例：先按探针的解析换算给一个初值，渲染后再用**真实帧**实测校正。
-
-      为什么还要实测校正：解析式要同时依赖"探针空间跨度"和"投影分支的 W/H 换算"，
-      任何一处偏差都会让人物偏大或偏小。实测校正不依赖这些假设 —— 第一帧量出人物
-      实际占画布多少，就能精确算出还需要放大/缩小多少倍。*/
-    const double stretch = static_cast<double>(std::max(1, canvasHeight)) /
-                           static_cast<double>(std::max(1, canvasWidth));
-    m_displayRatio = clampDouble(kTargetFigureHeightRatio /
-                                     std::max(1e-6, m_figureSpanY / stretch),
-                                 0.05, 1.0);
-    m_renderer.setDisplayHeightRatio(static_cast<float>(m_displayRatio));
+    /*目标占比：横竖同一个值。分轴摆放让"目标占比"变成精确值（fit = 2*占比/跨度，
+      而跨度来自同一把尺子的探针），所以这里不再需要解析式给初值 ——
+      下面的实测校正只是兜底与验证。*/
+    m_displayRatioX = kTargetFigureRatio;
+    m_displayRatioY = kTargetFigureRatio;
+    m_renderer.setDisplayRatios(static_cast<float>(m_displayRatioX),
+                                static_cast<float>(m_displayRatioY));
 
     resize(canvasSize);
     m_logicalCanvasSize = canvasSize;
 
-    /*余量自检：把「画布只比人物大一点点」这种本该被测试抓到的情况直接打到日志里，
-      省得只有测试失败时才知道裁了。真值来自渲染帧（见 probeFigureMetrics 的探针）。*/
-    const double marginRatio =
-        std::max(0.0, 1.0 - kTargetFigureHeightRatio) / 2.0;
     qInfo() << "Live2D 画布:" << canvasSize << " 目标人物高" << targetFigureHeight
-            << " 人物占比" << kTargetFigureHeightRatio << " 每侧余量约"
-            << static_cast<int>(std::lround(marginRatio * 100)) << "% | 人物宽高比"
-            << m_figureAspect << " 显示比例" << m_displayRatio;
+            << " 目标占比" << kTargetFigureRatio << " | 人物真实宽高比" << m_figureAspect
+            << " 探针跨度" << m_figureSpanX << "x" << m_figureSpanY;
 
     if (!renderAndRegisterFrame())
     {
@@ -317,33 +318,54 @@ void Live2DCharacterWindow::relayoutContent()
         return;
     }
 
-    /*实测校正：量出人物在这张真实帧里占画布多少，把显示比例精确修正到目标占比。
+    /*实测校正：量出人物在这张真实帧里占画布多少，把两个方向的目标占比精确修正到目标值。
 
-      为什么要有这一步：解析换算要同时押中"探针空间跨度"与"投影分支的 W/H 换算"，
-      任何一处偏差都会让人物偏大偏小（实测解析值只能做到 50% 而非目标 84%）。
-      缩放因子与占比成正比，所以量一次就能一步到位，不需要反复试探。
-      只做一轮：第二轮与第一轮同帧同尺寸，收敛是确定的；多轮只会白白多渲染一帧。*/
+      为什么还要实测：解析式要押中"探针跨度"与"摆放缩放"是同一把尺子。分轴之后单帧几何
+      已经很确定，但真实帧的姿势与探针并集之间仍可能有几像素出入，实测不依赖任何假设。
+      为什么一次就能收敛：横向 fitX 与纵向 fitY 在渲染器里是**解耦**的（fitX 只影响 x），
+      缩放因子与占比成正比，所以按比例修正一次就是精确解。
+      为什么最多 kMaxCorrectionRounds 轮：再多没有意义 —— 若两轮后仍不收敛，说明出现了
+      本轮修复没有设想的耦合（例如模型自身在换尺寸时改变姿势），此时**保留当前画布**并打
+      警告：人物会略小于目标，但画布尺寸在进入校正前就已定下，绝不会因此越界或拉伸。*/
+    double measuredX = 0.0;
+    double measuredY = 0.0;
+    for (int round = 0; round <= kMaxCorrectionRounds; ++round)
     {
-        QRect figureBounds;
-        const QImage frame = m_scaledImg;
-        if (!frame.isNull() && opaqueBoundsInFrame(&figureBounds))
+        if (!measureFigureOccupancy(&measuredX, &measuredY))
         {
-            // 占比用同一张帧的像素算，避免逻辑/物理像素换算又引入一次误差
-            const double measuredFraction =
-                static_cast<double>(figureBounds.height()) / frame.height();
-            if (measuredFraction > 1e-3)
-            {
-                const double corrected =
-                    clampDouble(m_displayRatio * (kTargetFigureHeightRatio / measuredFraction),
-                                0.05, 1.0);
-                qInfo() << "Live2D 占比校正: 实测占比" << measuredFraction << " 目标"
-                        << kTargetFigureHeightRatio << " 显示比例" << m_displayRatio << "→"
-                        << corrected;
-                m_displayRatio = corrected;
-                m_renderer.setDisplayHeightRatio(static_cast<float>(m_displayRatio));
-                if (!renderAndRegisterFrame())
-                    qWarning() << "Live2D 校正帧渲染失败，沿用上一帧";
-            }
+            qWarning() << "Live2D 占比校正：量不到人物，跳过（沿用按探针跨度排好的画布）";
+            break;
+        }
+
+        const bool converged =
+            std::abs(measuredX - kTargetFigureRatio) <= kCorrectionTolerance &&
+            std::abs(measuredY - kTargetFigureRatio) <= kCorrectionTolerance;
+        qInfo() << "Live2D 占比校正: 第" << round << "轮（0 = 校正前）实测 横向" << measuredX
+                << "纵向" << measuredY << " 目标" << kTargetFigureRatio
+                << " 容差" << kCorrectionTolerance;
+        if (converged)
+            break;
+
+        if (round == kMaxCorrectionRounds)
+        {
+            qWarning() << "Live2D 占比校正未收敛：" << kMaxCorrectionRounds << "轮后实测 横向"
+                       << measuredX << "纵向" << measuredY << "（目标" << kTargetFigureRatio
+                       << "）。保留当前画布：人物可能比目标略小，但不会被拉伸、也不会越界。";
+            break;
+        }
+
+        m_displayRatioX = clampDouble(
+            m_displayRatioX * kTargetFigureRatio / std::max(1e-6, measuredX), kMinDisplayRatio,
+            kMaxDisplayRatio);
+        m_displayRatioY = clampDouble(
+            m_displayRatioY * kTargetFigureRatio / std::max(1e-6, measuredY), kMinDisplayRatio,
+            kMaxDisplayRatio);
+        m_renderer.setDisplayRatios(static_cast<float>(m_displayRatioX),
+                                    static_cast<float>(m_displayRatioY));
+        if (!renderAndRegisterFrame())
+        {
+            qWarning() << "Live2D 校正帧渲染失败，沿用上一帧";
+            break;
         }
     }
 
@@ -352,8 +374,47 @@ void Live2DCharacterWindow::relayoutContent()
     m_renderingFrame = false;
 }
 
-/*量当前登记帧（m_scaledImg）里人物可见部分的像素包围盒。
-  layout 时用它实测校正显示比例。占比一律用同一张帧的像素算，
+/*量"人物在这张画布上实际占多少"：在 kMeasuredFramePasses 个真实帧上求 alpha 包围盒的
+  并集，再各自除以画布宽/高，得到横向与纵向的占比（0~1）。
+
+  为什么用并集：姿势会动（待机/呼吸/物理），单帧的包围盒可能恰好偏松，按它校正会把人物
+  放得比"整段动作都装得下"更大，动作一摆就贴到画布边。
+  为什么占比一律用同一张帧的像素算：逻辑/物理像素换算会再引入一次 dpr 取整误差。*/
+bool Live2DCharacterWindow::measureFigureOccupancy(double *fractionX, double *fractionY)
+{
+    QRect unionBounds;
+    for (int pass = 0; pass < kMeasuredFramePasses; ++pass)
+    {
+        if (pass > 0)
+        {
+            // 真的让时间过去一小段，姿势才会走到不同相位
+            QThread::msleep(static_cast<unsigned long>(kMeasuredFrameIntervalMs));
+            QCoreApplication::processEvents();
+        }
+        if (!renderAndRegisterFrame() || m_scaledImg.isNull())
+            return false;
+
+        QRect bounds;
+        if (!opaqueBoundsInFrame(&bounds))
+            return false;
+        unionBounds = unionBounds.isNull() ? bounds : unionBounds.united(bounds);
+    }
+
+    if (unionBounds.isNull() || m_scaledImg.isNull() || m_scaledImg.width() <= 0 ||
+        m_scaledImg.height() <= 0)
+    {
+        return false;
+    }
+
+    if (fractionX)
+        *fractionX = static_cast<double>(unionBounds.width()) / m_scaledImg.width();
+    if (fractionY)
+        *fractionY = static_cast<double>(unionBounds.height()) / m_scaledImg.height();
+    return true;
+}
+
+/*量当前登记帧（m_scaledImg，物理像素）里人物可见部分的像素包围盒。
+  layout 的实测校正用它，不依赖任何解析换算；占比一律用同一张帧的像素算，
   不做逻辑/物理像素换算 —— 那会再引入一次 dpr 取整误差。*/
 bool Live2DCharacterWindow::opaqueBoundsInFrame(QRect *bounds) const
 {
@@ -388,17 +449,30 @@ bool Live2DCharacterWindow::opaqueBoundsInFrame(QRect *bounds) const
 }
 
 /*探针：量出人物**可见部分**在绘制输出空间里的范围（多次取样求并集），
-  再由它推出宽高比与显示比例交给渲染器定位。
+  再由它推出真实宽高比与摆放跨度交给渲染器定位。
 
   为什么要取样求并集：呼吸/物理会让姿势移动，单帧范围会在动作过程中被超出；
   并集是"这段时间里人物占过的最大范围"，画布按它留余量才稳。
 
-  为什么渲染器现在能量准：模型变换按帧**无状态**重建（不再被 SetWidth 累积放大），
-  换算也补上了投影缩放；而且范围保留在**输出空间的浮点**里，不做模型画布像素取整
-  （本模型画布是 1x1，取整会把人物范围毁成 1x1）。*/
+  ⚠️ 为什么必须在**测量模式**下取样（setMeasureMode(true)，踩过的坑）：
+  并集要成立，所有取样必须在同一个坐标系里。以前探针帧的摆放变换是由"上一次测量结果"
+  推出来的（span 有效后就按并集中心/跨度缩放），而并集又喂给下一次测量 ——
+  测量基准被自己的结果改写，并集变成"不同缩放下的框的并集"，只会越并越大。
+  实测 atri：并集宽高比 0.436（真实）→ 0.498（虚高 14%），纵向范围顶到画布边缘
+  饱和成 2.0。画布宽度正是按这个虚高的宽高比定的，于是画布比人物宽 2.3 倍。
+
+  为什么测量模式要把人物缩到画布一半：人物的自然大小几乎占满输出空间（纵向 1.98/2.0），
+  动作一摆就超出画布被裁，量到的"并集"会被裁成整幅画布。缩小后动作范围稳稳落在画布内。
+
+  为什么渲染器现在能量准：摆放按帧**无状态**重建（不再被 SetWidth 累积放大、也不再依赖
+  画布宽高比），分轴缩放让输出空间到帧像素的各向异性被抵消，范围保留在**输出空间的浮点**里
+  不做模型画布像素取整（本模型画布是 1x1，取整会把人物范围毁成 1x1）。*/
 void Live2DCharacterWindow::probeFigureMetrics()
 {
     m_renderer.clearFigureSpan();
+    m_renderer.setMeasureMode(true);
+
+    bool probeOk = true;
     for (int i = 0; i < kProbeSamples; ++i)
     {
         // 取样之间真的让时间过去，呼吸/物理才会走到不同相位（i=0 不睡，省一次等待）
@@ -407,46 +481,41 @@ void Live2DCharacterWindow::probeFigureMetrics()
             QThread::msleep(static_cast<unsigned long>(kProbeSampleIntervalMs));
             QCoreApplication::processEvents();
         }
-        // 探针固定 1:1：renderFrame 的投影留边会让非正方形探针的换算失真
         const QImage probe = m_renderer.renderFrame(QSize(kProbeCanvasSide, kProbeCanvasSide));
         if (probe.isNull())
         {
-            qWarning() << "Live2D 探针渲染失败，退回默认尺寸";
-            m_figureAspect = kFallbackFigureAspect;
-            m_displayRatio = kFallbackHeightRatio;
-            m_renderer.clearFigureSpan();
-            return;
+            probeOk = false;
+            break;
         }
         // probeFigureMetrics 会把本次可见范围并进渲染器的 FigureSpan
         (void)m_renderer.probeFigureMetrics(probe);
     }
 
-    /*人物可见范围只在探针里测一次；这里拿到的是**探针（1:1）空间**的跨度。
-      渲染器的缩放也在这个空间里算（relayoutContent 会用同一个值定 displayHeightRatio），
-      所以这里直接用原始 span，不再做 W/H 换算 —— 换算统一放在 relayoutContent。*/
-    const Live2DOffscreenRenderer::FigureMetrics raw = m_renderer.figureMetrics(
-        kProbeCanvasSide, kProbeCanvasSide);
-    if (!raw.valid)
+    // 探针的下一帧就是真实画布的首帧，测量模式必须先关掉
+    m_renderer.setMeasureMode(false);
+
+    const Live2DOffscreenRenderer::FigureMetrics metrics = m_renderer.figureMetrics();
+    if (!probeOk || !metrics.valid)
     {
-        qWarning() << "Live2D 探针几乎没画出内容，退回默认尺寸";
+        qWarning() << "Live2D 探针渲染失败或几乎没画出内容，退回默认尺寸";
         m_figureAspect = kFallbackFigureAspect;
-        m_figureSpanY = kFallbackHeightRatio;
-        m_displayRatio = kFallbackHeightRatio;
+        m_figureSpanX = 2.0;
+        m_figureSpanY = 2.0;
         m_renderer.clearFigureSpan();
         return;
     }
 
-    /*画布宽高比：用"换算到目标比例后"的可见范围宽高比。
-      先用探针比例自身做一次换算（此时 stretch=1 的等效情形），得到目标比例下的比例。*/
-    const int probeW = std::max(1, static_cast<int>(std::lround(kBaseCanvasHeight * 0.6)));
-    const Live2DOffscreenRenderer::FigureMetrics corrected =
-        m_renderer.figureMetrics(probeW, kBaseCanvasHeight);
-    m_figureAspect = clampDouble(corrected.valid ? corrected.boundsAspect : raw.boundsAspect,
-                                 0.05, 20.0);
-    m_figureSpanY = std::max(1e-6, static_cast<double>(raw.spanY));
+    /*人物**真实**宽高比：探针是 1:1 正方形帧、测量模式又是等比变换，所以输出空间到帧像素
+      是各向同性的 —— 这个宽高比就是人物"没有任何拉伸"时的形状，直接拿来定画布宽高比。
+      （以前这里还要再乘一次画布高/画布宽去"补偿投影分支"，而那个分支从来就没生效过：
+      见 Live2DOffscreenRenderer::figureMetrics 的说明。）*/
+    m_figureAspect = clampDouble(metrics.boundsAspect, kMinFigureAspect, kMaxFigureAspect);
+    m_figureSpanX = std::max(1e-6, static_cast<double>(metrics.spanX));
+    m_figureSpanY = std::max(1e-6, static_cast<double>(metrics.spanY));
 
-    qInfo() << "Live2D 探针:" << kProbeSamples << "次取样，人物探针空间跨度" << raw.spanX << "x"
-            << raw.spanY << " 探针比例" << raw.boundsAspect << " 目标比例" << m_figureAspect;
+    qInfo() << "Live2D 探针:" << kProbeSamples << "次取样（测量模式），人物可见范围"
+            << "宽" << m_figureSpanX << "高" << m_figureSpanY << "（满画布 = 2）→ 真实宽高比"
+            << m_figureAspect;
 }
 /*每帧：渲染 → 登记；交互区只在低频节拍上重算（QBitmap 构造成本太高，不能进帧热路径）*/
 void Live2DCharacterWindow::onFrameTick()

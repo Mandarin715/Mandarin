@@ -12,7 +12,6 @@
 #include <Effect/CubismEyeBlink.hpp>
 #include <Id/CubismIdManager.hpp>
 #include <Math/CubismMatrix44.hpp>
-#include <Math/CubismModelMatrix.hpp>
 #include <Model/CubismModel.hpp>
 #include <Model/CubismUserModel.hpp>
 #include <Motion/ACubismMotion.hpp>
@@ -55,6 +54,13 @@ bool readAllBytes(const QString &path, QByteArray *out)
     *out = file.readAll();
     return !out->isEmpty();
 }
+
+/*测量模式下人物被缩到画布的这个比例（等比、居中）。
+
+  为什么测量模式要缩小：人物的自然大小几乎占满输出空间（实测 atri 纵向 1.98 / 2.0），
+  动作一摆就会顶到画布边缘，量到的范围被裁成"整幅画布"，并集随之失真。
+  先缩到一半，动作范围就稳稳落在画布内了。*/
+constexpr float kMeasureScale = 0.5f;
 
 /*把 QImage 上传成 GL 贴图。Cubism 的贴图坐标已按 GL 约定（原点左下）生成，
   所以这里保持原始行序，不做垂直翻转。
@@ -264,48 +270,54 @@ class OffscreenUserModel : public Csm::CubismUserModel
         return _model->GetParameterValue(Csm::CubismFramework::GetIdManager()->RegisterId(id));
     }
 
-    /*模型矩阵（"模型画布像素 → 输出坐标"）的**无状态**算法。
+    /*模型画布 → 输出空间的缩放：把模型画布高度映射到 2（= 满画布），居中、无平移。
 
       ⚠️ 必须自己算，不能直接读 GetModelMatrix()：
-      那是跨帧复用的对象，renderFrame 在窄画布分支里会反复对它调 SetWidth(2.0f)，
+      那是跨帧复用的对象，历史上 renderFrame 在窄画布分支里会反复对它调 SetWidth(2.0f)，
       而 CubismModelMatrix::SetWidth 内部是 Scale(w / _width) —— 累积乘法。
       于是读到的矩阵一帧比一帧大（实测 atri：基准 0.487 → 真实帧里 3.87，差 8 倍），
       任何"按它反推尺寸"的算法都会算错，人物被画得极小。
 
-      这里按 SDK 初始化的方式重建：
-        CubismModelMatrix(W_m, H_m) → SetHeight(2.0f)，即缩放 2/H_m、无平移；
-      再按 renderFrame 的投影分支（窄画布时把模型铺满宽度）补一次等比缩放。
-      W_m/H_m 是模型的固有画布尺寸，只取决于 moc3，与目标画布无关。*/
-    void buildModelTransform(Csm::CubismMatrix44 *out, Csm::csmUint32 frameWidth,
-                             Csm::csmUint32 frameHeight)
+      注意这里**不再**依赖画布宽高比：以前按 renderFrame 的投影分支给窄画布补过一次
+      2/W_m，那是为了配合"横长模型铺满画布宽度"的投影 —— 而那个投影分支在
+      drawModel 里会被等比 Scale 覆盖掉（CubismMatrix44::Scale 是直接赋值），
+      所以这个补丁只会让"测量模式"与"真实画布"用上不同的模型缩放，量出来的跨度对不上。
+      分轴缩放（见 drawModel）已经把尺寸的事全接管了，模型变换只管"居中、高度为 2"。*/
+    float modelToOutputScale() const
     {
-        out->LoadIdentity();
         if (_model == nullptr)
-            return;
-
-        const Csm::csmFloat32 canvasWidth = _model->GetCanvasWidth();
+            return 1.0f;
         const Csm::csmFloat32 canvasHeight = _model->GetCanvasHeight();
-        if (canvasWidth <= 0.0f || canvasHeight <= 0.0f)
-            return;
-
-        Csm::csmFloat32 scale = 2.0f / canvasHeight;
-        // 与 renderFrame 的分支保持一致：横长模型放进竖长画布时，模型铺满画布宽度
-        if (frameWidth < frameHeight && canvasWidth > 1.0f)
-            scale *= 2.0f / canvasWidth;
-        out->Scale(scale, scale);
+        if (canvasHeight <= 0.0f)
+            return 1.0f;
+        return 2.0f / canvasHeight;
     }
 
-    /*按样例的投影规则把模型画到当前绑定 FBO 上。
+    /*把模型画到当前绑定的 FBO 上：自己拼 MVP（模型变换 × 分轴摆放）再交给渲染器。
 
-      除了样例那套投影，这里还要把人物**摆正**：模型画布里人物的活动范围本身是偏的
-      （本模型明显偏右），只把画布放大是没用的 —— 人物像素位置与画布同比例放大，
-      右边缘照样贴着画布。所以按无状态模型变换把人物缩到 displayHeightRatio 并居中。
+      数学（行向量约定，p' = p · M）：
+        q  = modelToOutputScale() · p_model     // 模型画布 → 输出空间，高度 2、居中
+        ndc = fit ⊙ q - fit ⊙ center            // 目标占比 + 把活动范围中心搬到画布中心
+      合成后就是 diag(s·fitX, s·fitY) 加上平移 (-fitX·centerX, -fitY·centerY)。
+      CubismMatrix44::Scale / Translate 都是**直接赋值** _tr[0]/_tr[5] 与 _tr[12]/_tr[13]，
+      所以按 Scale 再 Translate 的顺序写就得到上面这个矩阵，不需要再 Multiply。
 
-      数学：p_N = 模型变换(模型画布像素)。先把活动范围中心搬到原点、再把尺寸压到
-      ratio（宽高各算一次取较大者，保证两条边都装得下），于是人物落在画布中心、
-      占画布高度的 ratio。displayHeightRatio=1.0 时只做居中，不缩小。*/
-    void drawWithProjection(Csm::CubismMatrix44 &projection, Csm::csmUint32 frameWidth,
-                            Csm::csmUint32 frameHeight)
+      ⚠️ 四条必须记住的结论（都是实测踩出来的）：
+      1. **分轴缩放**（fitX ≠ fitY）是"不拉伸"的**必要条件**：输出空间到帧像素的映射是
+         各向异性的（x 乘 W/2、y 乘 H/2）。只给一个等比因子时，人物的像素宽高比
+         = 模型宽高比 × 画布宽高比 —— 实测 atri 在 779x938 上被横向压扁 17%
+         （0.436 → 0.355），画布越宽人物越胖。
+      2. 分轴之后，人物的像素宽高比 = 画布宽高比、**与画布尺寸无关**；调用方只要把画布
+         宽高比取成人物真实宽高比（figureMetrics().boundsAspect），就同时拿到
+         "两个方向都占目标比例"和"不拉伸"。
+      3. 以前这里用 `fit = max(ratio/spanX, ratio/spanY)`（单因子），于是横向占比被钉死在
+         `ratio × 人物宽高比 / 画布宽高比` 上 —— 换画布宽度**完全不影响**横向占比
+         （实测 400/600/779/938/1200 宽的画布上横向占比恒为 0.357）。所以"只改画布宽度"
+         是修不好这个 bug 的。
+      4. renderFrame 里那套"横长模型铺满宽度"的投影分支在这里是**死代码**：
+         Scale 直接赋值会把它的各向异性覆盖掉。（曾经的探针换算就是为了补偿这个
+         根本不存在的各向异性，属于白算一遍还引入误差。）*/
+    void drawModel()
     {
         if (_model == nullptr)
             return;
@@ -315,31 +327,47 @@ class OffscreenUserModel : public Csm::CubismUserModel
         if (renderer == nullptr)
             return;
 
-        Csm::CubismModelMatrix modelTransform;
-        buildModelTransform(&modelTransform, frameWidth, frameHeight);
+        const Csm::csmFloat32 modelToOutput = modelToOutputScale();
 
-        if (m_figureSpan.valid)
+        Csm::csmFloat32 fitX = 0.0f;
+        Csm::csmFloat32 fitY = 0.0f;
+        Csm::csmFloat32 centerX = 0.0f;
+        Csm::csmFloat32 centerY = 0.0f;
+
+        if (m_measureMode)
         {
-            const Csm::csmFloat32 centerNx = (m_figureSpan.minX + m_figureSpan.maxX) / 2.0f;
-            const Csm::csmFloat32 centerNy = (m_figureSpan.minY + m_figureSpan.maxY) / 2.0f;
-            const Csm::csmFloat32 spanNx = m_figureSpan.spanX();
-            const Csm::csmFloat32 spanNy = m_figureSpan.spanY();
-
-            const Csm::csmFloat32 ratio = m_displayHeightRatio;
-            if (spanNx > 1e-6f && spanNy > 1e-6f)
+            /*测量模式：固定等比、不居中（模型变换已经把模型画布中心放在输出空间原点），
+              缩到 kMeasureScale 保证动作范围不被画布裁掉。所有取样共用这一个变换，
+              并集才有意义。*/
+            fitX = kMeasureScale;
+            fitY = kMeasureScale;
+        }
+        else
+        {
+            // 没有测量结果时按"人物铺满画布"兜底：span = 2（满画布）、中心 = 原点
+            const Csm::csmFloat32 spanX = m_figureSpan.valid ? m_figureSpan.spanX() : 2.0f;
+            const Csm::csmFloat32 spanY = m_figureSpan.valid ? m_figureSpan.spanY() : 2.0f;
+            if (m_figureSpan.valid)
             {
-                /*注意顺序：Translate 直接写平移列、Scale 直接写缩放因子，
-                  所以 Translate 之后再 Scale 得到的是"先平移再缩放"。
-                  乘进投影后整体作用在模型变换的输出上。*/
-                const Csm::csmFloat32 fit = std::max(ratio / spanNx, ratio / spanNy);
-                projection.Translate(-centerNx, -centerNy);
-                projection.Scale(fit, fit);
+                centerX = (m_figureSpan.minX + m_figureSpan.maxX) / 2.0f;
+                centerY = (m_figureSpan.minY + m_figureSpan.maxY) / 2.0f;
             }
+            // 目标：可见范围在输出空间里占 2*ratio ⇒ fit = 2*ratio/span
+            fitX = 2.0f * m_displayWidthRatio / std::max(1e-6f, spanX);
+            fitY = 2.0f * m_displayHeightRatio / std::max(1e-6f, spanY);
         }
 
-        // MultiplyByMatrix 是左乘：先"摆正"再乘模型变换 → 投影 × 摆正 × 模型
-        projection.MultiplyByMatrix(&modelTransform);
-        renderer->SetMvpMatrix(&projection);
+        Csm::CubismMatrix44 mvp;
+        mvp.LoadIdentity();
+        mvp.Scale(modelToOutput * fitX, modelToOutput * fitY);
+        // 平移按 fit 缩放：要搬的是"缩放之后"的中心
+        mvp.Translate(-fitX * centerX, -fitY * centerY);
+
+        // 记下来给探针反解"自然缩放"下的范围用（见 probeFigureMetrics）
+        m_lastFitX = fitX;
+        m_lastFitY = fitY;
+
+        renderer->SetMvpMatrix(&mvp);
         renderer->DrawModel();
     }
 
@@ -354,8 +382,21 @@ class OffscreenUserModel : public Csm::CubismUserModel
 
     void clearFigureSpan() { m_figureSpan = FigureSpan(); }
 
-    /*人物高度占画布高度的比例（见 Live2DOffscreenRenderer::setDisplayHeightRatio）*/
-    void setDisplayHeightRatio(float ratio) { m_displayHeightRatio = ratio; }
+    /*人物在画布 x/y 方向各占的比例（见 Live2DOffscreenRenderer::setDisplayRatios）*/
+    void setDisplayRatios(float widthRatio, float heightRatio)
+    {
+        m_displayWidthRatio = widthRatio;
+        m_displayHeightRatio = heightRatio;
+    }
+
+    /*测量模式：固定等比变换，取样之间不改变变换（见 Live2DOffscreenRenderer::setMeasureMode）*/
+    void setMeasureMode(bool on) { m_measureMode = on; }
+    bool isMeasureMode() const { return m_measureMode; }
+
+    /*上一帧实际用在输出空间上的 x/y 缩放（见 drawModel）。probeFigureMetrics 靠它把量到的
+      输出范围折回"自然缩放"下的范围。*/
+    float lastFrameFitX() const { return m_lastFitX; }
+    float lastFrameFitY() const { return m_lastFitY; }
 
     Csm::CubismModel *model() const { return _model; }
 
@@ -595,7 +636,7 @@ class OffscreenUserModel : public Csm::CubismUserModel
       成员不能挪位置/不能是临时量，否则引用悬空。*/
     Csm::csmBool _motionUpdated = false;
 
-    /*人物可见范围（**输出空间**浮点，画布映射到 [-0.5, 0.5]）。
+    /*人物可见范围（**输出空间**浮点，画布横竖都映射到 [-1, 1]）。
 
       ⚠️ 不能存成模型画布像素的 QRect：本模型的模型画布是 1x1（缩放 2/H_m = 2），
       人物在画布坐标里只占零点几个像素，取整后必然退化成 1x1，缩放因子随之算错
@@ -628,7 +669,13 @@ class OffscreenUserModel : public Csm::CubismUserModel
         }
     };
     FigureSpan m_figureSpan;
-    float m_displayHeightRatio = 1.0f; // 默认 1.0 = 保持原有"铺满画布高度"的行为
+    /*人物在画布 x/y 方向各占的比例。两个方向**分别**给：见 drawModel 的说明，
+      分轴缩放是"既不拉伸又占满目标比例"的必要条件。*/
+    float m_displayWidthRatio = 1.0f;
+    float m_displayHeightRatio = 1.0f;
+    bool m_measureMode = false; // true = 探针取样用的固定等比变换
+    float m_lastFitX = 1.0f;    // 上一帧实际用的输出空间 x 缩放（供探针反解自然跨度）
+    float m_lastFitY = 1.0f;
 };
 } // namespace
 
@@ -642,7 +689,7 @@ struct Live2DOffscreenRenderer::Impl
     QSize targetSize;
     QElapsedTimer clock;
 
-    /*人物可见范围（**输出空间**浮点，画布映射到 [-0.5, 0.5]）。
+    /*人物可见范围（**输出空间**浮点，画布横竖都映射到 [-1, 1]）。
 
       ⚠️ 不能存成模型画布像素的 QRect：本模型的模型画布是 1x1（缩放 2/H_m = 2），
       人物在画布坐标里只占零点几个像素，取整后必然退化成 1x1，缩放因子随之算错
@@ -675,7 +722,6 @@ struct Live2DOffscreenRenderer::Impl
         }
     };
     FigureSpan figureSpan;
-    float displayHeightRatio = 1.0f; // 人物高度占画布高度的比例
 
     bool makeCurrent()
     {
@@ -839,27 +885,17 @@ QImage Live2DOffscreenRenderer::renderFrame(const QSize &size)
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-    Csm::CubismMatrix44 projection;
-    projection.LoadIdentity();
-    Csm::CubismModel *model = m_impl->model->model();
     /*⚠️ 这里**不能再动 GetModelMatrix()**：它是跨帧复用的对象，SetWidth(2.0f) 内部是
       Scale(w/_width)（累积乘法），会导致模型矩阵一帧比一帧大（实测 atri 差 8 倍），
       而 drawable 顶点位置是用它换算的。
-      现在模型变换由 drawWithProjection 按帧无状态重建（buildModelTransform），
-      这里只负责投影的等比缩放。*/
-    if (model != nullptr && model->GetCanvasWidth() > 1.0f
-        && width < height) // 横长模型放进竖长画布
-    {
-        projection.Scale(1.0f, static_cast<Csm::csmFloat32>(width)
-                                  / static_cast<Csm::csmFloat32>(height));
-    }
-    else
-    {
-        projection.Scale(static_cast<Csm::csmFloat32>(height)
-                             / static_cast<Csm::csmFloat32>(width),
-                         1.0f);
-    }
+      摆放（模型缩放 + 分轴目标占比 + 居中）全部由 drawModel() 按帧**无状态**重建，
+      这里不再自己拼投影。
 
+      顺带说明为什么这里原来那段"横长模型铺满画布宽度"的投影分支被删了：
+      CubismMatrix44::Scale 是**直接赋值** _tr[0]/_tr[5]，drawModel 里那次分轴 Scale
+      会把它整个覆盖掉 —— 那段分支从来就没生效过（只在"还没有任何测量结果"的首帧上
+      短暂生效）。留着它只会让人以为投影里有一层各向异性补偿，从而去写
+      "再乘画布宽高比"之类的错误换算。*/
     /*单帧时间步长夹取。
 
       为什么必须夹：这个 delta 直接喂给呼吸/眨眼/物理。load() 之后到第一帧渲染之间
@@ -872,7 +908,7 @@ QImage Live2DOffscreenRenderer::renderFrame(const QSize &size)
     const float deltaSeconds = std::min(
         static_cast<float>(m_impl->clock.restart()) / 1000.0f, kMaxFrameDeltaSeconds); // 首帧即建立时间基准
     m_impl->model->tick(deltaSeconds);
-    m_impl->model->drawWithProjection(projection, width, height);
+    m_impl->model->drawModel();
 
     m_impl->renderTarget.EndDraw();
     Csm::Rendering::CubismOffscreenManager_OpenGLES2::GetInstance()->EndFrameProcess();
@@ -940,6 +976,13 @@ Live2DOffscreenRenderer::probeFigureMetrics(const QImage &probeFrame)
     if (m_impl->model == nullptr || probeFrame.isNull())
         return metrics;
 
+    /*⚠️ 只允许量**测量模式**下渲染的帧：非测量帧的摆放缩放是"上一次测量结果"推出来的，
+      拿它当基准会把测量结果又喂回测量基准（实测让 atri 的宽高比虚高 14%）。
+      这里显式告警，免得以后又有人拿普通帧来喂探针。*/
+    if (!m_impl->model->isMeasureMode())
+        qWarning("[Live2D] probeFigureMetrics 收到了非测量模式的帧：测量基准会被自己的"
+                 "结果改写，请先 setMeasureMode(true)");
+
     // 1) 探针帧里的 alpha 包围盒（与 CharacterWindow 同一口径：alpha > 32）
     const QImage rgba = probeFrame.convertToFormat(QImage::Format_RGBA8888);
     int minX = rgba.width();
@@ -962,20 +1005,26 @@ Live2DOffscreenRenderer::probeFigureMetrics(const QImage &probeFrame)
     if (maxX < minX || maxY < minY)
         return metrics;
 
-    /*2) 帧像素 → 模型变换的**输出坐标**。
+    /*2) 帧像素 → 绘制**输出空间**（画布横竖都映射到 [-1, 1]，满画布 = 2）。
 
-      renderFrame 的投影是 Scale(W/2, H/2) + Translate(W/2, H/2)（再乘分支的等比缩放，
-      探针固定 1:1 时分支缩放为 1）。所以帧像素 p 对应的输出坐标是 (2p - W)/W。
+      输出空间到帧像素的映射是 p = (o + 1) * N / 2，所以反解是 (2p - N)/N。
       **这一步不能省**：模型变换只负责"模型画布 → 输出"，从输出到帧像素是投影的缩放；
       少了它量出来的尺寸会差一个分辨率倍数，缩放因子随之算成天文数字。
-      这两个 span 就是"人物占输出空间的多少"，是换算目标占比的依据。*/
+      这两个 span 就是"人物占输出空间的多少"，是定目标占比的依据。*/
     const auto toOutput = [](double pixel, int extent) {
         return (pixel - extent / 2.0) / (extent / 2.0);
     };
-    const float oMinX = static_cast<float>(toOutput(minX, rgba.width()));
-    const float oMaxX = static_cast<float>(toOutput(maxX + 1, rgba.width()));
-    const float oMinY = static_cast<float>(toOutput(minY, rgba.height()));
-    const float oMaxY = static_cast<float>(toOutput(maxY + 1, rgba.height()));
+    /*把量到的输出范围折回**自然缩放**（fit = 1）下的范围。
+
+      为什么需要：测量帧里人物被等比缩到 kMeasureScale，真实画布上的 fit 则是按自然跨度
+      算的（fit = 2*ratio/span），两边必须同一把尺子。测量模式下中心在原点，所以
+      natural = output / fit 就是精确反解。*/
+    const float fitX = std::max(1e-6f, m_impl->model->lastFrameFitX());
+    const float fitY = std::max(1e-6f, m_impl->model->lastFrameFitY());
+    const float oMinX = static_cast<float>(toOutput(minX, rgba.width())) / fitX;
+    const float oMaxX = static_cast<float>(toOutput(maxX + 1, rgba.width())) / fitX;
+    const float oMinY = static_cast<float>(toOutput(minY, rgba.height())) / fitY;
+    const float oMaxY = static_cast<float>(toOutput(maxY + 1, rgba.height())) / fitY;
 
     metrics.spanX = oMaxX - oMinX;
     metrics.spanY = oMaxY - oMinY;
@@ -993,31 +1042,29 @@ Live2DOffscreenRenderer::probeFigureMetrics(const QImage &probeFrame)
       只占零点几个像素，QRect 一取整就退化成 1x1，缩放因子随之算错（实测人物被缩成
       画布的 13%）。绘制时直接在输出空间用这份浮点范围，画布尺寸怎么取整都不受影响。*/
     m_impl->figureSpan.unite(oMinX, oMinY, oMaxX, oMaxY);
-    if (m_impl->model != nullptr)
-        m_impl->model->setFigureSpanInOutputSpace(oMinX, oMinY, oMaxX, oMaxY);
+    m_impl->model->setFigureSpanInOutputSpace(oMinX, oMinY, oMaxX, oMaxY);
     return metrics;
 }
 
-Live2DOffscreenRenderer::FigureMetrics
-Live2DOffscreenRenderer::figureMetrics(int canvasWidth, int canvasHeight) const
+Live2DOffscreenRenderer::FigureMetrics Live2DOffscreenRenderer::figureMetrics() const
 {
     FigureMetrics metrics;
-    if (!m_impl->figureSpan.valid || canvasHeight == 0)
+    if (!m_impl->figureSpan.valid)
         return metrics;
 
-    /*把"1:1 探针比例下"的范围换算到目标画布比例。
+    /*⚠️ 这里**不做任何画布比例换算**。
 
-      探针是正方形，renderFrame 在竖长画布分支（W < H）里会把模型变换再乘 2/W_m，
-      横长画布分支只乘 2/H_m；两分支相差 H/W。所以同一个人物在真实画布输出空间里
-      的跨度 = 探针量到的值 × (H/W)（不是 × W/H —— 方向搞反会让 calculate 出来的
-      显示比例越算越大，人物反而被放大到贴边）。*/
-    const float stretch = static_cast<float>(canvasHeight) /
-                          static_cast<float>(canvasWidth);
-    metrics.minX = m_impl->figureSpan.minX * stretch;
+      曾经这里按 canvasHeight/canvasWidth 乘过一个 stretch，想补偿"探针是正方形、真实
+      画布不是正方形"带来的投影差异。那个差异并不存在：投影里那段分支会被 drawModel 的
+      分轴 Scale 直接覆盖（CubismMatrix44::Scale 是赋值）。于是这个 stretch 成了纯粹的
+      误差源 —— 它把 atri 的宽高比从 0.436 抬到 0.524（乘 1.204），而画布宽度正是按它
+      定的，画布因此比人物宽 2.3 倍。头注释当时写的是"必须再乘 W/H"、代码写的是乘 H/W，
+      两处都不对：正确做法是**不换算**（探针空间本身已经各向同性）。*/
+    metrics.minX = m_impl->figureSpan.minX;
     metrics.minY = m_impl->figureSpan.minY;
-    metrics.maxX = m_impl->figureSpan.maxX * stretch;
+    metrics.maxX = m_impl->figureSpan.maxX;
     metrics.maxY = m_impl->figureSpan.maxY;
-    metrics.spanX = m_impl->figureSpan.spanX() * stretch;
+    metrics.spanX = m_impl->figureSpan.spanX();
     metrics.spanY = m_impl->figureSpan.spanY();
     metrics.valid = true;
     if (metrics.spanY > 1e-6f)
@@ -1040,9 +1087,16 @@ void Live2DOffscreenRenderer::clearFigureSpan()
         m_impl->model->clearFigureSpan();
 }
 
-void Live2DOffscreenRenderer::setDisplayHeightRatio(float ratio)
+void Live2DOffscreenRenderer::setDisplayRatios(float widthRatio, float heightRatio)
 {
-    m_impl->displayHeightRatio = std::min(1.0f, std::max(0.05f, ratio));
+    const float width = std::min(1.0f, std::max(0.05f, widthRatio));
+    const float height = std::min(1.0f, std::max(0.05f, heightRatio));
     if (m_impl->model != nullptr)
-        m_impl->model->setDisplayHeightRatio(m_impl->displayHeightRatio);
+        m_impl->model->setDisplayRatios(width, height);
+}
+
+void Live2DOffscreenRenderer::setMeasureMode(bool on)
+{
+    if (m_impl->model != nullptr)
+        m_impl->model->setMeasureMode(on);
 }
