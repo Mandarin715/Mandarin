@@ -6,12 +6,18 @@
 #include <QBitmap>
 #include <QDir>
 #include <QElapsedTimer>
+#include <QFile>
 #include <QFileInfo>
 #include <QImage>
 #include <QMouseEvent>
 #include <QPixmap>
 #include <QRegion>
 #include <QSettings>
+#include <QTemporaryDir>
+#include <QTest>
+#include <QThread>
+
+#include <algorithm>
 
 /*Live2D 立绘窗口的端到端验证：真正要证伪的是「窗口只是个空白矩形」——
   也就是渲染帧确实被登记进窗口层、确实被画出来、并且穿透/命中判定确实来自模型 alpha。
@@ -22,6 +28,12 @@
   模型不入库（授权禁二传），本机没有模型时**跳过**而不是失败；
   可用环境变量 MANDARIN_LIVE2D_MODEL_DIR 指定别的模型目录。
 
+  **配置隔离（重要）**：本测试绝不碰用户的真实 `config.ini`。
+  initTestCase() 把配置读取重定向到 QTemporaryDir 里的临时文件
+  （经 MANDARIN_CONFIG_INI，见 Live2DCharacterWindow 的 settingsPath()），
+  测试要什么帧率/缩放就往临时文件里写。以前的做法是"改真实配置再恢复"，
+  实测已经因为中途退出/异常把用户的值永久覆盖过一次 —— 测试永远不该有机会写它。
+
   关于坐标系（踩过的坑，写在这里免得再踩）：窗口的 paintEvent 是按**设备像素**把帧画满的，
   所以「图像像素坐标」与「窗口设备无关坐标」一一对应；而 renderedImage() 给的是物理像素帧，
   两者之间要按 QImage::devicePixelRatio() 换算。测试里凡是跨这两种量纲的地方都显式换算。*/
@@ -30,14 +42,42 @@ class TestLive2DWindow : public QObject
     Q_OBJECT
 
   private slots:
+    /*整套测试共用的临时配置：用完即删，用户真实 config.ini 全程只读*/
+    void initTestCase();
+    void cleanupTestCase();
+
     void shapesWindowFromRenderedModel();
+    void animatesAcrossFrames();
+    void keepsWholeFigureInsideCanvas();
+    void loadsModelByDirectoryName();
     void reportsFullPipelineFrameCost();
 
   private:
     static QString modelDir();
+    static QString modelDirFor(const QString &name);
+    /*用户实际在用的模型名（config.ini 的 character/live2dModel，当前是 atri）*/
+    static QString preferredModelName();
+
+    QTemporaryDir m_tempDir;
+    QString m_tempConfigPath;
     /*扫描一帧，返回不透明像素数与一个确定不透明的点（画布中部，避开边缘羽化）。
       点在图像**像素**坐标系里。*/
     static int findOpaquePoint(const QImage &frame, QPoint *opaquePoint);
+
+    /*两帧之间「逐通道差值超过阈值」的像素数。用于「模型到底动没动」这条观察量：
+      冻结的模型两帧逐位相同，差值恒为 0。*/
+    static qint64 countDifferingPixels(const QImage &a, const QImage &b, int channelDelta);
+
+    /*一帧里 alpha > threshold 的像素包围盒；没有任何这样的像素时返回 false。
+      bbox = (minX, minY) 到 (maxX, maxY)，单位是图像**像素**。*/
+    static bool opaqueBounds(const QImage &frame, int alphaThreshold, QRect *bounds);
+
+    /*在 figureBounds 内找一个**确实实心**的点：该点连同 kSolidRadius 邻域全部 alpha 达标。
+      为什么要邻域而不是单点：单点可能落在羽化边缘上，用它当"人物身上的点"会偶发假失败。
+      点坐标写在 output 里，单位是 frame 的**像素**。*/
+    static constexpr int kSolidRadius = 2;
+    static bool findSolidPoint(const QImage &frame, const QRect &figureBounds,
+                               int alphaThreshold, QPoint *output);
 };
 
 QString TestLive2DWindow::modelDir()
@@ -46,6 +86,54 @@ QString TestLive2DWindow::modelDir()
     if (!fromEnv.isEmpty())
         return QString::fromLocal8Bit(fromEnv);
     return QDir(Live2DModelRootPath).filePath(QStringLiteral("miku"));
+}
+
+QString TestLive2DWindow::modelDirFor(const QString &name)
+{
+    return QDir(Live2DModelRootPath).filePath(name);
+}
+
+/*「用户实际在用的模型」= config.ini 里的 character/live2dModel（当前是 atri）。
+  动画/裁切这类"用户看得见"的结论必须在这个模型上得出，不能只在 miku 上测。
+  没有该目录时返回空，调用方 QSKIP。*/
+QString TestLive2DWindow::preferredModelName()
+{
+    QSettings settings(IniSettingPath, QSettings::IniFormat);
+    const QString configured =
+        settings.value(QStringLiteral("character/live2dModel")).toString().trimmed();
+    if (!configured.isEmpty() && QFileInfo::exists(modelDirFor(configured)))
+        return configured;
+    return QStringLiteral("atri");
+}
+
+/*把配置读取重定向到一次性临时文件：用户真实 config.ini 全程只读。
+
+  为什么这样才安全：窗口侧经 MANDARIN_CONFIG_INI 决定读哪个 ini（见 settingsPath()），
+  测试只往 QTemporaryDir 里写。即使某个用例 QSKIP / 断言失败 / 进程崩溃，
+  真实配置也一个字节都不会被动到 —— "改完再恢复"那种做法做不到这一点。*/
+void TestLive2DWindow::initTestCase()
+{
+    QVERIFY2(m_tempDir.isValid(), "建不出临时目录，无法隔离配置");
+
+    m_tempConfigPath = m_tempDir.filePath(QStringLiteral("config.ini"));
+    {
+        // 内容随意：各用例需要什么值自己往这个临时文件里写
+        QSettings settings(m_tempConfigPath, QSettings::IniFormat);
+        settings.setValue("character/live2dFps", 60);
+        settings.setValue("character/live2dScale", 1.0);
+        settings.sync();
+    }
+    QVERIFY2(QFileInfo::exists(m_tempConfigPath), "临时配置文件没写出来");
+
+    qputenv("MANDARIN_CONFIG_INI", m_tempConfigPath.toLocal8Bit());
+    qInfo("配置已重定向到临时文件：%s（真实 config.ini 只读）", qPrintable(m_tempConfigPath));
+}
+
+void TestLive2DWindow::cleanupTestCase()
+{
+    qunsetenv("MANDARIN_CONFIG_INI");
+    m_tempConfigPath.clear();
+    // m_tempDir 析构时自动删除整棵目录
 }
 
 int TestLive2DWindow::findOpaquePoint(const QImage &frame, QPoint *opaquePoint)
@@ -76,16 +164,128 @@ int TestLive2DWindow::findOpaquePoint(const QImage &frame, QPoint *opaquePoint)
     return opaquePixels;
 }
 
+qint64 TestLive2DWindow::countDifferingPixels(const QImage &a, const QImage &b, int channelDelta)
+{
+    if (a.isNull() || b.isNull() || a.size() != b.size())
+        return -1; // 尺寸不一致本身就是「变了」，但那样是异常，交给调用方断言
+
+    const QImage lhs = a.convertToFormat(QImage::Format_RGBA8888);
+    const QImage rhs = b.convertToFormat(QImage::Format_RGBA8888);
+    qint64 differing = 0;
+    for (int y = 0; y < lhs.height(); ++y)
+    {
+        const uchar *l = lhs.constScanLine(y);
+        const uchar *r = rhs.constScanLine(y);
+        for (int x = 0; x < lhs.width(); ++x)
+        {
+            for (int c = 0; c < 4; ++c)
+            {
+                if (qAbs(int(l[x * 4 + c]) - int(r[x * 4 + c])) > channelDelta)
+                {
+                    ++differing;
+                    break;
+                }
+            }
+        }
+    }
+    return differing;
+}
+
+bool TestLive2DWindow::opaqueBounds(const QImage &frame, int alphaThreshold, QRect *bounds)
+{    if (bounds)
+        *bounds = QRect();
+    if (frame.isNull())
+        return false;
+
+    const QImage rgba = frame.convertToFormat(QImage::Format_RGBA8888);
+    int minX = rgba.width();
+    int minY = rgba.height();
+    int maxX = -1;
+    int maxY = -1;
+    for (int y = 0; y < rgba.height(); ++y)
+    {
+        const uchar *line = rgba.constScanLine(y);
+        for (int x = 0; x < rgba.width(); ++x)
+        {
+            if (line[x * 4 + 3] <= alphaThreshold)
+                continue;
+            minX = std::min(minX, x);
+            maxX = std::max(maxX, x);
+            minY = std::min(minY, y);
+            maxY = std::max(maxY, y);
+        }
+    }
+    if (maxX < minX || maxY < minY)
+        return false;
+    if (bounds)
+        *bounds = QRect(QPoint(minX, minY), QPoint(maxX, maxY));
+    return true;
+}
+
+bool TestLive2DWindow::findSolidPoint(const QImage &frame, const QRect &figureBounds,
+                                      int alphaThreshold, QPoint *output)
+{
+    if (output)
+        *output = QPoint(-1, -1);
+    if (frame.isNull() || figureBounds.isEmpty())
+        return false;
+
+    const QImage rgba = frame.convertToFormat(QImage::Format_RGBA8888);
+    // 邻域内任意一点越界就没法判定"实心"，所以先收缩可行域
+    const QRect region = figureBounds.adjusted(kSolidRadius, kSolidRadius, -kSolidRadius,
+                                               -kSolidRadius)
+                             .intersected(rgba.rect());
+    if (region.isEmpty())
+        return false;
+
+    // 从人物包围盒中心开始找：中心附近的实心点最能代表"人物身上"
+    const QPoint center = region.center();
+    const int maxRadius = std::max(region.width(), region.height());
+    for (int radius = 0; radius <= maxRadius; radius += 3)
+    {
+        for (int dy = -radius; dy <= radius; dy += 3)
+        {
+            for (int dx = -radius; dx <= radius; dx += 3)
+            {
+                const QPoint candidate(center.x() + dx, center.y() + dy);
+                if (!region.contains(candidate))
+                    continue;
+                bool solid = true;
+                for (int oy = -kSolidRadius; oy <= kSolidRadius && solid; ++oy)
+                {
+                    const uchar *line = rgba.constScanLine(candidate.y() + oy);
+                    for (int ox = -kSolidRadius; ox <= kSolidRadius; ++ox)
+                    {
+                        if (line[(candidate.x() + ox) * 4 + 3] <= alphaThreshold)
+                        {
+                            solid = false;
+                            break;
+                        }
+                    }
+                }
+                if (!solid)
+                    continue;
+                if (output)
+                    *output = candidate;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 /*装载模型 → 窗口按渲染帧定尺寸 → 帧被画出来 → 形状/命中判定确实来自 alpha*/
 void TestLive2DWindow::shapesWindowFromRenderedModel()
 {
-    const QString dir = modelDir();
-    const QString modelJsonName = QStringLiteral("miku.model3.json");
-    if (!QFileInfo::exists(dir + QLatin1Char('/') + modelJsonName))
-        QSKIP("本机没有初音模型（禁二传，不入库），跳过立绘窗口验证");
+    /*用「用户实际配置的模型」而不是写死 miku：本用例会存一张窗口抓图，而本项目不许
+      自动启动桌宠，抓图就是唯一能被人工复查的证据 —— 它必须是你真正会看到的那套模型。*/
+    const QString modelName = preferredModelName();
+    const QString dir = modelDirFor(modelName);
+    if (dir.isEmpty())
+        QSKIP("本机没有可用模型（禁二传，不入库），跳过立绘窗口验证");
 
     Live2DCharacterWindow window;
-    window.reloadContent(QStringLiteral("miku"));
+    window.reloadContent(modelName);
     QVERIFY2(window.isModelLoaded(), "模型装载失败（Live2DCharacterWindow::reloadContent）");
 
     // 先真正显示一次：Windows 上的原生窗口区域要有窗口才谈得上生效。
@@ -140,8 +340,11 @@ void TestLive2DWindow::shapesWindowFromRenderedModel()
 
     // 存一份抓图：这是「桌宠在屏幕上长什么样」的唯一可查证据
     //（本项目不许自动启动桌宠，所以人工目视只能靠这张图）。
+    // 文件名带模型名：否则帧成本用例（固定用 miku）会把它覆盖成别的模型，
+    // 人工复查时就分不清看到的是哪一套。
     const QString grabPath = QDir(QCoreApplication::applicationDirPath())
-                                 .absoluteFilePath(QStringLiteral("../live2d-probe/window-grab.png"));
+                                 .absoluteFilePath(QStringLiteral("../live2d-probe/window-grab-%1.png")
+                                                       .arg(modelName));
     QDir().mkpath(QFileInfo(grabPath).absolutePath());
     QVERIFY2(grabbed.save(grabPath), qPrintable(QStringLiteral("写不出 %1").arg(grabPath)));
     qInfo("窗口抓图已保存：%s", qPrintable(grabPath));
@@ -196,16 +399,32 @@ void TestLive2DWindow::shapesWindowFromRenderedModel()
     QVERIFY2(window.mask().isEmpty(),
              "Windows 下窗口不应设置 mask（Tachie 同款行为：只 clearMask）");
 
-    // 塑形的等价观察量①：绘制结果里确实有人物（不是空白矩形，也不是满屏不透明底板）。
-    // 统计口径放在窗口自己的绘制结果上，避免和渲染帧的物理像素量纲混淆。
-    QPoint hitPoint;
-    const int paintedOpaque = findOpaquePoint(painted, &hitPoint);
+    /*塑形的等价观察量①：绘制结果里确实有人物（不是空白矩形，也不是满屏不透明底板）。
+
+      采点用 findSolidPoint 而不是"中部第一个不透明像素"：
+      acceptsClickAt 的逻辑坐标 → 帧像素映射与 dpr 强相关，单点采到羽化边缘或空洞上
+      就会偶发假失败。这里从**绘制结果里人物包围盒的中心**找一个连邻域都实心的点，
+      再按 dpr 换算回逻辑坐标去问命中判定 —— 断言的仍然是"人物身上可点、透明处穿透"。
+      统计口径放在窗口自己的绘制结果上，避免和渲染帧的物理像素量纲混淆。*/
+    QPoint paintedBoundsPoint;
+    const int paintedOpaque = findOpaquePoint(painted, &paintedBoundsPoint);
     const qint64 paintedPixels = static_cast<qint64>(painted.width()) * painted.height();
     QVERIFY2(paintedOpaque > 1000, "窗口绘制结果里几乎没有不透明像素（帧没被画出来）");
     QVERIFY2(paintedOpaque < paintedPixels * 0.9,
              "窗口绘制结果几乎全是不透明，等于一块矩形背板而不是人物");
-    QVERIFY2(hitPoint.x() >= 0, "窗口绘制结果中部找不到不透明像素");
-    QVERIFY2(hitPoint.x() < window.width() && hitPoint.y() < window.height(),
+
+    QRect paintedFigureBounds;
+    QVERIFY2(opaqueBounds(painted, 32, &paintedFigureBounds), "窗口绘制结果里没有不透明像素");
+    QPoint solidPixel;
+    QVERIFY2(findSolidPoint(painted, paintedFigureBounds, 32, &solidPixel),
+             "在绘制结果的人物包围盒里找不到实心点");
+    const qreal paintedDpr = window.devicePixelRatioF() > 0.0 ? window.devicePixelRatioF() : 1.0;
+    const QPoint hitPoint(static_cast<int>(std::lround(solidPixel.x() / paintedDpr)),
+                          static_cast<int>(std::lround(solidPixel.y() / paintedDpr)));
+    qInfo("命中判定采样点：绘制像素 %d,%d → 逻辑 %d,%d (dpr=%.3f)",
+          solidPixel.x(), solidPixel.y(), hitPoint.x(), hitPoint.y(), double(paintedDpr));
+    QVERIFY2(hitPoint.x() >= 0 && hitPoint.y() >= 0 && hitPoint.x() < window.width() &&
+                 hitPoint.y() < window.height(),
              qPrintable(QStringLiteral("绘制结果里的人物点 %1,%2 落在窗口 %3x%4 之外，"
                                        "说明绘制尺寸与窗口尺寸不一致")
                             .arg(hitPoint.x())
@@ -292,15 +511,239 @@ void TestLive2DWindow::shapesWindowFromRenderedModel()
 #endif
 }
 
-/*量「真实全链路」每帧成本：renderFrame() + 登记 alpha 图 + 交互区节拍（每 10 帧一次）。
+/*「宠物真的活着吗」——这条测试钉住 Bug A（模型冻在默认姿势）。
 
+  为什么不能只看「一帧里有不透明像素」：那只能证明模型画出来了，证明不了它会动。
+  这里走的是**真实帧路径**（renderFrameNow → renderAndRegisterFrame → renderFrame → tick），
+  中间插入真实流逝的时间（QThread::msleep），所以 deltaSeconds 是真时间，
+  呼吸/眨眼/待机动作该推进的都推进了。
+
+  冻结的实现两帧逐位相同 → 差值为 0；只要参数驱动器接上了，差值就是成千上万像素。
+  阈值取「显著大于噪声」的量级：这个模型任何一帧之间都不可能只差几百像素，
+  冻结时又恰好是 0，所以不存在"靠噪声蒙对"的可能。*/
+void TestLive2DWindow::animatesAcrossFrames()
+{
+    const QString modelName = preferredModelName();
+    const QString dir = modelDirFor(modelName);
+    if (!QFileInfo::exists(dir))
+        QSKIP("本机没有用户配置的模型（禁二传，不入库），跳过动画验证");
+
+    /*帧率与缩放在 initTestCase 写进**临时**配置：这条测试量的是"动不动"，
+      不是性能。用的是临时文件里的 60fps / 1.0x，用户的 config.ini 不参与、也不被改。*/
+    {
+        Live2DCharacterWindow window;
+        window.reloadContent(modelName);
+        QVERIFY2(window.isModelLoaded(), "模型装载失败，无法验证动画");
+
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        QCoreApplication::processEvents();
+
+        QVERIFY2(!window.contentSize().isEmpty(), "contentSize() 为空，还没有帧");
+
+        // 起手帧：停下帧循环再自己渲一帧，保证「基准帧」与后面比较的是同一条路径。
+        window.hide();
+        QCoreApplication::processEvents();
+        QVERIFY2(window.renderFrameNow(), "基准帧渲染失败");
+        const QImage before = window.renderedImage();
+        QVERIFY2(!before.isNull(), "基准帧为空");
+
+        /*推进：真的让时间过去。逐帧之间也睡一小会儿，这样 tick() 收到的是
+          真实 deltaSeconds（而不是紧循环里那种 <0.1ms 的假时间）。
+          实测（本机 RTX 5070 Ti Laptop）加上驱动器后，相邻帧（间隔 100ms）差 5 万~13 万像素，
+          参考帧与 3.2s 后的帧差 13 万像素（约 21%）—— 与阈值 2000 差两个数量级，
+          所以这条断言既不可能被噪声蒙对，也不会因为时序抖动而偶发失败。*/
+        constexpr int kFrames = 60;
+        for (int i = 0; i < kFrames; ++i)
+        {
+            QThread::msleep(16);
+            QCoreApplication::processEvents();
+            QVERIFY2(window.renderFrameNow(), "推进帧渲染失败");
+        }
+
+        // 让动作走到与基准帧明显不同的相位（呼吸周期 3.2~15.5s，待机动作 2.667s 一循环）
+        QThread::msleep(3200);
+        QCoreApplication::processEvents();
+        QVERIFY2(window.renderFrameNow(), "比较帧渲染失败");
+        const QImage after = window.renderedImage();
+        QVERIFY2(!after.isNull(), "比较帧为空");
+
+        QCOMPARE(after.size(), before.size());
+        constexpr int kChannelDelta = 8; // 抗 8bit 量化/抗锯齿的通道噪声
+        const qint64 differing = countDifferingPixels(before, after, kChannelDelta);
+        QVERIFY2(differing >= 0, "两帧尺寸不一致，无法比较");
+        const qint64 total = static_cast<qint64>(before.width()) * before.height();
+        qInfo("动画验证[%s]：%d 帧 + 真实流逝时间后，逐通道差 >%d 的像素 = %lld / %lld（%.3f%%）",
+              qPrintable(modelName), kFrames, kChannelDelta, differing, total,
+              static_cast<double>(differing) * 100.0 / static_cast<double>(total));
+
+        /*冻结的实现这里是 0（实测逐位相同）；只差"某一帧的渲染状态"这种噪声量级也才几百。
+          阈值取 2000：远高于噪声，又远低于真实动画的量级。*/
+        QVERIFY2(differing > 2000,
+                 qPrintable(QStringLiteral("两帧只差 %1 个像素，模型看上去是静止的"
+                                               "（没有呼吸/眨眼/待机动作）")
+                                .arg(differing)));
+    }
+}
+
+/*「人物完整落在画布内吗」——这条测试钉住 Bug B（右侧双马尾被裁掉）。
+
+  观察量：渲染帧里 alpha>threshold 的包围盒，必须与画布**四条边都留出余量**。
+  画布是"人物包围盒 + 0 边距"时，包围盒必然顶到某条边（余量 0），这条断言就会失败。
+
+  为什么取一段时间内两帧的**并集**：待机动作会让姿势移动，单帧的包围盒可能恰好在
+  某条边上松一点。并集是"人物在这段时间里占过的最大范围"，用它判断有没有被裁更严格。
+
+  注意：这里不假设人物在画布里居中 —— 只要求四条边都有余量，居不居中由实现自己决定。*/
+void TestLive2DWindow::keepsWholeFigureInsideCanvas()
+{
+    const QString modelName = preferredModelName();
+    const QString dir = modelDirFor(modelName);
+    if (!QFileInfo::exists(dir))
+        QSKIP("本机没有用户配置的模型（禁二传，不入库），跳过画布余量验证");
+
+    /*用临时配置（60fps / 1.0x）确实能复现 bug：裁切与帧率/渲染倍数无关，
+      它只取决于逻辑画布与人物包围盒的关系。用户真实 config.ini 全程只读。*/
+    Live2DCharacterWindow window;
+    window.reloadContent(modelName);
+    QVERIFY2(window.isModelLoaded(), "模型装载失败，无法验证画布余量");
+
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QCoreApplication::processEvents();
+    QVERIFY2(window.renderFrameNow(), "首帧渲染失败");
+
+
+    const QSize logical = window.contentSize();
+    QVERIFY2(!logical.isEmpty(), "contentSize() 为空");
+
+    // 一帧不足以代表"人物占过的最大范围"（姿势会动），取两帧并集。
+    QRect unionBounds;
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        if (pass > 0)
+        {
+            for (int i = 0; i < 30; ++i)
+            {
+                QThread::msleep(16);
+                QCoreApplication::processEvents();
+                QVERIFY2(window.renderFrameNow(), "推进帧渲染失败");
+            }
+            QVERIFY2(window.renderFrameNow(), "第二帧渲染失败");
+        }
+
+        const QImage frame = window.renderedImage();
+        QVERIFY2(!frame.isNull(), "渲染帧为空");
+        QRect bounds;
+        QVERIFY2(opaqueBounds(frame, 32, &bounds), "渲染帧里没有任何不透明像素");
+        unionBounds = unionBounds.isNull() ? bounds : unionBounds.united(bounds);
+    }
+
+    // 渲染帧是物理像素，画布是逻辑像素；两者只差一个统一比例，用比例折回画布坐标。
+    const QImage frame = window.renderedImage();
+    const double scale = static_cast<double>(logical.width()) / frame.width();
+    const QRect figure(
+        static_cast<int>(std::lround(unionBounds.x() * scale)),
+        static_cast<int>(std::lround(unionBounds.y() * scale)),
+        static_cast<int>(std::lround(unionBounds.width() * scale)),
+        static_cast<int>(std::lround(unionBounds.height() * scale)));
+
+    const int left = figure.left();
+    const int top = figure.top();
+    const int right = logical.width() - 1 - figure.right();
+    const int bottom = logical.height() - 1 - figure.bottom();
+
+    // 「几条边有真实余量」的判据：至少画布短边的百分之几，而不是"≥1 像素"
+    const int minMargin = std::max(2, static_cast<int>(std::lround(
+                                          std::min(logical.width(), logical.height()) * 0.02)));
+    qInfo("画布余量验证[%s]：逻辑画布=%dx%d，渲染帧=%dx%d，人物并集包围盒=%d,%d %dx%d，"
+          "四边余量 左=%d 上=%d 右=%d 下=%d（要求每条 ≥%d）",
+          qPrintable(modelName), logical.width(), logical.height(), frame.width(),
+          frame.height(), figure.x(), figure.y(), figure.width(), figure.height(), left, top,
+          right, bottom, minMargin);
+
+    QVERIFY2(left >= minMargin && top >= minMargin && right >= minMargin && bottom >= minMargin,
+             qPrintable(QStringLiteral("人物顶到画布边缘：四边余量 左=%1 上=%2 右=%3 下=%4，"
+                                       "每条至少要 %5（画布 %6x%7，人物包围盒 %8,%9 %10x%11）")
+                            .arg(left)
+                            .arg(top)
+                            .arg(right)
+                            .arg(bottom)
+                            .arg(minMargin)
+                            .arg(logical.width())
+                            .arg(logical.height())
+                            .arg(figure.x())
+                            .arg(figure.y())
+                            .arg(figure.width())
+                            .arg(figure.height())));
+}
+
+/*模型入口文件名不一定等于目录名 —— 这条测试钉住宽松查找。
+
+  实机用例：`Live2D/atri/` 目录里的入口是 `atri_8.model3.json`（不是 atri.model3.json）。
+  模型文件受授权保护不能改名，所以查找必须回退到"扫目录"。按目录名 atri 装载必须成功。
+
+  目录不存在就跳过（模型不入库）。*/
+void TestLive2DWindow::loadsModelByDirectoryName()
+{
+    struct Case
+    {
+        const char *dirName;
+        const char *expectedJson; // 该目录里实际存在的入口文件名
+    };
+    const Case cases[] = {
+        {"atri", "atri_8.model3.json"}, // 目录名 ≠ 文件名：这条就是本次修复的目标
+        {"miku", "miku.model3.json"},   // 正命名：必须继续可用
+        {"樱花miku", "樱花miku.model3.json"}, // 另一台正命名模型（存在才测）
+    };
+
+    int checked = 0;
+    for (const Case &c : cases)
+    {
+        const QString dir = modelDirFor(QString::fromUtf8(c.dirName));
+        if (!QFileInfo::exists(dir))
+        {
+            qInfo("跳过 %s（本机没有该模型目录）", c.dirName);
+            continue;
+        }
+        QVERIFY2(QFileInfo::exists(dir + QLatin1Char('/') + QString::fromUtf8(c.expectedJson)),
+                 qPrintable(QStringLiteral("%1 目录里没有预期的入口文件 %2（模型文件不该被改）")
+                                .arg(dir)
+                                .arg(QString::fromUtf8(c.expectedJson))));
+
+        Live2DCharacterWindow window;
+        window.reloadContent(QString::fromUtf8(c.dirName));
+        QVERIFY2(window.isModelLoaded(),
+                 qPrintable(QStringLiteral("按目录名 %1 装载失败：入口文件实际叫 %2")
+                                .arg(QString::fromUtf8(c.dirName))
+                                .arg(QString::fromUtf8(c.expectedJson))));
+        QCOMPARE(window.modelDir(), dir);
+
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        QCoreApplication::processEvents();
+        QVERIFY2(window.renderFrameNow(), "渲染失败");
+        QRect bounds;
+        QVERIFY2(opaqueBounds(window.renderedImage(), 32, &bounds),
+                 qPrintable(QStringLiteral("%1 渲染帧里没有不透明像素").arg(c.dirName)));
+        qInfo("按目录名装载成功：%s → 入口 %s，帧 %dx%d，人物 %dx%d", c.dirName, c.expectedJson,
+              window.renderedImage().width(), window.renderedImage().height(), bounds.width(),
+              bounds.height());
+        ++checked;
+    }
+
+    if (checked == 0)
+        QSKIP("本机没有 atri / miku / 樱花miku 任何一个模型目录（禁二传，不入库）");
+}
+
+/*量「真实全链路」每帧成本：renderFrame() + 登记 alpha 图 + 交互区节拍（每 10 帧一次）。
   为什么必须量整条链路而不能只看 renderFrame：高刷屏下帧预算只有几毫秒，
   控件侧的开销（QImage 拷贝、updateRenderedImage）与周期性的 QBitmap mask
   完全可能反超渲染本身。这条测试是把「能不能上高帧率」变成数字的地方。
 
-  两种配置都量：用户 config.ini 里的实际值，以及**代码默认值** 60fps / 1.0x
+  两种配置都量：高帧率档（120fps / 1.5x，用户实际在用的档位）与**代码默认值** 60fps / 1.0x
   —— 后者才是「弱机器开箱行为」的真实成本。
-  config.ini 是全局状态，测完必须原样还原（程序没在跑才动它）。*/
+  两种配置都写进**临时**配置文件（见 initTestCase），用户的 config.ini 全程只读。*/
 void TestLive2DWindow::reportsFullPipelineFrameCost()
 {
     const QString dir = modelDir();
@@ -314,48 +757,19 @@ void TestLive2DWindow::reportsFullPipelineFrameCost()
         int fps;
         double scale;
     } configurations[] = {
-        {"config.ini 实际值", -1, -1.0}, // -1 = 不覆盖，用用户当前配置
-        {"代码默认值", 60, 1.0},
+        {"用户档位 120fps/1.5x", 120, 1.5},
+        {"代码默认值 60fps/1.0x", 60, 1.0},
     };
 
     for (const auto &config : configurations)
     {
-        // RAII：无论断言怎么退出，都把被改过的 config.ini 键还原回去
-        struct ConfigGuard
+        /*只写临时配置；不需要 RAII —— 临时目录随测试进程一起消失，
+          而且下一个用例会自己再写一次，用户真实配置从头到尾没参与。*/
         {
-            QSettings settings{IniSettingPath, QSettings::IniFormat};
-            bool touched = false;
-            bool hadFps = false;
-            bool hadScale = false;
-            QVariant oldFps;
-            QVariant oldScale;
-
-            ~ConfigGuard()
-            {
-                if (!touched)
-                    return;
-                if (hadFps)
-                    settings.setValue("character/live2dFps", oldFps);
-                else
-                    settings.remove("character/live2dFps");
-                if (hadScale)
-                    settings.setValue("character/live2dScale", oldScale);
-                else
-                    settings.remove("character/live2dScale");
-                settings.sync();
-            }
-        } guard;
-
-        if (config.fps > 0)
-        {
-            guard.hadFps = guard.settings.contains("character/live2dFps");
-            guard.hadScale = guard.settings.contains("character/live2dScale");
-            guard.oldFps = guard.settings.value("character/live2dFps");
-            guard.oldScale = guard.settings.value("character/live2dScale");
-            guard.settings.setValue("character/live2dFps", config.fps);
-            guard.settings.setValue("character/live2dScale", config.scale);
-            guard.settings.sync();
-            guard.touched = true;
+            QSettings settings(m_tempConfigPath, QSettings::IniFormat);
+            settings.setValue("character/live2dFps", config.fps);
+            settings.setValue("character/live2dScale", config.scale);
+            settings.sync();
         }
 
         Live2DCharacterWindow window;

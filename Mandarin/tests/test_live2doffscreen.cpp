@@ -5,7 +5,9 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFileInfo>
+#include <QHash>
 #include <QImage>
+#include <QThread>
 
 /*Live2D 离屏渲染的端到端验证。
 
@@ -21,6 +23,7 @@ class TestLive2DOffscreen : public QObject
 
   private slots:
     void rendersMikuFirstFrame();
+    void drivesParametersWithUpdaters();
     void reportsFrameCost();
 
   private:
@@ -103,8 +106,78 @@ void TestLive2DOffscreen::rendersMikuFirstFrame()
           qPrintable(visiblePng));
 }
 
-/*测每帧渲染成本，给"帧循环能跑多少 fps / 要不要降分辨率"提供真实数据，并作为性能守门。
+/*参数驱动器（呼吸/眨眼/物理）真的接上了吗 —— 这是 Bug A（模型完全静止）的离屏钉子。
 
+  只断言"两帧像素不同"是不够的：那既可能来自驱动器，也可能来自渲染噪声。
+  这里直接读**参数真实值**跑一段时间看它有没有变，并覆盖三类驱动器：
+    - 眨眼：ParamEyeLOpen / ParamEyeROpen（model3.json 的 EyeBlink 组）
+    - 呼吸：ParamAngleX/Y/Z、ParamBodyAngleX、ParamBreath
+    - 物理输出：模型的 physics3.json 里的输出参数（Parami / Param_Angle_Rotation_*），
+      它们只有物理真的在跑并且每帧**恰好求值一次**才会跟着动
+      （算两次会让输出以双倍速度漂移，算零次则一直不变）。
+
+  没装模型就跳过（禁二传，不入库）。*/
+void TestLive2DOffscreen::drivesParametersWithUpdaters()
+{
+    const QString dir = modelDir();
+    if (!QFileInfo::exists(dir + QStringLiteral("/miku.model3.json"))
+        && !QFileInfo::exists(dir + QStringLiteral("/atri_8.model3.json")))
+        QSKIP("本机没有模型（禁二传，不入库），跳过参数驱动器验证");
+
+    const QString modelJsonName = QFileInfo::exists(dir + QStringLiteral("/miku.model3.json"))
+                                      ? QStringLiteral("miku.model3.json")
+                                      : QStringLiteral("atri_8.model3.json");
+
+    Live2DOffscreenRenderer renderer;
+    QString error;
+    QVERIFY2(renderer.load(dir, modelJsonName, &error), qPrintable(error));
+
+    const QSize targetSize(600, 700);
+    QVERIFY(!renderer.renderFrame(targetSize).isNull());
+
+    /*要观察的参数：眨眼 / 呼吸用官方样例那套名字；物理输出取该模型 physics3.json
+      里真实存在的参数名（多试几个，至少有一个会动）。*/
+    const QStringList watched = {
+        QStringLiteral("ParamEyeLOpen"),   QStringLiteral("ParamEyeROpen"),
+        QStringLiteral("ParamAngleX"),     QStringLiteral("ParamAngleY"),
+        QStringLiteral("ParamAngleZ"),     QStringLiteral("ParamBodyAngleX"),
+        QStringLiteral("ParamBreath"),     QStringLiteral("Parami"),
+        QStringLiteral("Param_Angle_Rotation_1_ArtMesh48"),
+        QStringLiteral("Param_Angle_Rotation_1_ArtMesh79"),
+    };
+
+    QHash<QString, float> first;
+    for (const QString &id : watched)
+        first.insert(id, renderer.parameterValue(id));
+
+    // 真的让时间过去：呼吸周期 3.2~15.5s，眨眼间隔 1~4s，取样 4s 足够覆盖
+    constexpr int kFrames = 40;
+    for (int i = 0; i < kFrames; ++i)
+    {
+        QThread::msleep(100);
+        QVERIFY(!renderer.renderFrame(targetSize).isNull());
+    }
+
+    int movedParameters = 0;
+    for (const QString &id : watched)
+    {
+        const float before = first.value(id);
+        const float after = renderer.parameterValue(id);
+        if (!qFuzzyCompare(before, after))
+        {
+            ++movedParameters;
+            qInfo("参数驱动器验证：%s %f → %f", qPrintable(id), before, after);
+        }
+    }
+
+    QVERIFY2(movedParameters >= 2,
+             qPrintable(QStringLiteral("跑完 %1 帧后只有 %2 个参数变化，参数驱动器没接上"
+                                       "（呼吸/眨眼/物理至少要有两个在动）")
+                            .arg(kFrames)
+                            .arg(movedParameters)));
+}
+
+/*测每帧渲染成本，给"帧循环能跑多少 fps / 要不要降分辨率"提供真实数据，并作为性能守门。
   为什么必须有这条：窗口层要按帧重绘，帧成本直接决定帧率档位与是否需要降采样。
   实测值随机器/驱动不同，所以这里只设一个**宽松退步警戒线**，真实数字打到日志里。*/
 void TestLive2DOffscreen::reportsFrameCost()

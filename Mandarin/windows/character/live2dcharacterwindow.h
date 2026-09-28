@@ -73,7 +73,16 @@ class Live2DCharacterWindow : public CharacterWindowBase
   private:
     /*画布尺寸启发式的基准高、探针参数与各类夹取范围*/
     static constexpr int kBaseCanvasHeight = 900;
-    static constexpr int kProbeCanvasHeight = 512;
+    static constexpr int kProbeCanvasSide = 512;
+    /*探针取样次数与间隔：要覆盖整段待机动作（本模型 2.667s 一循环）。
+       20 次 × 150ms ≈ 3s > 一个循环，够把动作走满一遍；只做一次布局，成本可接受。*/
+    static constexpr int kProbeSamples = 20;
+    static constexpr int kProbeSampleIntervalMs = 150;
+    /*人物高度目标占比：留出 (1-ratio)/2 的上下余量。
+       0.84 → 上下各 8% 余量，人物在屏幕上的尺寸只比原来小 16%，同时杜绝边缘裁切。
+       （取 0.84 而不是贴着 0.88：探针是在一段动作上求并集，真实帧的姿势仍会有
+       几个像素的出入，余量要留得比"刚好"更宽一点才稳。）*/
+    static constexpr double kTargetFigureHeightRatio = 0.84;
     static constexpr int kRegionRefreshInterval = 10;
     static constexpr int kDefaultFps = 60;
     static constexpr int kMinFps = 5;
@@ -85,24 +94,30 @@ class Live2DCharacterWindow : public CharacterWindowBase
     static constexpr double kMinCanvasSide = 32;
     static constexpr double kMaxCanvasSide = 8192;
     static constexpr double kFallbackFigureAspect = 3.0 / 4.0; //探针失败时的兜底宽高比
-    static constexpr double kFallbackHeightRatio = 1.0;
+    static constexpr double kFallbackHeightRatio = kTargetFigureHeightRatio;
 
     void onFrameTick();              //定时器回调：渲染一帧并登记
     void refreshInteractiveRegion(); //低频重算交互区（构建 QBitmap 很贵，不能每帧做）
     bool renderAndRegisterFrame();   //渲染一帧并登记 alpha 图，失败返回 false
 
-    /*按模型名在两个候选目录里找模型，返回含 <model>.model3.json 的目录，找不到返回空*/
+    /*按模型名在两个候选目录里找模型，返回含可用 model3.json 的目录，找不到返回空*/
     QString resolveModelDir(const QString &modelName) const;
+
+    /*在 modelDir 里挑出要用的 model3.json 文件名（不假定它等于 <模型名>.model3.json：
+       实机模型常对不上，如 atri/atri_8.model3.json）。找不到返回空。*/
+    static QString resolveModelJsonName(const QString &modelDir, const QString &modelName);
 
     /*读 config.ini 的帧率/缩放（各自带默认值与安全夹取）*/
     void applyFrameRateFromConfig();
     void applyRenderScaleFromConfig();
 
-    /*探针渲染：先按正方形画布渲一帧，量出人物到底占多高（见 m_figureHeightRatio）。
-      为什么必须探测而不是用模型画布尺寸：投影矩阵会把模型铺满整个目标画布
-      （见 Live2DOffscreenRenderer::renderFrame），画布本身不携带"模型多宽多高"的信息，
-      而模型画布宽高只有渲染器内部知道 —— 所以只能实测，不为渲染器新增 API。*/
+    /*探针渲染：量出人物可见范围在绘制输出空间里的跨度（见 Live2DOffscreenRenderer::
+      probeFigureMetrics），据此定画布宽高比与显示比例。*/
     void probeFigureMetrics();
+
+    /*量当前登记帧（m_scaledImg，物理像素）里人物可见部分的包围盒。
+      layout 时用它实测校正显示比例，不依赖解析换算。*/
+    bool opaqueBoundsInFrame(QRect *bounds) const;
 
     Live2DOffscreenRenderer m_renderer;
     QTimer *m_frameTimer = nullptr; //渲染节拍
@@ -119,8 +134,15 @@ class Live2DCharacterWindow : public CharacterWindowBase
     /*重入保护：高帧率 + 慢帧时不能让定时器把渲染排队堆起来；也用于 paintEvent 里的重排*/
     bool m_renderingFrame = false;
 
-    double m_figureAspect = kFallbackFigureAspect;     //人物宽/高（探针实测）
-    double m_figureHeightRatio = kFallbackHeightRatio; //人物高 / 探针画布高
+    /*人物几何（探针实测）
+      m_figureAspect：人物可见范围在**目标画布比例**下的宽/高。画布按它定宽高比，
+      人物才不会横向溢出。
+      m_figureSpanY：人物可见范围在**探针（1:1）比例**下的高度跨度。渲染器的缩放是在
+      探针空间里算的，所以显示比例要用它，见 relayoutContent。
+      m_displayRatio：人物高度占画布高度的目标比例，交给渲染器 setDisplayHeightRatio。*/
+    double m_figureAspect = kFallbackFigureAspect;
+    double m_figureSpanY = kFallbackHeightRatio;
+    double m_displayRatio = kFallbackHeightRatio;
 
     /*最近一帧对应的**逻辑**画布尺寸。
       为什么不实时用 m_scaledImg.size()/dpr 推：窗口一旦映射到屏幕，devicePixelRatioF()

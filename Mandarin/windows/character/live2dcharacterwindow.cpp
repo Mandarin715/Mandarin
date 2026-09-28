@@ -13,6 +13,7 @@
 #include <QScreen>
 #include <QSettings>
 #include <QShowEvent>
+#include <QThread>
 #include <QTimer>
 
 #include <algorithm>
@@ -30,13 +31,21 @@
 
 namespace
 {
-/*探针渲染的采样步长：占比只需要精确到几个像素，隔点采样把扫描成本降到 1/4*/
-constexpr int kProbeSampleStride = 2;
-/*包围盒占比低于这个值就认为模型基本没画出来，退回默认尺寸*/
-constexpr double kMinProbeCoverage = 0.01;
 /*画布尺寸下限/上限：防止极端百分比或异常探针算出 1px 或巨大的窗口*/
 constexpr int kMinCanvasSide = 32;
 constexpr int kMaxCanvasSide = 8192;
+
+/*本类要读的 ini 路径。
+
+  为什么不是直接用 IniSettingPath：**测试绝不允许改到用户的真实配置**。
+  以前测试直接往 IniSettingPath 写 live2dFps/live2dScale 再"恢复"，一旦中途 QSKIP
+  或崩溃就永久覆盖用户的值（实测已发生过，用户被改成 60/1）。所以配置读取支持一个
+  环境变量重定向：测试把它指到 QTemporaryDir 里的临时文件，真实配置全程只读。*/
+QString settingsPath()
+{
+    const QByteArray override = qgetenv("MANDARIN_CONFIG_INI");
+    return override.isEmpty() ? IniSettingPath : QString::fromLocal8Bit(override);
+}
 
 int clampInt(int value, int low, int high)
 {
@@ -84,14 +93,60 @@ void Live2DCharacterWindow::applyFrameRateFromConfig()
   贴图是 6×4096 的大图，1.5x 在 1440p 上确实更清晰，所以留出这个档位。*/
 void Live2DCharacterWindow::applyRenderScaleFromConfig()
 {
-    QSettings settings(IniSettingPath, QSettings::IniFormat);
+    QSettings settings(settingsPath(), QSettings::IniFormat);
     m_renderScale =
         clampDouble(settings.value("character/live2dScale", 1.0).toDouble(),
                     kMinRenderScale, kMaxRenderScale);
     qInfo() << "Live2D 渲染缩放:" << m_renderScale;
 }
 
-/*按「全局模型根目录 → 当前角色资源目录」的顺序找模型，取第一个含 <model>.model3.json 的目录*/
+/*在目录里挑出要用的 model3.json 文件名。
+
+  为什么不能假定"<模型名>.model3.json"：实机模型常常对不上 —— 用户新加的
+  `Live2D/atri/` 目录里入口文件叫 `atri_8.model3.json`。模型文件受授权保护、不能改名，
+  所以查找必须宽松：
+
+    1) 先看 `<模型名>.model3.json`（miku / 樱花miku 都是这种正命名，优先命中）；
+    2) 没有就扫目录里的 `*.model3.json`：
+       - 只有一个 → 直接用；
+       - 有多个 → 优先"文件名以模型名开头"的那个，否则取第一个并警告列出候选；
+       - 一个都没有 → 返回空（调用方沿用"找不到模型"的既有行为，回退 PNG 立绘）。
+
+  返回空字符串表示该目录里没有可用的 model3.json。*/
+QString Live2DCharacterWindow::resolveModelJsonName(const QString &modelDir,
+                                                    const QString &modelName)
+{
+    if (modelDir.isEmpty() || modelName.isEmpty())
+        return QString();
+
+    const QDir dir(modelDir);
+    const QString exactName = modelName + QStringLiteral(".model3.json");
+    if (QFileInfo::exists(dir.filePath(exactName)))
+        return exactName;
+
+    const QStringList found = dir.entryList({QStringLiteral("*.model3.json")}, QDir::Files);
+    if (found.isEmpty())
+        return QString();
+    if (found.size() == 1)
+        return found.first();
+
+    // 多个候选：优先文件名以模型名开头的那个（atri → atri_8.model3.json）
+    for (const QString &fileName : found)
+    {
+        if (fileName.startsWith(modelName, Qt::CaseInsensitive))
+        {
+            qInfo() << "Live2D 模型目录里有多个 model3.json，按前缀选中:" << fileName
+                    << "候选:" << found;
+            return fileName;
+        }
+    }
+
+    qWarning() << "Live2D 模型目录里有多个 model3.json 且没有一个以模型名开头，取第一个:"
+               << found.first() << "候选:" << found;
+    return found.first();
+}
+
+/*按「全局模型根目录 → 当前角色资源目录」的顺序找模型，取第一个含可用 model3.json 的目录*/
 QString Live2DCharacterWindow::resolveModelDir(const QString &modelName) const
 {
     const QString trimmed = modelName.trimmed();
@@ -107,10 +162,9 @@ QString Live2DCharacterWindow::resolveModelDir(const QString &modelName) const
                           .filePath(charName + "/Live2D/" + trimmed);
     }
 
-    const QString modelJsonName = trimmed + ".model3.json";
     for (const QString &dir : candidates)
     {
-        if (QFileInfo::exists(QDir(dir).filePath(modelJsonName)))
+        if (!resolveModelJsonName(dir, trimmed).isEmpty())
             return dir;
     }
 
@@ -130,7 +184,14 @@ void Live2DCharacterWindow::reloadContent(const QString &contentName)
 
     applyRenderScaleFromConfig();
 
-    const QString modelJsonName = modelName + ".model3.json";
+    //入口文件名以目录里的实际内容为准（可能不叫 <模型名>.model3.json）
+    const QString modelJsonName = resolveModelJsonName(dir, modelName);
+    if (modelJsonName.isEmpty())
+    {
+        qWarning() << "Live2D 目录里没有 model3.json:" << dir;
+        return;
+    }
+
     QString error;
     if (!m_renderer.load(dir, modelJsonName, &error))
     {
@@ -155,16 +216,23 @@ void Live2DCharacterWindow::reloadContent(const QString &contentName)
         m_pendingModelName = modelName;
 }
 
-/*画布尺寸启发式（v1）：
-   1) 先按正方形探针渲一帧，量出人物占探针高度的比例（figureHeightRatio）与人物宽高比；
-   2) 逻辑人物高 = 基准高 900 × (m_tachieSizePercent/100)；
-   3) 逻辑画布高 = 逻辑人物高 / figureHeightRatio，逻辑画布宽 = 逻辑画布高 × 人物宽高比 ——
-      这样人物既不变形、又基本填满画布，没有大片空白；
-   4) 逻辑尺寸再夹进屏幕可用高度/宽度的 85%（2560x1440@125% 只有 2048x1152 逻辑像素，
-      不夹的话大立绘会被屏幕裁掉）。m_tachieSizePercent 沿用 PNG 路径的「立绘大小」语义。
+/*画布尺寸启发式（v2）：
 
-   注意：character/live2dScale **只放大渲染分辨率**，不改变这里的逻辑尺寸
-   （逻辑尺寸直接决定屏幕上的大小，见 renderAndRegisterFrame）。*/
+  1) 先按**正方形**探针渲一帧，由渲染器把人物包围盒换算回模型画布像素，得到人物宽高比；
+  2) 逻辑人物高 = 基准高 900 × (m_tachieSizePercent/100)；
+  3) 画布高 = 人物高 / kTargetFigureHeightRatio（人物只占画布高的 88%，上下各留 6%）；
+     画布宽 = 画布高 × 人物宽高比 —— 画布与人物包围盒同宽高比，两条边同时留出余量；
+  4) 逻辑尺寸再夹进屏幕可用高度/宽度的 85%（2560x1440@125% 只有 2048x1152 逻辑像素，
+     不夹的话大立绘会被屏幕裁掉），夹取时**始终保比例**。
+
+  为什么 v1（画布 = 人物包围盒 / 占比、零余量）会裁掉人物：
+  画布宽 = 画布高 × 人物宽高比 且 画布高 = 人物高 / 人物高占比，两式合起来等价于
+  "画布恰好等于人物包围盒"，人物四边全部贴边；再加上模型画布里人物本身是偏的，
+  右边自然先被切掉。现在多了 12% 的余量，且渲染器会把人物**搬回画布中心**再做等比缩放，
+  偏置不再体现为某一侧被切。
+
+  注意：character/live2dScale **只放大渲染分辨率**，不改变这里的逻辑尺寸
+  （逻辑尺寸直接决定屏幕上的大小，见 renderAndRegisterFrame）。*/
 void Live2DCharacterWindow::relayoutContent()
 {
     if (!m_renderer.isLoaded())
@@ -173,7 +241,7 @@ void Live2DCharacterWindow::relayoutContent()
     // 重排期间置位，避免 paintEvent 在自检「画布 vs 窗口」时递归进来
     m_renderingFrame = true;
 
-    //探针必须在定尺寸之前跑：宽高比与占比都来自它
+    // 探针必须在定尺寸之前跑：宽高比与显示比例都来自它
     probeFigureMetrics();
 
     const int targetFigureHeight =
@@ -181,13 +249,15 @@ void Live2DCharacterWindow::relayoutContent()
                                                 (m_tachieSizePercent / 100.0))));
     int canvasHeight = clampInt(
         static_cast<int>(std::lround(targetFigureHeight /
-                                     std::max(1e-3, m_figureHeightRatio))),
+                                     std::max(1e-3, kTargetFigureHeightRatio))),
         static_cast<int>(kMinCanvasSide), static_cast<int>(kMaxCanvasSide));
     int canvasWidth = clampInt(
         static_cast<int>(std::lround(canvasHeight * m_figureAspect)),
         static_cast<int>(kMinCanvasSide), static_cast<int>(kMaxCanvasSide));
 
-    //屏幕夹取：先按可用高度夹，再按可用宽度夹，始终保比例（不拉伸人物）。
+    /*屏幕夹取：先按可用高度夹，再按可用宽度夹，**始终保比例**（不拉伸人物）。
+      夹取后按同一个比例回算另一条边 —— 画布宽高比不能被破坏，否则渲染器那套
+      "宽度与高度各算一次缩放取较大者"就会退化成单边受限，人物在另一边贴边。*/
     if (QScreen *screen = QGuiApplication::primaryScreen())
     {
         const QRect available = screen->availableGeometry();
@@ -197,23 +267,47 @@ void Live2DCharacterWindow::relayoutContent()
             std::max(1, static_cast<int>(available.width() * kMaxScreenHeightRatio));
         if (canvasHeight > maxHeight)
         {
+            const double shrink = static_cast<double>(maxHeight) / canvasHeight;
             canvasHeight = maxHeight;
             canvasWidth = clampInt(
-                static_cast<int>(std::lround(canvasHeight * m_figureAspect)),
+                static_cast<int>(std::lround(canvasWidth * shrink)),
                 static_cast<int>(kMinCanvasSide), maxWidth);
         }
         if (canvasWidth > maxWidth)
         {
+            const double shrink = static_cast<double>(maxWidth) / canvasWidth;
             canvasWidth = maxWidth;
             canvasHeight = clampInt(
-                static_cast<int>(std::lround(canvasWidth / m_figureAspect)),
+                static_cast<int>(std::lround(canvasHeight * shrink)),
                 static_cast<int>(kMinCanvasSide), maxHeight);
         }
     }
 
     const QSize canvasSize(canvasWidth, canvasHeight);
+
+    /*显示比例：先按探针的解析换算给一个初值，渲染后再用**真实帧**实测校正。
+
+      为什么还要实测校正：解析式要同时依赖"探针空间跨度"和"投影分支的 W/H 换算"，
+      任何一处偏差都会让人物偏大或偏小。实测校正不依赖这些假设 —— 第一帧量出人物
+      实际占画布多少，就能精确算出还需要放大/缩小多少倍。*/
+    const double stretch = static_cast<double>(std::max(1, canvasHeight)) /
+                           static_cast<double>(std::max(1, canvasWidth));
+    m_displayRatio = clampDouble(kTargetFigureHeightRatio /
+                                     std::max(1e-6, m_figureSpanY / stretch),
+                                 0.05, 1.0);
+    m_renderer.setDisplayHeightRatio(static_cast<float>(m_displayRatio));
+
     resize(canvasSize);
     m_logicalCanvasSize = canvasSize;
+
+    /*余量自检：把「画布只比人物大一点点」这种本该被测试抓到的情况直接打到日志里，
+      省得只有测试失败时才知道裁了。真值来自渲染帧（见 probeFigureMetrics 的探针）。*/
+    const double marginRatio =
+        std::max(0.0, 1.0 - kTargetFigureHeightRatio) / 2.0;
+    qInfo() << "Live2D 画布:" << canvasSize << " 目标人物高" << targetFigureHeight
+            << " 人物占比" << kTargetFigureHeightRatio << " 每侧余量约"
+            << static_cast<int>(std::lround(marginRatio * 100)) << "% | 人物宽高比"
+            << m_figureAspect << " 显示比例" << m_displayRatio;
 
     if (!renderAndRegisterFrame())
     {
@@ -222,73 +316,138 @@ void Live2DCharacterWindow::relayoutContent()
         m_renderingFrame = false;
         return;
     }
+
+    /*实测校正：量出人物在这张真实帧里占画布多少，把显示比例精确修正到目标占比。
+
+      为什么要有这一步：解析换算要同时押中"探针空间跨度"与"投影分支的 W/H 换算"，
+      任何一处偏差都会让人物偏大偏小（实测解析值只能做到 50% 而非目标 84%）。
+      缩放因子与占比成正比，所以量一次就能一步到位，不需要反复试探。
+      只做一轮：第二轮与第一轮同帧同尺寸，收敛是确定的；多轮只会白白多渲染一帧。*/
+    {
+        QRect figureBounds;
+        const QImage frame = m_scaledImg;
+        if (!frame.isNull() && opaqueBoundsInFrame(&figureBounds))
+        {
+            // 占比用同一张帧的像素算，避免逻辑/物理像素换算又引入一次误差
+            const double measuredFraction =
+                static_cast<double>(figureBounds.height()) / frame.height();
+            if (measuredFraction > 1e-3)
+            {
+                const double corrected =
+                    clampDouble(m_displayRatio * (kTargetFigureHeightRatio / measuredFraction),
+                                0.05, 1.0);
+                qInfo() << "Live2D 占比校正: 实测占比" << measuredFraction << " 目标"
+                        << kTargetFigureHeightRatio << " 显示比例" << m_displayRatio << "→"
+                        << corrected;
+                m_displayRatio = corrected;
+                m_renderer.setDisplayHeightRatio(static_cast<float>(m_displayRatio));
+                if (!renderAndRegisterFrame())
+                    qWarning() << "Live2D 校正帧渲染失败，沿用上一帧";
+            }
+        }
+    }
+
     m_frameIndex = 0;
     refreshInteractiveRegion();
     m_renderingFrame = false;
 }
 
-/*探针渲染：按正方形画布渲一帧，用非透明像素包围盒量人物占比与宽高比。
-
-  不能用模型自然尺寸替代：renderFrame 的投影矩阵会把模型铺满目标画布
-  （见 Live2DOffscreenRenderer::renderFrame），画布本身不携带"模型多宽多高"的信息，
-  而模型画布宽高只有渲染器内部知道 —— 所以只能实测，不为渲染器新增 API。*/
-void Live2DCharacterWindow::probeFigureMetrics()
+/*量当前登记帧（m_scaledImg）里人物可见部分的像素包围盒。
+  layout 时用它实测校正显示比例。占比一律用同一张帧的像素算，
+  不做逻辑/物理像素换算 —— 那会再引入一次 dpr 取整误差。*/
+bool Live2DCharacterWindow::opaqueBoundsInFrame(QRect *bounds) const
 {
-    const QSize probeSize(kProbeCanvasHeight, kProbeCanvasHeight);
-    const QImage probe = m_renderer.renderFrame(probeSize);
-    if (probe.isNull())
-    {
-        qWarning() << "Live2D 探针渲染失败，退回默认尺寸";
-        m_figureAspect = kFallbackFigureAspect;
-        m_figureHeightRatio = kFallbackHeightRatio;
-        return;
-    }
+    if (bounds)
+        *bounds = QRect();
+    if (m_scaledImg.isNull())
+        return false;
 
-    //统一成 Format_RGBA8888 后逐行读，比逐像素 pixelColor() 快一个量级。
-    const QImage rgba = probe.convertToFormat(QImage::Format_RGBA8888);
-
+    const QImage rgba = m_scaledImg.convertToFormat(QImage::Format_RGBA8888);
     int minX = rgba.width();
     int minY = rgba.height();
     int maxX = -1;
     int maxY = -1;
-    qint64 opaqueCount = 0;
-    for (int y = 0; y < rgba.height(); y += kProbeSampleStride)
+    for (int y = 0; y < rgba.height(); ++y)
     {
         const uchar *line = rgba.constScanLine(y);
-        for (int x = 0; x < rgba.width(); x += kProbeSampleStride)
+        for (int x = 0; x < rgba.width(); ++x)
         {
             if (line[x * 4 + 3] <= 32)
                 continue;
-            ++opaqueCount;
             minX = std::min(minX, x);
             maxX = std::max(maxX, x);
             minY = std::min(minY, y);
             maxY = std::max(maxY, y);
         }
     }
+    if (maxX < minX || maxY < minY)
+        return false;
+    if (bounds)
+        *bounds = QRect(QPoint(minX, minY), QPoint(maxX, maxY));
+    return true;
+}
 
-    const qint64 probedPixels =
-        static_cast<qint64>(rgba.width() / kProbeSampleStride) *
-        static_cast<qint64>(rgba.height() / kProbeSampleStride);
-    if (maxX < minX || maxY < minY ||
-        opaqueCount < static_cast<qint64>(probedPixels * kMinProbeCoverage))
+/*探针：量出人物**可见部分**在绘制输出空间里的范围（多次取样求并集），
+  再由它推出宽高比与显示比例交给渲染器定位。
+
+  为什么要取样求并集：呼吸/物理会让姿势移动，单帧范围会在动作过程中被超出；
+  并集是"这段时间里人物占过的最大范围"，画布按它留余量才稳。
+
+  为什么渲染器现在能量准：模型变换按帧**无状态**重建（不再被 SetWidth 累积放大），
+  换算也补上了投影缩放；而且范围保留在**输出空间的浮点**里，不做模型画布像素取整
+  （本模型画布是 1x1，取整会把人物范围毁成 1x1）。*/
+void Live2DCharacterWindow::probeFigureMetrics()
+{
+    m_renderer.clearFigureSpan();
+    for (int i = 0; i < kProbeSamples; ++i)
+    {
+        // 取样之间真的让时间过去，呼吸/物理才会走到不同相位（i=0 不睡，省一次等待）
+        if (i > 0)
+        {
+            QThread::msleep(static_cast<unsigned long>(kProbeSampleIntervalMs));
+            QCoreApplication::processEvents();
+        }
+        // 探针固定 1:1：renderFrame 的投影留边会让非正方形探针的换算失真
+        const QImage probe = m_renderer.renderFrame(QSize(kProbeCanvasSide, kProbeCanvasSide));
+        if (probe.isNull())
+        {
+            qWarning() << "Live2D 探针渲染失败，退回默认尺寸";
+            m_figureAspect = kFallbackFigureAspect;
+            m_displayRatio = kFallbackHeightRatio;
+            m_renderer.clearFigureSpan();
+            return;
+        }
+        // probeFigureMetrics 会把本次可见范围并进渲染器的 FigureSpan
+        (void)m_renderer.probeFigureMetrics(probe);
+    }
+
+    /*人物可见范围只在探针里测一次；这里拿到的是**探针（1:1）空间**的跨度。
+      渲染器的缩放也在这个空间里算（relayoutContent 会用同一个值定 displayHeightRatio），
+      所以这里直接用原始 span，不再做 W/H 换算 —— 换算统一放在 relayoutContent。*/
+    const Live2DOffscreenRenderer::FigureMetrics raw = m_renderer.figureMetrics(
+        kProbeCanvasSide, kProbeCanvasSide);
+    if (!raw.valid)
     {
         qWarning() << "Live2D 探针几乎没画出内容，退回默认尺寸";
         m_figureAspect = kFallbackFigureAspect;
-        m_figureHeightRatio = kFallbackHeightRatio;
+        m_figureSpanY = kFallbackHeightRatio;
+        m_displayRatio = kFallbackHeightRatio;
+        m_renderer.clearFigureSpan();
         return;
     }
 
-    const int figureWidth = maxX - minX + 1;
-    const int figureHeight = maxY - minY + 1;
-    m_figureAspect = static_cast<double>(figureWidth) / static_cast<double>(figureHeight);
-    //采样步长会引入 ±stride 的误差，占比夹一下防止极端值把画布撑爆
-    m_figureHeightRatio =
-        clampDouble(static_cast<double>(figureHeight) / rgba.height(), 0.05, 1.0);
-    qInfo() << "Live2D 探针: 人物" << figureWidth << "x" << figureHeight
-            << " 宽高比" << m_figureAspect << " 高度占比" << m_figureHeightRatio;
-}
+    /*画布宽高比：用"换算到目标比例后"的可见范围宽高比。
+      先用探针比例自身做一次换算（此时 stretch=1 的等效情形），得到目标比例下的比例。*/
+    const int probeW = std::max(1, static_cast<int>(std::lround(kBaseCanvasHeight * 0.6)));
+    const Live2DOffscreenRenderer::FigureMetrics corrected =
+        m_renderer.figureMetrics(probeW, kBaseCanvasHeight);
+    m_figureAspect = clampDouble(corrected.valid ? corrected.boundsAspect : raw.boundsAspect,
+                                 0.05, 20.0);
+    m_figureSpanY = std::max(1e-6, static_cast<double>(raw.spanY));
 
+    qInfo() << "Live2D 探针:" << kProbeSamples << "次取样，人物探针空间跨度" << raw.spanX << "x"
+            << raw.spanY << " 探针比例" << raw.boundsAspect << " 目标比例" << m_figureAspect;
+}
 /*每帧：渲染 → 登记；交互区只在低频节拍上重算（QBitmap 构造成本太高，不能进帧热路径）*/
 void Live2DCharacterWindow::onFrameTick()
 {
