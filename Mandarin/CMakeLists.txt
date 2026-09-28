@@ -355,4 +355,52 @@ if(BUILD_TESTING)
             "$<TARGET_FILE_DIR:test_chatlogstore>"
     )
     add_test(NAME test_chatlogstore COMMAND test_chatlogstore)
+
+    add_executable(test_live2dmodelinfo
+        tests/test_live2dmodelinfo.cpp
+        utils/Live2DModelInfo.cpp
+    )
+    target_include_directories(test_live2dmodelinfo PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_BINARY_DIR}
+    )
+    target_link_libraries(test_live2dmodelinfo PRIVATE
+        Qt${QT_VERSION_MAJOR}::Test
+        Qt${QT_VERSION_MAJOR}::Core
+    )
+    set_target_properties(test_live2dmodelinfo PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_custom_command(TARGET test_live2dmodelinfo POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Test>"
+            "$<TARGET_FILE_DIR:test_live2dmodelinfo>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Core>"
+            "$<TARGET_FILE_DIR:test_live2dmodelinfo>"
+    )
+    add_test(NAME test_live2dmodelinfo COMMAND test_live2dmodelinfo)
+
+    add_executable(test_tachiegeometry
+        tests/test_tachiegeometry.cpp
+        utils/TachieGeometry.cpp
+    )
+    target_include_directories(test_tachiegeometry PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_BINARY_DIR}
+    )
+    target_link_libraries(test_tachiegeometry PRIVATE
+        Qt${QT_VERSION_MAJOR}::Test
+        Qt${QT_VERSION_MAJOR}::Core
+    )
+    set_target_properties(test_tachiegeometry PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_custom_command(TARGET test_tachiegeometry POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Test>"
+            "$<TARGET_FILE_DIR:test_tachiegeometry>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Core>"
+            "$<TARGET_FILE_DIR:test_tachiegeometry>"
+    )
+    add_test(NAME test_tachiegeometry COMMAND test_tachiegeometry)
 endif()
