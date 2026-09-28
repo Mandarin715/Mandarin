@@ -1305,6 +1305,43 @@ git commit -m "docs(live2d): record stage 0-1 regression checklist and results"
      > 与真实原因无关的错（如 `Core: 不是类或命名空间名称`），极难排查。
   3. 渲染器类名是 **`CubismRenderer_OpenGLES2`**（桌面 GL 也走这套 ES2 风格接口），配套离屏类是
      `CubismOffscreenManager_OpenGLES2` / `CubismOffscreenRenderTarget_OpenGLES2` —— 正对应方案里的离屏管线。
+
+**阶段 2 已完成「离屏渲染一帧」的实证，以下 6 条是实测踩出来的，务必照抄**（实现见
+`Mandarin/utils/Live2DCubismRuntime.{h,cpp}` / `Live2DOffscreenRenderer.{h,cpp}`，
+验证见 `Mandarin/tests/test_live2doffscreen.cpp`；产物 `build2/tests/live2d-probe/*.png`）：
+
+4. **必须把框架着色器拷到可执行文件旁**。桌面 GL 下框架从 **CWD 相对路径**读着色器源码
+   （`"FrameworkShaders/VertShaderSrc.vert"` 等，`CubismShader_OpenGLES2.cpp`），
+   而 SDK 里**没有**现成的 `FrameworkShaders/` 目录 —— 源在
+   `Framework/src/Rendering/OpenGL/Shaders/Standard`。不拷过去的现象是**什么都不画**，
+   日志里只有 `[CSM][E]File loader is not set.` 这类误导信息。资源读取钩子还要**带回退解析**
+   （CWD 找不到就试可执行文件目录），因为 ctest 的 CWD 与 exe 目录不同。
+
+5. **`Option` 必须有进程级生命周期**。`CubismFramework::StartUp` 只存 `option` 的**指针**，不拷贝。
+   把 `Option` 放在函数栈上 → 悬空 → 现象同样是 `File loader is not set.`，且**不崩溃**，极难排查。
+   官方样例把它做成 `LAppAppDelegate` 的成员就是这个原因。
+
+6. **贴图必须 `glGenerateMipmap`**。框架每次绘制会把 `GL_TEXTURE_MIN_FILTER` 设成
+   `GL_LINEAR_MIPMAP_LINEAR`；贴图没有 mipmap 就是"不完整纹理"，GL 规定采样返回 `(0,0,0,1)`，
+   表现为 **形状完全正确、纯黑的剪影**（因为 Live2D 的 drawable 是贴合美术的多边形网格）。
+   官方 `LAppTextureManager` 同样在 `glTexImage2D` 后调了 `glGenerateMipmap`。
+
+7. **`QSurfaceFormat` 请求 2.0，不要请求 3.0**。实测请求 `3.0` 时驱动给出精确的 3.0 上下文，
+   Cubism 绘制阶段会返回 `GL_INVALID_OPERATION` 且**整帧什么都没画**（全透明）；
+   请求 `2.0` 反而拿到 **4.6.0 兼容上下文**，一切正常。
+
+8. **读回用 `glReadPixels`，不要用 `glGetTexImage`**。后者在本机 NVIDIA 驱动上**直接崩溃**
+   （`0xC0000005`，栈里是 `DrvPresentBuffers`）。用 `BeginDraw()` 绑回 FBO →
+   `glReadPixels(0,0,w,h,GL_RGBA,GL_UNSIGNED_BYTE,...)` → `EndDraw()`，再**垂直镜像**（GL 原点左下）。
+
+9. **参数覆盖要夹在 `LoadParameters()` 之后、`SaveParameters()` 之前**。顺序是
+   `LoadParameters → 施加覆盖 → physics->Evaluate → SaveParameters → model->Update()`；
+   放在外面第一帧就会被还原冲掉。另外 `_renderer` 在 `CubismUserModel` 里是 **private**，
+   只能经 `GetRenderer<T>()` 取。
+
+10. **测试断言不要用"两帧像素差异"证明参数生效**：帧间物理动画（头发/呼吸）本来就会变，
+    像素差异无法区分"参数生效"和"动画推进"。要断言就**回读参数值**（`GetParameterValue`），
+    视觉正确性另行**导出 PNG 目视确认** —— 阶段 2 的水印极性错误就是靠看图才发现的。
 - **计划 C（阶段 3–7）**：`parameter-map.json` 生成（用 Task 2 的 `Live2DModelInfo` + 模型自带 `vtube.json`）、指纹校验、表情/动作外部加载、水印显式关闭、`PresentationController` 状态机与口型三要素。
 - **计划 D（阶段 8–10）**：点击交互、模型导入 UI、打包合规检查。
 

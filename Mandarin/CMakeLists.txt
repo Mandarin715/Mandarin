@@ -504,4 +504,50 @@ if(BUILD_TESTING)
             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
         add_test(NAME test_cubismframework COMMAND test_cubismframework)
     endif()
+
+    # Live2D 离屏渲染端到端验证（唯一需要真实 GL 上下文的测试）
+    if(WIN32 AND TARGET Framework)
+        add_executable(test_live2doffscreen
+            tests/test_live2doffscreen.cpp
+            utils/Live2DOffscreenRenderer.cpp
+            utils/Live2DCubismRuntime.cpp
+            utils/Live2DModelInfo.cpp
+        )
+        target_include_directories(test_live2doffscreen PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}
+        )
+        target_link_libraries(test_live2doffscreen PRIVATE
+            Qt${QT_VERSION_MAJOR}::Test
+            Qt${QT_VERSION_MAJOR}::Gui
+            Framework
+        )
+        set_target_properties(test_live2doffscreen PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+
+        # 桌面 GL 下框架从 CWD 相对路径读**着色器源码**（"FrameworkShaders/*.vert|frag"），
+        # 而 SDK 里并没有现成的 FrameworkShaders 目录 —— 源在
+        # Framework/src/Rendering/OpenGL/Shaders/Standard。不拷过去就是全白（什么都不画）。
+        add_custom_command(TARGET test_live2doffscreen POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_FILE_DIR:test_live2doffscreen>/FrameworkShaders"
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CUBISM_SDK_DIR}/Framework/src/Rendering/OpenGL/Shaders/Standard"
+                "$<TARGET_FILE_DIR:test_live2doffscreen>/FrameworkShaders"
+            # QOffscreenSurface 需要一个平台插件；测试跑在 tests/ 下，Qt 不会自动找到
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "$<TARGET_FILE_DIR:Qt${QT_VERSION_MAJOR}::Core>/../plugins/platforms"
+                "$<TARGET_FILE_DIR:test_live2doffscreen>/platforms"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Test>"
+                "$<TARGET_FILE_DIR:test_live2doffscreen>"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Core>"
+                "$<TARGET_FILE_DIR:test_live2doffscreen>"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Gui>"
+                "$<TARGET_FILE_DIR:test_live2doffscreen>"
+        )
+        add_test(NAME test_live2doffscreen COMMAND test_live2doffscreen)
+    endif()
 endif()
