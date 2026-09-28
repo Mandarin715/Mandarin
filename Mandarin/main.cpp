@@ -2,6 +2,9 @@
 #include "windows/setting/setting.h"
 #include "windows/tachie/tachie.h"
 #include "windows/character/characterwindowbase.h"
+#include "windows/character/live2dcharacterwindow.h"
+
+#include "GlobalConstants.h"
 
 #include "ElaApplication.h"
 #include "ElaMenu.h"
@@ -10,12 +13,14 @@
 
 #include <QApplication>
 #include <QColor>
+#include <QDebug>
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QNetworkProxy>
 #include <QPalette>
 #include <QStandardPaths>
+#include <QSettings>
 #include <QSystemTrayIcon>
 
 #include <QDir>
@@ -130,7 +135,41 @@ int main(int argc, char *argv[])
     /*窗口创建*/
     Dialog dialogWin;
     dialogWin.show();
-    CharacterWindowBase *characterWin = new Tachie();
+
+    //立绘渲染器由配置决定：默认 png，保持既有行为不变；live2d 为显式选择加入。
+    QSettings mainSettings(IniSettingPath, QSettings::IniFormat);
+    const QString renderMode =
+        mainSettings.value("character/renderMode", "png").toString().trimmed().toLower();
+    const QString live2dModel =
+        mainSettings.value("character/live2dModel", "miku").toString().trimmed();
+    CharacterWindowBase *characterWin = nullptr;
+    if (renderMode == "live2d")
+    {
+#ifdef MANDARIN_HAS_LIVE2D
+        auto *live2dWin = new Live2DCharacterWindow();
+        //重载内容会真正装载模型；失败必须能感知，否则用户会得到一个看不见的桌宠。
+        live2dWin->reloadContent(live2dModel);
+        if (live2dWin->isModelLoaded())
+        {
+            characterWin = live2dWin;
+        }
+        else
+        {
+            qWarning() << "Live2D 模型装载失败，回退到 PNG 立绘:" << live2dModel;
+            delete live2dWin;
+            characterWin = new Tachie();
+        }
+#else
+        qWarning() << "本构建未包含 Live2D SDK（live2d 渲染器不可用），回退到 PNG 立绘";
+        characterWin = new Tachie();
+#endif
+    }
+    else
+    {
+        if (renderMode != "png")
+            qWarning() << "未知的 character/renderMode，按 png 处理:" << renderMode;
+        characterWin = new Tachie();
+    }
     characterWin->show();
     MainWindow *settings = nullptr;
 

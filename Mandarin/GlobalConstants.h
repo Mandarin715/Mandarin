@@ -19,6 +19,12 @@ inline const QString CharacterAssestPath =
     QDir(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation))
         .filePath("Mandarin/Character/Assets");
 
+//Live2D 模型根目录（全局共享模型，故意放在安装目录之外：
+//模型授权禁二传，不入库也不随包分发，由用户自行放置）
+inline const QString Live2DModelRootPath =
+    QDir(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation))
+        .filePath("Mandarin/Live2D");
+
 //角色配置位置
 inline const QString CharacterUserConfigPath =
     QDir(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation))

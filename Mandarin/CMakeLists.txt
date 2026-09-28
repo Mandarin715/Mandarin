@@ -409,6 +409,44 @@ else()
     message(STATUS "Live2D Cubism Framework 未接线（缺 Core 或 GLEW）")
 endif()
 
+# ---- Live2D 目标源码接线（必须放在 Framework 定义**之后**，TARGET 判断才有意义）----
+# 主程序也要编 Live2D 渲染源（此前这些文件只挂在 test_live2doffscreen 上，主程序从没编过）。
+# SDK 缺席时**既不编这些源、也不定义 MANDARIN_HAS_LIVE2D**：
+# main.cpp 的 live2d 分支被该宏条件编译掉，于是退化成纯 PNG 构建（不会引用到 Framework 符号）。
+# 注意：Live2DOffscreenRenderer.cpp include 的是 <CubismFramework.hpp> 这类 SDK 头，
+# 由 Framework 的 PUBLIC include 目录提供，而该目标只在 SDK 就位时存在 —— 两者必须同生共死。
+if(TARGET Framework)
+    target_sources(Mandarin PRIVATE
+        windows/character/live2dcharacterwindow.h windows/character/live2dcharacterwindow.cpp
+        utils/Live2DCubismRuntime.h utils/Live2DCubismRuntime.cpp
+        utils/Live2DOffscreenRenderer.h utils/Live2DOffscreenRenderer.cpp
+        utils/Live2DModelInfo.h utils/Live2DModelInfo.cpp
+    )
+    # Framework 已经 PUBLIC 带了 CSM_TARGET_WIN_GL / Core/include / GLEW，这里无需重复
+    target_link_libraries(Mandarin PRIVATE Framework)
+    target_compile_definitions(Mandarin PRIVATE MANDARIN_HAS_LIVE2D)
+    # Cubism Core 的静态库默认引 LIBCMT（静态 CRT），与 Qt 的 /MD 混链时链接器会给
+    # LNK4098「默认库冲突」（实际按 /MD 解析，运行无碍）。这里按链接器自己的建议显式排除，
+    # 免得真正的告警被这条噪音淹没。
+    target_link_options(Mandarin PRIVATE /NODEFAULTLIB:LIBCMT)
+
+    # Cubism 的桌面 GL 着色器是运行时按 CWD 相对路径读**源码**的（"FrameworkShaders/*.vert|frag"），
+    # SDK 里并没有现成的 FrameworkShaders/ 目录 —— 源在
+    # Framework/src/Rendering/OpenGL/Shaders/Standard。不拷到 exe 同级就是模型全白，
+    # 与 test_live2doffscreen / test_live2dwindow 的处理一致。
+    # 注意：这条 add_custom_command 必须在 Framework 目标存在之后才生效，
+    # 所以只能放在这里（WIN32 链接块在它之前，那里 if(TARGET Framework) 恒为假）。
+    if(WIN32)
+        add_custom_command(TARGET Mandarin POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_FILE_DIR:Mandarin>/FrameworkShaders"
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CUBISM_SDK_DIR}/Framework/src/Rendering/OpenGL/Shaders/Standard"
+                "$<TARGET_FILE_DIR:Mandarin>/FrameworkShaders"
+        )
+    endif()
+endif()
+
 # ---- 单元测试（Qt Test）----
 include(CTest)
 if(BUILD_TESTING)
@@ -551,5 +589,60 @@ if(BUILD_TESTING)
                 "$<TARGET_FILE_DIR:test_live2doffscreen>"
         )
         add_test(NAME test_live2doffscreen COMMAND test_live2doffscreen)
+    endif()
+
+    # Live2D 立绘窗口：验证窗口层真的用渲染帧把自己「塑形」出来了
+    #（纯公开 API 测试；除渲染帧形状外不做别的假设）
+    if(WIN32 AND TARGET Framework)
+        add_executable(test_live2dwindow
+            tests/test_live2dwindow.cpp
+            windows/character/characterwindowbase.cpp
+            windows/character/live2dcharacterwindow.cpp
+            utils/DragHelper.cpp
+            utils/Live2DOffscreenRenderer.cpp
+            utils/Live2DCubismRuntime.cpp
+            utils/Live2DModelInfo.cpp
+        )
+        target_include_directories(test_live2dwindow PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}
+        )
+        target_link_libraries(test_live2dwindow PRIVATE
+            Qt${QT_VERSION_MAJOR}::Test
+            Qt${QT_VERSION_MAJOR}::Gui
+            Qt${QT_VERSION_MAJOR}::Widgets
+            Framework
+        )
+        # 同 Mandarin：Cubism Core 静态库带进静态 CRT 引子，与 /MD 混链会报 LNK4098 噪音
+        target_link_options(test_live2dwindow PRIVATE /NODEFAULTLIB:LIBCMT)
+        set_target_properties(test_live2dwindow PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+
+        # 与 test_live2doffscreen 同样的两条运行时依赖：
+        # 着色器源码必须放在 exe 同级的 FrameworkShaders/（否则模型全白），
+        # 离屏 GL 上下文需要 Qt 的 platforms 插件目录。
+        add_custom_command(TARGET test_live2dwindow POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_FILE_DIR:test_live2dwindow>/FrameworkShaders"
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CUBISM_SDK_DIR}/Framework/src/Rendering/OpenGL/Shaders/Standard"
+                "$<TARGET_FILE_DIR:test_live2dwindow>/FrameworkShaders"
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "$<TARGET_FILE_DIR:Qt${QT_VERSION_MAJOR}::Core>/../plugins/platforms"
+                "$<TARGET_FILE_DIR:test_live2dwindow>/platforms"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Test>"
+                "$<TARGET_FILE_DIR:test_live2dwindow>"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Core>"
+                "$<TARGET_FILE_DIR:test_live2dwindow>"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Gui>"
+                "$<TARGET_FILE_DIR:test_live2dwindow>"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Widgets>"
+                "$<TARGET_FILE_DIR:test_live2dwindow>"
+        )
+        add_test(NAME test_live2dwindow COMMAND test_live2dwindow)
     endif()
 endif()
