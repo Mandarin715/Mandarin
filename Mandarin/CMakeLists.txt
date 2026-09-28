@@ -2,6 +2,14 @@ cmake_minimum_required(VERSION 3.16)
 
 project(Mandarin VERSION 1.14.3 LANGUAGES CXX)
 
+# MSVC 默认按系统代码页解析源文件（中文 Windows 上是 936/GBK），会把中文注释与字面量读坏，
+# 表现为 C4819 + C1071（"在注释中遇到意外的文件结束"）。
+# 链接 Qt 的目标会由 Qt6::Core 带上 /utf-8，**不链接 Qt 的目标不会**，所以这里全局显式指定；
+# 源文件一律以 UTF-8（无 BOM）保存。
+if(MSVC)
+    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/utf-8>")
+endif()
+
 if(APPLE)
     set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "Build universal binaries")
     list(APPEND CMAKE_FRAMEWORK_PATH "/System/Library/Frameworks")
@@ -327,6 +335,46 @@ if(QT_VERSION_MAJOR EQUAL 6)
     qt_finalize_executable(Mandarin)
 endif()
 
+# ---- Live2D Cubism SDK for Native（专有许可，目录不入版本库）----
+# 官方 zip 解压后会多一层 CubismSdkForNative-5-r.x/，这里自动下钻一层，省得手工改名。
+set(CUBISM_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/Live2DCubismSDK"
+    CACHE PATH "Live2D Cubism SDK for Native 解压根目录")
+if(NOT EXISTS "${CUBISM_SDK_DIR}/Core/include/Live2DCubismCore.h")
+    file(GLOB _cubism_candidates "${CUBISM_SDK_DIR}/CubismSdkForNative-*")
+    foreach(_cubism_candidate ${_cubism_candidates})
+        if(EXISTS "${_cubism_candidate}/Core/include/Live2DCubismCore.h")
+            set(CUBISM_SDK_DIR "${_cubism_candidate}")
+            break()
+        endif()
+    endforeach()
+endif()
+
+set(CUBISM_CORE_DIR "")
+set(CUBISM_CORE_LIB "")
+if(WIN32 AND EXISTS "${CUBISM_SDK_DIR}/Core/include/Live2DCubismCore.h")
+    # Core 预编译库按 MSVC 工具集版本分目录（143 = VS2022，142 = VS2019，141 = VS2017），
+    # 取第一个存在的；本工程生成器是 "Visual Studio 17 2022"，命中 143。
+    foreach(_cubism_toolset 143 142 141)
+        if(EXISTS "${CUBISM_SDK_DIR}/Core/lib/windows/x86_64/${_cubism_toolset}")
+            set(CUBISM_CORE_DIR "${CUBISM_SDK_DIR}/Core/lib/windows/x86_64/${_cubism_toolset}")
+            break()
+        endif()
+    endforeach()
+
+    if(CUBISM_CORE_DIR)
+        # 选静态库而不是 Core/dll 下的 DLL 版：少一个要随包分发的文件。
+        # CRT 必须与配置匹配（Qt 用 /MD）：Debug -> _MDd，其余 -> _MD。
+        set(CUBISM_CORE_LIB
+            "$<$<CONFIG:Debug>:${CUBISM_CORE_DIR}/Live2DCubismCore_MDd.lib>"
+            "$<$<NOT:$<CONFIG:Debug>>:${CUBISM_CORE_DIR}/Live2DCubismCore_MD.lib>")
+    endif()
+
+    message(STATUS "Live2D Cubism SDK: base=${CUBISM_SDK_DIR}")
+    message(STATUS "Live2D Cubism Core: ${CUBISM_CORE_DIR}")
+else()
+    message(STATUS "Live2D Cubism SDK 未就位，跳过（Live2D 相关目标不可用）")
+endif()
+
 # ---- 单元测试（Qt Test）----
 include(CTest)
 if(BUILD_TESTING)
@@ -403,4 +451,15 @@ if(BUILD_TESTING)
             "$<TARGET_FILE_DIR:test_tachiegeometry>"
     )
     add_test(NAME test_tachiegeometry COMMAND test_tachiegeometry)
+
+    # Cubism Core 编译/链接冒烟（不依赖 Qt；用静态库，无需拷贝 DLL）
+    if(WIN32 AND CUBISM_CORE_LIB)
+        add_executable(test_cubismcore tests/test_cubismcore.cpp)
+        target_include_directories(test_cubismcore PRIVATE
+            "${CUBISM_SDK_DIR}/Core/include")
+        target_link_libraries(test_cubismcore PRIVATE ${CUBISM_CORE_LIB})
+        set_target_properties(test_cubismcore PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+        add_test(NAME test_cubismcore COMMAND test_cubismcore)
+    endif()
 endif()

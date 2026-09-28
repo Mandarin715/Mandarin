@@ -102,110 +102,159 @@ int main()
 Run: `cmake --build "build2" --config Release --target test_cubismcore`
 Expected: FAIL —— 目标不存在（`test_cubismcore` 尚未加进 CMake，构建系统报 "unknown target"）。这是本任务的"红"。
 
-- [ ] **Step 3: 解压 SDK 并核对真实布局**
+- [x] **Step 3: 解压 SDK 并核对真实布局**（2026-09-28 已完成，实测结构如下）
 
-把使用者下载的 `CubismSdkForNative-5-r.x.zip` **解压到 `Mandarin/3rdparty/Live2DCubismSDK/`**（保留官方那层 `CubismSdkForNative-5-r.x/` 也行，下一步的 CMake 会自动下钻一层）：
+解压到 `Mandarin/3rdparty/Live2DCubismSDK/`（官方那层 `CubismSdkForNative-5-r.5/` 保留即可，CMake 会自动下钻）。**实测真实结构**：
 
 ```
-Mandarin/3rdparty/Live2DCubismSDK/
-├── CubismSdkForNative-5-r.5/          ← 官方原样保留也可
-│   ├── Core/include/Live2DCubismCore.h
-│   ├── Core/lib/windows/x86_64/*.lib
-│   └── Framework/src/...
+Mandarin/3rdparty/Live2DCubismSDK/CubismSdkForNative-5-r.5/
+├── Core/
+│   ├── include/Live2DCubismCore.h
+│   ├── lib/windows/x86_64/<工具集>/*.lib      ← 实测多一层工具集目录！
+│   └── dll/windows/x86_64/Live2DCubismCore.{dll,lib}   ← DLL 版（本工程不用）
+└── Framework/
+    ├── CMakeLists.txt        ← 官方构建脚本，target 名 = Framework (STATIC)
+    └── src/  (75 个 .cpp)
+        └── Rendering/{D3D9,D3D11,OpenGL,Vulkan}/   ← 4 个后端
 ```
 
-Run:
-```powershell
-Get-ChildItem "Mandarin\3rdparty\Live2DCubismSDK\Core\lib\windows\x86_64" | Select-Object Name
-Get-ChildItem "Mandarin\3rdparty\Live2DCubismSDK\Core\include" | Select-Object Name
+**实测与计划假设的 3 处差异（已据此修正下面的 CMake）**：
+
+1. **Core 静态库多一层「MSVC 工具集版本」目录**：`lib/windows/x86_64/{141,142,143}/`，且每个目录下有 4 个变体
+   `Live2DCubismCore_{MD,MDd,MT,MTd}.lib`。141=VS2017、142=VS2019、**143=VS2022**。
+   本工程生成器是 `Visual Studio 17 2022` → 取 `143`；CRT 跟配置走：**Debug→`_MDd`，其余→`_MD`**（Qt 用 `/MD`）。
+   选**静态库**而非 `Core/dll/` 下的 DLL 版，少一个要随包分发的文件。
+2. **`Framework/src` 里含 4 个渲染后端**（D3D9 7 个、D3D11 8 个、OpenGL 5 个、Vulkan 6 个）。
+   **绝不能 `file(GLOB_RECURSE .../Framework/src/*.cpp)` 全量编译** —— 会连带编译 Vulkan/D3D 后端（Vulkan 还要 Vulkan SDK）。
+   官方做法：父级先设 `FRAMEWORK_SOURCE=OpenGL`（`Rendering/CMakeLists.txt` 里 `add_subdirectory(${FRAMEWORK_SOURCE})`），再 `add_subdirectory(Framework)`。
+3. **OpenGL 后端在 Windows 上 `#include <GL/glew.h>`**（`CubismRenderer_OpenGLES2.hpp` L33-35，条件 `CSM_TARGET_WIN_GL`）
+   —— **SDK 不自带 GLEW**，这是阶段 2 必须补的外部依赖（见"后续计划"）。
+
+> `csmGetVersion()` 实测返回 **6.0.0**（raw `0x06000001`），`csmGetLatestMocVersion()` = 6。
+> **Core 的版本号与 SDK 包名 `5-r.5` 不是一回事**，不要用包名去推断 Core 版本。
+> 另：`typedef unsigned int csmVersion;` / `csmMocVersion`，都是普通 typedef（不是 enum class）。
+
+- [x] **Step 4: 在 CMakeLists.txt 里接线 SDK**（2026-09-28 已完成并实测通过）
+
+先在 `Mandarin/CMakeLists.txt` 的 `project(...)` 之后加一条**全局编译选项**（实测发现：不链 Qt 的目标不会被 Qt 带上 `/utf-8`，MSVC 会按 GBK 解析源码，导致中文注释报 `C4819 + C1071`）：
+
+```cmake
+# MSVC 默认按系统代码页解析源文件（中文 Windows 上是 936/GBK），会把中文注释与字面量读坏，
+# 表现为 C4819 + C1071（"在注释中遇到意外的文件结束"）。
+# 链接 Qt 的目标会由 Qt6::Core 带上 /utf-8，**不链接 Qt 的目标不会**，所以这里全局显式指定；
+# 源文件一律以 UTF-8（无 BOM）保存。
+if(MSVC)
+    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/utf-8>")
+endif()
 ```
 
-Expected: 看到 `Live2DCubismCore*.lib` 与 `Live2DCubismCore.h`。**记录真实文件名**，下一步据此校正。
-
-- [ ] **Step 4: 在 CMakeLists.txt 里接线 SDK**
-
-在 `Mandarin/CMakeLists.txt` 的 `if(QT_VERSION_MAJOR EQUAL 6) ... qt_finalize_executable(Mandarin) endif()` 之后、`# ---- 单元测试（Qt Test）----` 之前插入：
+然后在 `qt_finalize_executable(Mandarin)` 之后、`# ---- 单元测试（Qt Test）----` 之前插入：
 
 ```cmake
 # ---- Live2D Cubism SDK for Native（专有许可，目录不入版本库）----
-# Qt 用 /MD，故优先取 Core 的 MD 变体；未找到则退回到唯一那个 .lib。
+# 官方 zip 解压后会多一层 CubismSdkForNative-5-r.x/，这里自动下钻一层，省得手工改名。
 set(CUBISM_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/Live2DCubismSDK"
     CACHE PATH "Live2D Cubism SDK for Native 解压根目录")
-
-# 官方 zip 解压后会多一层 CubismSdkForNative-5-r.x/，这里自动下钻一层，省得手工改名。
 if(NOT EXISTS "${CUBISM_SDK_DIR}/Core/include/Live2DCubismCore.h")
     file(GLOB _cubism_candidates "${CUBISM_SDK_DIR}/CubismSdkForNative-*")
-    foreach(_candidate ${_cubism_candidates})
-        if(EXISTS "${_candidate}/Core/include/Live2DCubismCore.h")
-            set(CUBISM_SDK_DIR "${_candidate}")
+    foreach(_cubism_candidate ${_cubism_candidates})
+        if(EXISTS "${_cubism_candidate}/Core/include/Live2DCubismCore.h")
+            set(CUBISM_SDK_DIR "${_cubism_candidate}")
             break()
         endif()
     endforeach()
 endif()
 
+set(CUBISM_CORE_DIR "")
+set(CUBISM_CORE_LIB "")
 if(WIN32 AND EXISTS "${CUBISM_SDK_DIR}/Core/include/Live2DCubismCore.h")
-    file(GLOB CUBISM_CORE_LIBS "${CUBISM_SDK_DIR}/Core/lib/windows/x86_64/*.lib")
-    set(CUBISM_CORE_LIB "")
-    foreach(_cubism_lib ${CUBISM_CORE_LIBS})
-        if(_cubism_lib MATCHES "_MD\\.lib$")
-            set(CUBISM_CORE_LIB "${_cubism_lib}")
+    # Core 预编译库按 MSVC 工具集版本分目录（143 = VS2022，142 = VS2019，141 = VS2017），
+    # 取第一个存在的；本工程生成器是 "Visual Studio 17 2022"，命中 143。
+    foreach(_cubism_toolset 143 142 141)
+        if(EXISTS "${CUBISM_SDK_DIR}/Core/lib/windows/x86_64/${_cubism_toolset}")
+            set(CUBISM_CORE_DIR "${CUBISM_SDK_DIR}/Core/lib/windows/x86_64/${_cubism_toolset}")
+            break()
         endif()
     endforeach()
-    if(NOT CUBISM_CORE_LIB AND CUBISM_CORE_LIBS)
-        list(GET CUBISM_CORE_LIBS 0 CUBISM_CORE_LIB)
+
+    if(CUBISM_CORE_DIR)
+        # 选静态库而不是 Core/dll 下的 DLL 版：少一个要随包分发的文件。
+        # CRT 必须与配置匹配（Qt 用 /MD）：Debug -> _MDd，其余 -> _MD。
+        set(CUBISM_CORE_LIB
+            "$<$<CONFIG:Debug>:${CUBISM_CORE_DIR}/Live2DCubismCore_MDd.lib>"
+            "$<$<NOT:$<CONFIG:Debug>>:${CUBISM_CORE_DIR}/Live2DCubismCore_MD.lib>")
     endif()
 
-    # Framework 是开源框架源码，自己编成静态库，避免依赖其自带 CMake target 名。
-    file(GLOB_RECURSE CUBISM_FRAMEWORK_SOURCES "${CUBISM_SDK_DIR}/Framework/src/*.cpp")
-    add_library(CubismNativeFramework STATIC ${CUBISM_FRAMEWORK_SOURCES})
-    target_include_directories(CubismNativeFramework PUBLIC
-        "${CUBISM_SDK_DIR}/Core/include"
-        "${CUBISM_SDK_DIR}/Framework/src")
-    target_compile_definitions(CubismNativeFramework PUBLIC CSM_TARGET_WIN_GL)
-    target_link_libraries(CubismNativeFramework PUBLIC opengl32 "${CUBISM_CORE_LIB}")
-    message(STATUS "Live2D Cubism SDK: Core=${CUBISM_CORE_LIB}, Framework sources=${CUBISM_FRAMEWORK_SOURCES}")
+    message(STATUS "Live2D Cubism SDK: base=${CUBISM_SDK_DIR}")
+    message(STATUS "Live2D Cubism Core: ${CUBISM_CORE_DIR}")
 else()
     message(STATUS "Live2D Cubism SDK 未就位，跳过（Live2D 相关目标不可用）")
 endif()
 ```
 
-- [ ] **Step 5: 加冒烟测试目标**
+> **Framework 静态库不在本任务里建**：它需要先补 GLEW，且必须走官方 `add_subdirectory(Framework)` + 预设 `FRAMEWORK_SOURCE=OpenGL` 的路线（不能 glob）。这段留到阶段 2，见「后续计划」。
+> 实测配置输出：
+> ```
+> -- Live2D Cubism SDK: base=.../3rdparty/Live2DCubismSDK/CubismSdkForNative-5-r.5
+> -- Live2D Cubism Core: .../Core/lib/windows/x86_64/143
+> ```
 
-在 `Mandarin/CMakeLists.txt` 的 `if(BUILD_TESTING)` 段内、`endif()` 之前追加：
+- [x] **Step 5: 加冒烟测试目标**
+
+在 `Mandarin/CMakeLists.txt` 的 `if(BUILD_TESTING)` 段内、`endif()` 之前追加（`CUBISM_CORE_LIB` 是含生成器表达式的**列表**，不要再加引号包成单个字符串）：
 
 ```cmake
-    # Cubism Core 编译/链接冒烟（不依赖 Qt，无需拷贝 DLL；若实测 Core 带 .dll 则补 copy）
+    # Cubism Core 编译/链接冒烟（不依赖 Qt；用静态库，无需拷贝 DLL）
     if(WIN32 AND CUBISM_CORE_LIB)
         add_executable(test_cubismcore tests/test_cubismcore.cpp)
         target_include_directories(test_cubismcore PRIVATE
             "${CUBISM_SDK_DIR}/Core/include")
-        target_link_libraries(test_cubismcore PRIVATE "${CUBISM_CORE_LIB}")
+        target_link_libraries(test_cubismcore PRIVATE ${CUBISM_CORE_LIB})
         set_target_properties(test_cubismcore PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
         add_test(NAME test_cubismcore COMMAND test_cubismcore)
     endif()
 ```
 
-- [ ] **Step 6: 重新 configure 并构建**
+- [x] **Step 6: 重新 configure 并构建**（已完成）
 
 Run: `cmake -S Mandarin -B build2` 然后 `cmake --build "build2" --config Release --target test_cubismcore`
-Expected: PASS —— 配置阶段打印 `Live2D Cubism SDK: Core=...`；编译链接成功。
+实测结果：配置阶段打印 `Live2D Cubism SDK: base=...` / `Live2D Cubism Core: .../143`；`test_cubismcore.vcxproj -> ...\tests\Release\test_cubismcore.exe`。
 
-- [ ] **Step 7: 运行冒烟测试**
+- [x] **Step 7: 运行冒烟测试**（已完成）
 
 Run: `ctest --test-dir build2 -C Release -R test_cubismcore --output-on-failure`
-Expected: PASS，输出 `OK: Cubism Core 5.x.x`。
+实测输出（**注意是 6.0.0，不是 5.x**）：
 
-- [ ] **Step 8: 确认 SDK 未进版本库**
+```
+OK: Cubism Core 6.0.0 (raw 0x06000001), latest moc version 6
+```
 
-Run: `git status --short`
-Expected: **不出现** `3rdparty/Live2DCubismSDK` 下任何文件。
+- [x] **Step 8: 验证 `/utf-8` 全局改动无回归**（新增步骤，实测通过）
 
-- [ ] **Step 9: Commit**
+`/utf-8` 是全局编译选项，会影响主程序全部源文件，必须单独验证：
+
+```powershell
+cmake --build "build2" --config Release --target Mandarin   # 主程序重编，期望零 error/warning
+ctest --test-dir build2 -C Release --output-on-failure      # 期望 4/4 通过
+```
+
+实测：`Mandarin.vcxproj -> build2\Release\Mandarin.exe`，无 error/warning；`100% tests passed, 0 tests failed out of 4`。
+
+- [x] **Step 9: 确认 SDK 未进版本库**（已完成）
+
+Run: `git status --short` → 只出现 `Mandarin/CMakeLists.txt`、`tests/test_cubismcore.cpp`、计划文档；`git check-ignore` 命中 `.gitignore:121`。
+
+- [ ] **Step 10: Commit**
 
 ```bash
-git add Mandarin/CMakeLists.txt Mandarin/tests/test_cubismcore.cpp
-git commit -m "build(live2d): wire Cubism Native Core/Framework into CMake with a link smoke test"
+git add Mandarin/CMakeLists.txt Mandarin/tests/test_cubismcore.cpp Mandarin/docs/Live2D实施计划-阶段0-1.md
+git commit -m "build(live2d): wire Cubism Core (v143/_MD) into CMake with a link smoke test
+
+- auto-descend into CubismSdkForNative-*, pick toolset dir 143 for VS2022
+- per-config CRT: Debug -> _MDd, otherwise _MD; static lib, no DLL to ship
+- add global /utf-8 for MSVC: non-Qt targets would otherwise parse UTF-8 as GBK (C4819/C1071)
+- smoke test asserts csmGetVersion() and csmGetLatestMocVersion(); Core reports 6.0.0"
 ```
 
 ---
@@ -1214,6 +1263,20 @@ git commit -m "docs(live2d): record stage 0-1 regression checklist and results"
 
 建议拆分：
 - **计划 B（阶段 2）**：SDK 渲染管线 —— 离屏 FBO + 读回 RGBA `QImage` + `Live2DCharacterWindow` 子类 + 接 `updateRenderedImage()`。
+  **已实测确定的前置与路线（Task 1 执行时发现，务必照此写）**：
+  1. **必须先补 GLEW**：`CubismRenderer_OpenGLES2.hpp` 在 `CSM_TARGET_WIN_GL` 下 `#include <GL/glew.h>`，而 SDK 不含 GLEW。
+     建议取官方发布包里的 **静态库 `glew32s.lib` + 头文件**，放 `Mandarin/3rdparty/glew/`，并定义 `GLEW_STATIC`（这样不必随包分发 `glew32.dll`）。
+  2. **Framework 库用官方构建脚本，不要 glob**：
+     ```cmake
+     set(FRAMEWORK_SOURCE OpenGL)                 # 选后端；Rendering/CMakeLists.txt 里 add_subdirectory(${FRAMEWORK_SOURCE})
+     set(FRAMEWORK_DEFINITIOINS CSM_TARGET_WIN_GL GLEW_STATIC)   # 注意上游就是这么拼的（拼写错误，勿"修正"）
+     set(RENDER_INCLUDE_PATH "${CMAKE_SOURCE_DIR}/3rdparty/glew/include")
+     add_subdirectory("${CUBISM_SDK_DIR}/Framework")   # 产出目标名 = Framework (STATIC)
+     ```
+     然后给消费方（我们自己的目标）**再补一次** `CSM_TARGET_WIN_GL`：框架里这两个定义是 `PRIVATE` 的，
+     而 `CubismRenderer_OpenGLES2.hpp` 是我们要直接 include 的头，缺定义会走到 `<GLES2/gl2.h>` 分支而编译失败。
+  3. 渲染器类名是 **`CubismRenderer_OpenGLES2`**（桌面 GL 也走这套 ES2 风格接口），配套离屏类是
+     `CubismOffscreenManager_OpenGLES2` / `CubismOffscreenRenderTarget_OpenGLES2` —— 正对应方案里的离屏管线。
 - **计划 C（阶段 3–7）**：`parameter-map.json` 生成（用 Task 2 的 `Live2DModelInfo` + 模型自带 `vtube.json`）、指纹校验、表情/动作外部加载、水印显式关闭、`PresentationController` 状态机与口型三要素。
 - **计划 D（阶段 8–10）**：点击交互、模型导入 UI、打包合规检查。
 
