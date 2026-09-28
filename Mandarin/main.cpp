@@ -1,6 +1,7 @@
 #include "windows/dialog/dialog.h"
 #include "windows/setting/setting.h"
 #include "windows/tachie/tachie.h"
+#include "windows/character/characterwindowbase.h"
 
 #include "ElaApplication.h"
 #include "ElaMenu.h"
@@ -129,24 +130,24 @@ int main(int argc, char *argv[])
     /*窗口创建*/
     Dialog dialogWin;
     dialogWin.show();
-    Tachie tachieWin;
-    tachieWin.show();
+    CharacterWindowBase *characterWin = new Tachie();
+    characterWin->show();
     MainWindow *settings = nullptr;
 
     /*一些绑定*/
     //对话框的开启和关闭
-    QObject::connect(&tachieWin, &Tachie::requestToggleVisible, &dialogWin,
-                     &Dialog::ToggleVisible);
+    QObject::connect(characterWin, &CharacterWindowBase::requestToggleVisible,
+                     &dialogWin, &Dialog::ToggleVisible);
     //文件拖放到立绘
-    QObject::connect(&tachieWin, &Tachie::requestFileDrop, &dialogWin,
-                     &Dialog::handleFileDrop);
+    QObject::connect(characterWin, &CharacterWindowBase::requestFileDrop,
+                     &dialogWin, &Dialog::handleFileDrop);
     //修改立绘图片
-    QObject::connect(&dialogWin, &Dialog::requestSetCharTachie, &tachieWin,
-                     &Tachie::SetTachieImg);
-    QObject::connect(&dialogWin, &Dialog::requestShowInnerThought, &tachieWin,
-                     &Tachie::ShowInnerThought);
-    QObject::connect(&dialogWin, &Dialog::requestHideInnerThought, &tachieWin,
-                     &Tachie::HideInnerThought);
+    QObject::connect(&dialogWin, &Dialog::requestSetCharTachie, characterWin,
+                     &CharacterWindowBase::reloadContent);
+    QObject::connect(&dialogWin, &Dialog::requestShowInnerThought, characterWin,
+                     &CharacterWindowBase::ShowInnerThought);
+    QObject::connect(&dialogWin, &Dialog::requestHideInnerThought, characterWin,
+                     &CharacterWindowBase::HideInnerThought);
 
     /*托盘*/
     QSystemTrayIcon tray;
@@ -180,7 +181,7 @@ int main(int argc, char *argv[])
                              if (!settings)
                              {
                                  eApp->init();
-                                 settings = new MainWindow(&dialogWin, &tachieWin);
+                                 settings = new MainWindow(&dialogWin, characterWin);
                              }
                              bringToFront(settings);
                          }
@@ -191,11 +192,13 @@ int main(int argc, char *argv[])
                          if (!settings)
                          {
                              eApp->init();
-                             settings = new MainWindow(&dialogWin, &tachieWin);
+                             settings = new MainWindow(&dialogWin, characterWin);
                          }
                          bringToFront(settings); });
     //退出程序
     QObject::connect(actionQuit, &QAction::triggered, &a, &QApplication::quit);
 
-    return a.exec();
+    const int exitCode = a.exec();
+    delete characterWin; //立绘窗口是堆对象（原为栈对象），退出前释放
+    return exitCode;
 }

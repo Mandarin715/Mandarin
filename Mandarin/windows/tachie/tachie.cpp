@@ -4,6 +4,7 @@
 #include "../../GlobalConstants.h"
 
 #include "../../utils/DragHelper.h"
+#include "../../utils/TachieGeometry.h"
 #include "ZcJsonLib.h"
 #include <QAbstractAnimation>
 #include <QBitmap>
@@ -33,7 +34,7 @@
 #endif
 
 Tachie::Tachie(QWidget *parent)
-    : QWidget(parent), ui(new Ui::Tachie)
+    : CharacterWindowBase(parent), ui(new Ui::Tachie)
 {
     /*窗口设置*/
     ui->setupUi(this);
@@ -41,26 +42,6 @@ Tachie::Tachie(QWidget *parent)
     if (ui->gridLayout)
         ui->gridLayout->removeWidget(ui->label_tachie1);
     ui->label_tachie1->setParent(this);
-
-    //无边框
-    setAttribute(Qt::WA_TranslucentBackground);
-    setAcceptDrops(true);
-    Qt::WindowFlags flags = Qt::Tool | Qt::FramelessWindowHint |
-                            Qt::WindowStaysOnTopHint;
-#ifdef Q_OS_LINUX
-    //避免窗口管理器限制拖拽范围（如屏幕边缘约束）。
-    flags |= Qt::X11BypassWindowManagerHint;
-#endif
-    setWindowFlags(flags);
-    //窗口拖拽
-    new DragHelper(this);
-
-    // 内心独白的生命周期由 Tachie 统一管理：显示后 20 秒自动淡出。
-    m_innerThoughtTimer = new QTimer(this);
-    m_innerThoughtTimer->setSingleShot(true);
-    m_innerThoughtTimer->setInterval(20000);
-    connect(m_innerThoughtTimer, &QTimer::timeout, this,
-            &Tachie::HideInnerThought);
 
     //延迟加载立绘
     QTimer::singleShot(0, this, [this]()
@@ -80,61 +61,6 @@ Tachie::~Tachie()
     }
     delete ui;
 }
-
-#if defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
-void Tachie::ApplyInteractiveRegion(const QRegion &region)
-{
-#ifdef Q_OS_LINUX
-    Display *display = XOpenDisplay(nullptr);
-    if (!display)
-        return;
-
-    Window window_id = static_cast<Window>(this->winId());
-
-    const int count = region.rectCount();
-    if (count <= 0)
-    {
-        XShapeCombineRectangles(display, window_id, ShapeInput, 0, 0, nullptr, 0,
-                                ShapeSet, YXBanded);
-        XCloseDisplay(display);
-        return;
-    }
-
-    auto rects = region.begin();
-    QVector<XRectangle> xrects;
-    xrects.resize(count);
-    for (int i = 0; i < count; ++i)
-    {
-        const QRect &rect = rects[i];
-        xrects[i].x = static_cast<short>(rect.x());
-        xrects[i].y = static_cast<short>(rect.y());
-        xrects[i].width = static_cast<unsigned short>(rect.width());
-        xrects[i].height = static_cast<unsigned short>(rect.height());
-    }
-
-    XShapeCombineRectangles(display, window_id, ShapeInput, 0, 0, xrects.data(),
-                            count, ShapeSet, YXBanded);
-    XCloseDisplay(display);
-#else
-    setMask(region);
-#endif
-}
-
-void Tachie::ApplyInteractiveRegionFromImage()
-{
-    if (_scaledImg.isNull())
-        return;
-
-    QRegion region(QBitmap::fromImage(_scaledImg.createAlphaMask()));
-    region.translate(_scaledImgTopLeft);
-    ApplyInteractiveRegion(region);
-}
-
-void Tachie::ApplyInteractiveRegionFullWindow()
-{
-    ApplyInteractiveRegion(QRegion(QRect(0, 0, width(), height())));
-}
-#endif
 
 /*立绘解码缓存：路径 + mtime 未变则复用，避免反复解码大图*/
 QPixmap Tachie::loadTachiePixmapCached(const QString &filePath)
@@ -159,8 +85,8 @@ QPixmap Tachie::loadTachiePixmapCached(const QString &filePath)
     return pm;
 }
 
-//设置立绘
-void Tachie::SetTachieImg(QString TachieName)
+//设置立绘（渲染层入口，由窗口层按角色/心情名调用）
+void Tachie::reloadContent(const QString &contentName)
 {
     const QString tachieDirPath = ReadCharacterTachiePath();
     if (tachieDirPath.isEmpty())
@@ -168,7 +94,7 @@ void Tachie::SetTachieImg(QString TachieName)
         return;
     }
 
-    const QString normalizedName = TachieName.trimmed();
+    const QString normalizedName = contentName.trimmed();
     QPixmap loadedPixmap;
     bool loaded = false;
 
@@ -239,6 +165,12 @@ void Tachie::SetTachieImg(QString TachieName)
     QString actionName = QFileInfo(normalizedName).completeBaseName();
     if (!actionName.isEmpty())
         TryPlayAnimationForAction(actionName);
+}
+
+//兼容旧调用名：转发到 reloadContent
+void Tachie::SetTachieImg(QString TachieName)
+{
+    reloadContent(TachieName);
 }
 
 /*播放动画*/
@@ -365,16 +297,16 @@ void Tachie::TryPlayAnimationForAction(const QString &actionName)
             auto applyScaleFrame = [this, scaleSequenceState](double factor)
             {
                 // 保护倍率，避免异常值导致图片瞬间过大。
-                const double safeFactor = qBound(0.05, factor, 2.0);
+                const double safeFactor = TachieGeometry::clampScaleFactor(factor);
                 const int w = qMax(
                     1, qRound(scaleSequenceState->baseImageRect.width() * safeFactor));
                 const int h = qMax(
                     1, qRound(scaleSequenceState->baseImageRect.height() * safeFactor));
 
                 // 固定窗口，仅在画布中心缩放，保证始终从中心放大/缩小。
-                const QPointF center(width() / 2.0, height() / 2.0);
-                const int x = qRound(center.x() - w / 2.0);
-                const int y = qRound(center.y() - h / 2.0);
+                const QRect frame = TachieGeometry::centeredRect(size(), QSize(w, h));
+                const int x = frame.x();
+                const int y = frame.y();
 
                 if (!NowTachie.isNull())
                 {
@@ -387,8 +319,8 @@ void Tachie::TryPlayAnimationForAction(const QString &actionName)
                                    Qt::SmoothTransformation);
                     ui->label_tachie1->setPixmap(scaledPixmap);
                     ui->label_tachie1->setGeometry(x, y, w, h);
-                    _scaledImg = scaledPixmap.toImage();
-                    _scaledImgTopLeft = QPoint(x, y);
+                    m_scaledImg = scaledPixmap.toImage();
+                    m_scaledImgTopLeft = QPoint(x, y);
                 }
             };
 
@@ -424,13 +356,9 @@ void Tachie::TryPlayAnimationForAction(const QString &actionName)
     seq->start(QAbstractAnimation::DeleteWhenStopped);
 }
 
-//设置窗口大小并重载立绘
-void Tachie::SetTachieSize(int size)
+//按基类记录的立绘大小百分比重新布局并重载立绘
+void Tachie::relayoutContent()
 {
-    constexpr double kCanvasScale = 2.0;
-    const int safeSize = (size <= 0) ? 100 : size;
-    qInfo() << "设置立绘大小为" << safeSize;
-
     if (NowTachie.isNull())
     {
         return;
@@ -438,22 +366,19 @@ void Tachie::SetTachieSize(int size)
 
     //缩放新图片并设置到 label
     QPixmap scaledPixmap =
-        NowTachie.scaled(NowTachie.size() * (safeSize / 100.0),
+        NowTachie.scaled(NowTachie.size() * (m_tachieSizePercent / 100.0),
                          Qt::KeepAspectRatio, Qt::SmoothTransformation);
 
     // 预留 200% 画布，缩放动画只动图片层，不改窗口几何，避免抖动。
-    const int canvasW = qMax(1, qRound(scaledPixmap.width() * kCanvasScale));
-    const int canvasH = qMax(1, qRound(scaledPixmap.height() * kCanvasScale));
-    const int imgX = (canvasW - scaledPixmap.width()) / 2;
-    const int imgY = (canvasH - scaledPixmap.height()) / 2;
+    const TachieGeometry::CanvasLayout layout =
+        TachieGeometry::canvasForScaledSize(scaledPixmap.size());
 
-    this->resize(canvasW, canvasH);
+    this->resize(layout.canvasSize);
     ui->label_tachie1->setPixmap(scaledPixmap);
-    ui->label_tachie1->setGeometry(imgX, imgY, scaledPixmap.width(),
-                                   scaledPixmap.height());
+    ui->label_tachie1->setGeometry(layout.imageTopLeft.x(), layout.imageTopLeft.y(),
+                                   scaledPixmap.width(), scaledPixmap.height());
 
-    _scaledImg = scaledPixmap.toImage();
-    _scaledImgTopLeft = QPoint(imgX, imgY);
+    updateRenderedImage(scaledPixmap.toImage(), layout.imageTopLeft);
 
 #if defined(Q_OS_LINUX) || defined(Q_OS_MACOS) //这里保留透明输入区域逻辑，macOS 也沿用同一套 region 处理
     ApplyInteractiveRegionFromImage();
@@ -461,237 +386,10 @@ void Tachie::SetTachieSize(int size)
     //Windows 下不裁剪窗口形状，避免半透明边缘被硬裁切后出现“略微缩小/边缘异常”。
     this->clearMask();
 #endif
-
-    RepositionInnerThoughtBubble();
 }
 
-//鼠标按下
-void Tachie::mousePressEvent(QMouseEvent *event)
+/*当前内容尺寸：当前贴图尺寸*/
+QSize Tachie::contentSize() const
 {
-    const QPoint pos = event->pos();
-    const QPoint imgPos = pos - _scaledImgTopLeft;
-    const QRect imageBounds(QPoint(0, 0), _scaledImg.size());
-    if (_scaledImg.isNull() || !imageBounds.contains(imgPos))
-    {
-        event->ignore();
-        return;
-    }
-
-    const int alpha = _scaledImg.pixelColor(imgPos).alpha();
-    if (alpha < 10)
-    {
-        event->ignore();
-        return;
-    }
-
-#if defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
-    //拖动时扩大输入区域，避免鼠标离开形状区域后丢失拖拽。
-    ApplyInteractiveRegionFullWindow();
-#endif
-
-    QWidget::mousePressEvent(event);
-}
-
-//鼠标抬起
-void Tachie::mouseReleaseEvent(QMouseEvent *event)
-{
-    QWidget::mouseReleaseEvent(event);
-
-#if defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
-    ApplyInteractiveRegionFromImage();
-#endif
-
-    //仅在初始化恢复完成后，且左键释放时保存一次位置。
-    if (!_tachiePosRestoreDone || event->button() != Qt::LeftButton)
-        return;
-
-    SaveTachieLoc(); //保存立绘位置
-}
-
-/*文件拖放到立绘上——提取文件路径发给 Dialog 处理*/
-void Tachie::dragEnterEvent(QDragEnterEvent *event)
-{
-    if (event->mimeData()->hasUrls())
-        event->acceptProposedAction();
-}
-
-void Tachie::dropEvent(QDropEvent *event)
-{
-    const QList<QUrl> urls = event->mimeData()->urls();
-    if (urls.isEmpty())
-        return;
-
-    QStringList paths;
-    for (const QUrl &url : urls) {
-        if (url.isLocalFile())
-            paths.append(url.toLocalFile());
-    }
-    if (!paths.isEmpty())
-        emit requestFileDrop(paths);
-}
-
-//重置立绘位置
-void Tachie::ResetTachieLoc()
-{
-    this->move(0, 0);
-    SaveTachieLoc(); //保存立绘位置
-}
-
-//保存立绘位置
-void Tachie::SaveTachieLoc()
-{
-    const QString charName = ReadNowSelectChar();
-    if (charName.isEmpty() || charName == "未选择")
-        return;
-
-    QSettings settings(IniSettingPath, QSettings::IniFormat);
-    settings.setValue(QString("tachie/%1/posX").arg(charName), this->x());
-    settings.setValue(QString("tachie/%1/posY").arg(charName), this->y());
-}
-//读取设置立绘位置
-void Tachie::RestoreTachieLoc()
-{
-    const QString charName = ReadNowSelectChar();
-    if (charName.isEmpty() || charName == "未选择")
-    {
-        _tachiePosRestoreDone = false;
-        return;
-    }
-
-    QSettings settings(IniSettingPath, QSettings::IniFormat);
-    const QString keyX = QString("tachie/%1/posX").arg(charName);
-    const QString keyY = QString("tachie/%1/posY").arg(charName);
-
-    if (!settings.contains(keyX) || !settings.contains(keyY))
-    {
-        //没有历史位置时标记恢复完成，后续用户拖动可直接保存。
-        _tachiePosRestoreDone = true;
-        return;
-    }
-
-    //恢复阶段不触发 mouseReleaseEvent 保存，直接移动即可。
-    this->move(settings.value(keyX).toInt(), settings.value(keyY).toInt());
-    _tachiePosRestoreDone = true;
-}
-
-/*内心独白气泡：立绘头顶右上 45°，半透明淡入→停留→语音播完淡出*/
-void Tachie::ShowInnerThought(QString text)
-{
-    text = text.trimmed();
-    if (text.isEmpty())
-        return;
-
-    // 先清理上一个气泡
-    HideInnerThought();
-
-    // 恢复原来的父窗口内 QLabel 绘制方式，确保半透明背景稳定显示。
-    auto *bubble = new QLabel(text, this);
-    bubble->setTextFormat(Qt::PlainText);
-    bubble->setWordWrap(true);
-    bubble->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-
-    QFont bubbleFont = bubble->font();
-    bubbleFont.setPixelSize(13);
-    bubble->setFont(bubbleFont);
-    bubble->setStyleSheet(
-        "color: #555; background: rgba(255,255,255,200); "
-        "border: 1px solid rgba(180,180,180,120); "
-        "border-radius: 12px; padding: 8px 14px;");
-
-    // 在 Tachie 画布范围内自动换行，避免长文本横向越界。
-    const QRect available = rect().adjusted(10, 10, -10, -10);
-
-    constexpr int kHorizontalPadding = 30;
-    constexpr int kVerticalPadding = 18;
-    const int maxBubbleWidth = qMax(130, qMin(320, available.width()));
-    const int maxTextWidth = maxBubbleWidth - kHorizontalPadding;
-    const QFontMetrics metrics(bubbleFont);
-    const int naturalWidth = metrics.boundingRect(text).width();
-    const int textWidth = qBound(100, naturalWidth, maxTextWidth);
-    const QRect textRect = metrics.boundingRect(
-        QRect(0, 0, textWidth, qMax(100, available.height())),
-        Qt::TextWordWrap | Qt::TextWrapAnywhere | Qt::AlignLeft, text);
-    bubble->setFixedSize(qMin(maxBubbleWidth,
-                              qMax(130, textRect.width() + kHorizontalPadding)),
-                         qMax(36, textRect.height() + kVerticalPadding));
-
-    m_innerThoughtBubble = bubble;
-    RepositionInnerThoughtBubble();
-    bubble->show();
-
-    // 淡入
-    auto *effect = new QGraphicsOpacityEffect(bubble);
-    bubble->setGraphicsEffect(effect);
-    effect->setOpacity(0.0);
-    auto *fadeIn = new QPropertyAnimation(effect, "opacity", bubble);
-    fadeIn->setDuration(400);
-    fadeIn->setStartValue(0.0);
-    fadeIn->setEndValue(1.0);
-    fadeIn->start(QAbstractAnimation::DeleteWhenStopped);
-
-    m_innerThoughtTimer->start();
-}
-
-/*将气泡定位到立绘头部附近，并限制在 Tachie 画布内*/
-void Tachie::RepositionInnerThoughtBubble()
-{
-    if (!m_innerThoughtBubble)
-        return;
-
-    const QPoint head(width() / 2, static_cast<int>(height() * 0.30));
-    constexpr int kCanvasMargin = 10;
-    constexpr int kHorizontalOffset = 50;
-    constexpr int kVerticalOffset = 35;
-
-    int x = head.x() + kHorizontalOffset;
-    int y = head.y() - kVerticalOffset - m_innerThoughtBubble->height();
-
-    // 右侧空间不足时翻转到立绘左上方。
-    if (x + m_innerThoughtBubble->width() >
-        width() - kCanvasMargin)
-    {
-        x = head.x() - kHorizontalOffset -
-            m_innerThoughtBubble->width();
-    }
-
-    // 顶部空间不足时改放到头部下方。
-    if (y < kCanvasMargin)
-        y = head.y() + kVerticalOffset;
-
-    const int minX = kCanvasMargin;
-    const int minY = kCanvasMargin;
-    const int maxX = qMax(minX, width() - kCanvasMargin -
-                                    m_innerThoughtBubble->width());
-    const int maxY = qMax(minY, height() - kCanvasMargin -
-                                    m_innerThoughtBubble->height());
-
-    m_innerThoughtBubble->move(qBound(minX, x, maxX),
-                               qBound(minY, y, maxY));
-}
-
-/*隐藏内心独白气泡：淡出后销毁*/
-void Tachie::HideInnerThought()
-{
-    if (m_innerThoughtTimer)
-        m_innerThoughtTimer->stop();
-
-    if (!m_innerThoughtBubble)
-        return;
-
-    QWidget *bubble = m_innerThoughtBubble;
-    m_innerThoughtBubble = nullptr;
-
-    auto *eff = qobject_cast<QGraphicsOpacityEffect *>(bubble->graphicsEffect());
-    if (!eff)
-    {
-        delete bubble;
-        return;
-    }
-
-    auto *fadeOut = new QPropertyAnimation(eff, "opacity", bubble);
-    fadeOut->setDuration(400);
-    fadeOut->setStartValue(eff->opacity());
-    fadeOut->setEndValue(0.0);
-    QObject::connect(fadeOut, &QPropertyAnimation::finished, bubble, &QObject::deleteLater);
-    fadeOut->start(QAbstractAnimation::DeleteWhenStopped);
+    return NowTachie.size();
 }

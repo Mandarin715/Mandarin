@@ -1,70 +1,46 @@
 #ifndef TACHIE_H
 #define TACHIE_H
 
+#include "../character/characterwindowbase.h"
+
 #include "../../utils/AnimePluginManager.h"
 
-#include <QWidget>
+#include <QHash>
+#include <QPixmap>
 
-class QDragEnterEvent;
-class QDropEvent;
 class QSequentialAnimationGroup;
-class QTimer;
 
 namespace Ui
 {
 class Tachie;
 }
 
-class Tachie : public QWidget
+/*PNG 立绘渲染器：窗口层（穿透/拖拽/位置/气泡/拖放）全部继承自 CharacterWindowBase*/
+class Tachie : public CharacterWindowBase
 {
     Q_OBJECT
 
   public:
     explicit Tachie(QWidget *parent = nullptr);
-    ~Tachie();
-
-  signals:
-    void requestToggleVisible(); //切换对话框的显示状态
-    void requestFileDrop(QStringList filePaths); //文件拖放到立绘
+    ~Tachie() override;
 
   public slots:
-    void SetTachieImg(QString TachieName = "default");
-    void SetTachieSize(int size);
-    void ResetTachieLoc();
-    void ShowInnerThought(QString text);
-    void HideInnerThought();
+    void SetTachieImg(QString TachieName = "default"); //兼容旧调用名，转发到 reloadContent
+    void reloadContent(const QString &contentName) override; //原 SetTachieImg
+
+  protected:
+    void relayoutContent() override;    //原 SetTachieSize 的布局部分（用基类的 m_tachieSizePercent）
+    QSize contentSize() const override; //当前贴图尺寸
 
   private:
     Ui::Tachie *ui;
     QPixmap NowTachie;
-    QImage _scaledImg;                  //用于缓存缩放后的图片，避免编译版本差异
-    QPoint _scaledImgTopLeft{0, 0};     //缓存图片在窗口内左上角位置
-    bool _tachiePosRestoreDone = false; //位置恢复完成后才允许自动保存
     AnimePluginManager m_animePluginManager;
     QHash<QString, QPixmap> m_pixmapCache;    // 立绘解码缓存：路径 -> pixmap（避免反复解码大图）
     QHash<QString, qint64> m_pixmapCacheStamp; // 路径 -> mtime_ms
     QPixmap loadTachiePixmapCached(const QString &filePath);
     QSequentialAnimationGroup *m_activeAnimationGroup = nullptr;
-    QWidget *m_innerThoughtBubble = nullptr;
-    QTimer *m_innerThoughtTimer = nullptr;
-    void SaveTachieLoc();    //将当前立绘位置写入 config.ini（按角色）
-    void RestoreTachieLoc(); //从 config.ini 读取并恢复立绘位置
     void TryPlayAnimationForAction(const QString &actionName);
-    void RepositionInnerThoughtBubble();
-    void ApplyInteractiveRegion(const QRegion &region);
-    void ApplyInteractiveRegionFromImage();
-    void ApplyInteractiveRegionFullWindow();
-
-  protected:
-    void contextMenuEvent(QContextMenuEvent *event) override
-    {
-        emit requestToggleVisible(); //发出信号
-    }
-
-    void mousePressEvent(QMouseEvent *event) override; //为了实现鼠标穿透
-    void mouseReleaseEvent(QMouseEvent *event) override;
-    void dragEnterEvent(QDragEnterEvent *event) override;
-    void dropEvent(QDropEvent *event) override;
 };
 
 #endif //TACHIE_H

@@ -146,7 +146,9 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
         utils/AnimePluginManager.h utils/AnimePluginManager.cpp
         utils/SearchProvider.h utils/SearchProvider.cpp
         windows/tachie/tachie.h windows/tachie/tachie.cpp windows/tachie/tachie.ui
+        windows/character/characterwindowbase.h windows/character/characterwindowbase.cpp
         utils/DragHelper.h utils/DragHelper.cpp
+        utils/TachieGeometry.h utils/TachieGeometry.cpp
         utils/WakeWordDetector.h utils/WakeWordDetector.cpp
         utils/OfflineSpeechRecognizer.h utils/OfflineSpeechRecognizer.cpp
         utils/ChatLogStore.h utils/ChatLogStore.cpp

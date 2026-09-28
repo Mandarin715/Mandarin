@@ -5,7 +5,7 @@
 #include <QMainWindow>
 
 #include "../dialog/dialog.h"
-#include "../tachie/tachie.h"
+#include "../character/characterwindowbase.h"
 
 QT_BEGIN_NAMESPACE
 namespace Ui
@@ -19,7 +19,7 @@ class MainWindow : public ElaWindow
     Q_OBJECT
 
   public:
-    MainWindow(Dialog *dialog, Tachie *tachie, QWidget *parent = nullptr);
+    MainWindow(Dialog *dialog, CharacterWindowBase *characterWin, QWidget *parent = nullptr);
     ~MainWindow();
 
   private:

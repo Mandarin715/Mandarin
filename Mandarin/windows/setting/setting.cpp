@@ -13,7 +13,7 @@
 #include "child/settingchild_speech.h"
 #include "child/settingchild_vits.h"
 
-MainWindow::MainWindow(Dialog *dialog, Tachie *tachie, QWidget *parent)
+MainWindow::MainWindow(Dialog *dialog, CharacterWindowBase *characterWin, QWidget *parent)
     : ElaWindow(parent), ui(new Ui::MainWindow)
 {
     /*初始化窗口*/
@@ -63,11 +63,11 @@ MainWindow::MainWindow(Dialog *dialog, Tachie *tachie, QWidget *parent)
 
     //连接
     connect(settingchild_charWin, &SettingChild_Char::requestReloadCharSelect,
-            tachie, &Tachie::SetTachieImg); //设置立绘图像（重载角色）
+            characterWin, &CharacterWindowBase::reloadContent); //设置立绘图像（重载角色）
     connect(settingchild_charWin, &SettingChild_Char::requestSetTachieSize,
-            tachie, &Tachie::SetTachieSize); //设置立绘大小
+            characterWin, &CharacterWindowBase::SetTachieSize); //设置立绘大小
     connect(settingchild_charWin, &SettingChild_Char::requestResetTachieLoc,
-            tachie, &Tachie::ResetTachieLoc); //重置立绘位置
+            characterWin, &CharacterWindowBase::ResetTachieLoc); //重置立绘位置
     connect(settingchild_charWin, &SettingChild_Char::requestReloadAIConfig,
             dialog, &Dialog::ReloadCharacterConfig); //角色/prompt变更重载
     connect(settingchild_memoryWin, &SettingChild_Memory::requestReloadMemory,

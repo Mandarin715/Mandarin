@@ -1160,7 +1160,9 @@ class Tachie : public CharacterWindowBase
 - L16 定义形参同步改名；
 - L66-70 三条连接的目标类型改为 `CharacterWindowBase`：
 ```cpp
-    connect(settingchild_charWin, &SettingChild_Char::requestSetCharTachie,
+    // ⚠️ 第一个信号的真实名字是 requestReloadCharSelect，不是 requestSetCharTachie
+    //    （后者是 Dialog 的信号名，容易抄错）。
+    connect(settingchild_charWin, &SettingChild_Char::requestReloadCharSelect,
             characterWin, &CharacterWindowBase::reloadContent); //设置立绘图像（重载角色）
     connect(settingchild_charWin, &SettingChild_Char::requestSetTachieSize,
             characterWin, &CharacterWindowBase::SetTachieSize); //设置立绘大小
@@ -1168,6 +1170,20 @@ class Tachie : public CharacterWindowBase
             characterWin, &CharacterWindowBase::ResetTachieLoc); //重置立绘位置
 ```
 > `SetTachieSize` 已在 Task 4 Step 1 上移为 `CharacterWindowBase` 的公开槽，这里连的就是基类版本；`CharacterWindowBase` 是不完整类型之外的真实基类，`connect` 到基类槽对 `Tachie` 实例同样生效。
+
+- [x] **Task 4 执行记录（2026-09-28 已完成并验证）**
+
+实际执行与计划的差异，均为**计划本身的缺口**而非设计变更：
+
+| # | 差异 | 处理 |
+|---|---|---|
+| 1 | 计划 Step 6 写的信号名 `requestSetCharTachie` **不存在**于 `SettingChild_Char` | 用真实名 `requestReloadCharSelect`（上面代码块已更正） |
+| 2 | 计划 `tachie.h` 骨架漏了 `class QSequentialAnimationGroup;` 前向声明，但保留了 `m_activeAnimationGroup` 指针 | 补上前向声明（否则编不过） |
+| 3 | 计划基类头漏了 `#include <QStringList>`，而 `requestFileDrop(QStringList)` 需要它（原先靠 `AnimePluginManager.h` 间接引入） | 补上 include |
+| 4 | **Task 3 只做了「模块 + 测试」，漏了 Step 7 的接线**：`utils/TachieGeometry.cpp` 只加进了**测试**目标、没加进 `Mandarin` 目标，`tachie.cpp` 也仍在用内联算法 | 已补：把 `utils/TachieGeometry.h/.cpp` 加入 `Mandarin` 目标源码表，并把 `kCanvasScale` 内联数学换成 `TachieGeometry::canvasForScaledSize`；缩放动画帧改用 `clampScaleFactor`/`centeredRect` |
+
+> **教训（写给下一个执行者）**：新增的 `.cpp` **必须同时加进主程序目标**，只加进测试目标的话，测试全绿而主程序在链接期才报 `LNK2019`。
+> 另外，搬迁类重构完成后应做一次**方法体字节级比对**（把 `git show HEAD:<file>` 里的方法体与搬过去后的内容、仅套用改名表后逐字节比较），这比人工读 diff 可靠得多 —— 本次 13/13 方法体确认逐字节一致。
 
 - [ ] **Step 7: 把新文件加进主程序源码清单**
 
