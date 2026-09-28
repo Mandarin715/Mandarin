@@ -3,6 +3,7 @@
 #include "../utils/Live2DOffscreenRenderer.h"
 
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFileInfo>
 #include <QImage>
 
@@ -20,6 +21,7 @@ class TestLive2DOffscreen : public QObject
 
   private slots:
     void rendersMikuFirstFrame();
+    void reportsFrameCost();
 
   private:
     static QString modelDir();
@@ -99,6 +101,53 @@ void TestLive2DOffscreen::rendersMikuFirstFrame()
     QCOMPARE(renderer.parameterValue(QStringLiteral("Param137")), 0.0f);
     qInfo("离屏渲染产物：隐藏水印=%s 显示水印=%s", qPrintable(hiddenPng),
           qPrintable(visiblePng));
+}
+
+/*测每帧渲染成本，给"帧循环能跑多少 fps / 要不要降分辨率"提供真实数据，并作为性能守门。
+
+  为什么必须有这条：窗口层要按帧重绘，帧成本直接决定帧率档位与是否需要降采样。
+  实测值随机器/驱动不同，所以这里只设一个**宽松退步警戒线**，真实数字打到日志里。*/
+void TestLive2DOffscreen::reportsFrameCost()
+{
+    const QString dir = modelDir();
+    const QString modelJsonName = QStringLiteral("miku.model3.json");
+    if (!QFileInfo::exists(dir + QLatin1Char('/') + modelJsonName))
+        QSKIP("本机没有初音模型（禁二传，不入库），跳过帧成本测量");
+
+    Live2DOffscreenRenderer renderer;
+    QString error;
+    QVERIFY2(renderer.load(dir, modelJsonName, &error), qPrintable(error));
+
+    struct Result
+    {
+        QSize size;
+        double msPerFrame;
+    };
+    QVector<Result> results;
+
+    const int frameCount = 30;
+    for (const QSize &size : {QSize(760, 900), QSize(380, 450)})
+    {
+        (void)renderer.renderFrame(size); // 首帧含 GL 目标重建，不计入
+        QElapsedTimer timer;
+        timer.start();
+        for (int i = 0; i < frameCount; ++i)
+            (void)renderer.renderFrame(size);
+        const double msPerFrame = static_cast<double>(timer.elapsed()) / frameCount;
+        results.append({size, msPerFrame});
+        qInfo("帧成本：%dx%d 平均 %.1f ms/帧（约 %.1f fps）", size.width(), size.height(),
+              msPerFrame, msPerFrame > 0.0 ? 1000.0 / msPerFrame : 0.0);
+    }
+
+    // 退步警戒：只要不是崩坏级变慢就放过（真实性能靠上面日志观察，不在这里卡死阈值）
+    for (const Result &r : results)
+    {
+        QVERIFY2(r.msPerFrame < 500.0,
+                 qPrintable(QStringLiteral("%1x%2 每帧 %.1f ms，慢到不可用")
+                                .arg(r.size.width())
+                                .arg(r.size.height())
+                                .arg(r.msPerFrame)));
+    }
 }
 
 QTEST_MAIN(TestLive2DOffscreen)
