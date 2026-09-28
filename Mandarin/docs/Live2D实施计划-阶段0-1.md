@@ -104,13 +104,14 @@ Expected: FAIL —— 目标不存在（`test_cubismcore` 尚未加进 CMake，�
 
 - [ ] **Step 3: 解压 SDK 并核对真实布局**
 
-把使用者下载的 `CubismSdkForNative-5-r.x.zip` 解压，使目录成为：
+把使用者下载的 `CubismSdkForNative-5-r.x.zip` **解压到 `Mandarin/3rdparty/Live2DCubismSDK/`**（保留官方那层 `CubismSdkForNative-5-r.x/` 也行，下一步的 CMake 会自动下钻一层）：
 
 ```
 Mandarin/3rdparty/Live2DCubismSDK/
-├── Core/include/Live2DCubismCore.h
-├── Core/lib/windows/x86_64/*.lib
-└── Framework/src/...
+├── CubismSdkForNative-5-r.5/          ← 官方原样保留也可
+│   ├── Core/include/Live2DCubismCore.h
+│   ├── Core/lib/windows/x86_64/*.lib
+│   └── Framework/src/...
 ```
 
 Run:
@@ -130,6 +131,18 @@ Expected: 看到 `Live2DCubismCore*.lib` 与 `Live2DCubismCore.h`。**记录真�
 # Qt 用 /MD，故优先取 Core 的 MD 变体；未找到则退回到唯一那个 .lib。
 set(CUBISM_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/Live2DCubismSDK"
     CACHE PATH "Live2D Cubism SDK for Native 解压根目录")
+
+# 官方 zip 解压后会多一层 CubismSdkForNative-5-r.x/，这里自动下钻一层，省得手工改名。
+if(NOT EXISTS "${CUBISM_SDK_DIR}/Core/include/Live2DCubismCore.h")
+    file(GLOB _cubism_candidates "${CUBISM_SDK_DIR}/CubismSdkForNative-*")
+    foreach(_candidate ${_cubism_candidates})
+        if(EXISTS "${_candidate}/Core/include/Live2DCubismCore.h")
+            set(CUBISM_SDK_DIR "${_candidate}")
+            break()
+        endif()
+    endforeach()
+endif()
+
 if(WIN32 AND EXISTS "${CUBISM_SDK_DIR}/Core/include/Live2DCubismCore.h")
     file(GLOB CUBISM_CORE_LIBS "${CUBISM_SDK_DIR}/Core/lib/windows/x86_64/*.lib")
     set(CUBISM_CORE_LIB "")
