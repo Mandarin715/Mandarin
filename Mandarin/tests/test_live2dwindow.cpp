@@ -137,6 +137,14 @@ void TestLive2DWindow::shapesWindowFromRenderedModel()
     const QPixmap grabbed = window.grab();
     QVERIFY2(!grabbed.isNull(), "window.grab() 失败，无法确认帧真的被画出来");
     QCOMPARE(grabbed.size(), (window.size() * window.devicePixelRatioF()));
+
+    // 存一份抓图：这是「桌宠在屏幕上长什么样」的唯一可查证据
+    //（本项目不许自动启动桌宠，所以人工目视只能靠这张图）。
+    const QString grabPath = QDir(QCoreApplication::applicationDirPath())
+                                 .absoluteFilePath(QStringLiteral("../live2d-probe/window-grab.png"));
+    QDir().mkpath(QFileInfo(grabPath).absolutePath());
+    QVERIFY2(grabbed.save(grabPath), qPrintable(QStringLiteral("写不出 %1").arg(grabPath)));
+    qInfo("窗口抓图已保存：%s", qPrintable(grabPath));
     const QImage painted = grabbed.toImage().convertToFormat(QImage::Format_RGBA8888);
     // 绘制结果就是窗口的设备像素数（帧可能更大 —— 那是 live2dScale 的超采样，
     // 最终由 Qt 下采样到设备像素；渲染分辨率不会改变桌宠在屏幕上的物理大小）。
