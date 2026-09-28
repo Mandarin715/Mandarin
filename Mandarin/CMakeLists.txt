@@ -375,6 +375,38 @@ else()
     message(STATUS "Live2D Cubism SDK 未就位，跳过（Live2D 相关目标不可用）")
 endif()
 
+# ---- GLEW（Cubism OpenGL 后端的外部依赖；用静态库，不必随包分发 glew32.dll）----
+set(GLEW_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/glew")
+if(WIN32 AND EXISTS "${GLEW_ROOT}/include/GL/glew.h")
+    add_library(glew_static STATIC IMPORTED)
+    set_target_properties(glew_static PROPERTIES
+        IMPORTED_LOCATION "${GLEW_ROOT}/lib/x64/glew32s.lib"
+        INTERFACE_INCLUDE_DIRECTORIES "${GLEW_ROOT}/include"
+        INTERFACE_COMPILE_DEFINITIONS "GLEW_STATIC")
+    message(STATUS "GLEW: ${GLEW_ROOT}")
+endif()
+
+# ---- Cubism Framework（只编 OpenGL 后端）----
+# 官方构建脚本按 FRAMEWORK_SOURCE 选后端（Framework/src/Rendering/CMakeLists.txt 里
+# add_subdirectory(${FRAMEWORK_SOURCE})）。**绝不能自己 glob Framework/src/**/*.cpp**：
+# 里面还有 D3D9 / D3D11 / Vulkan 三个后端，Vulkan 还需要 Vulkan SDK。
+if(WIN32 AND CUBISM_CORE_LIB AND TARGET glew_static)
+    set(FRAMEWORK_SOURCE OpenGL)
+    set(FRAMEWORK_DEFINITIOINS CSM_TARGET_WIN_GL GLEW_STATIC) # 上游变量名就是这个拼写，别"修正"
+    set(RENDER_INCLUDE_PATH "${GLEW_ROOT}/include")
+    add_subdirectory("${CUBISM_SDK_DIR}/Framework"
+                     "${CMAKE_CURRENT_BINARY_DIR}/cubism_framework")
+
+    # 框架把这两个定义设成了 PRIVATE，而我们要直接 include 它的 GL 渲染头，所以自己再补一次；
+    # Core 的头与库框架同样只 PRIVATE 引了，需要显式 PUBLIC 传递给我们自己的目标。
+    target_compile_definitions(Framework PUBLIC CSM_TARGET_WIN_GL)
+    target_include_directories(Framework PUBLIC "${CUBISM_SDK_DIR}/Core/include")
+    target_link_libraries(Framework PUBLIC ${CUBISM_CORE_LIB} glew_static opengl32)
+    message(STATUS "Live2D Cubism Framework: backend=OpenGL")
+else()
+    message(STATUS "Live2D Cubism Framework 未接线（缺 Core 或 GLEW）")
+endif()
+
 # ---- 单元测试（Qt Test）----
 include(CTest)
 if(BUILD_TESTING)
@@ -461,5 +493,15 @@ if(BUILD_TESTING)
         set_target_properties(test_cubismcore PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
         add_test(NAME test_cubismcore COMMAND test_cubismcore)
+    endif()
+
+    # Cubism Framework（OpenGL 后端）编译/链接验证：GLEW 路径、CSM_TARGET_WIN_GL 定义、
+    # 以及"只编了 OpenGL 后端"这件事，全部由这个目标钉住。
+    if(WIN32 AND TARGET Framework)
+        add_executable(test_cubismframework tests/test_cubismframework.cpp)
+        target_link_libraries(test_cubismframework PRIVATE Framework)
+        set_target_properties(test_cubismframework PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+        add_test(NAME test_cubismframework COMMAND test_cubismframework)
     endif()
 endif()

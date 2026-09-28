@@ -1264,17 +1264,45 @@ git commit -m "docs(live2d): record stage 0-1 regression checklist and results"
 建议拆分：
 - **计划 B（阶段 2）**：SDK 渲染管线 —— 离屏 FBO + 读回 RGBA `QImage` + `Live2DCharacterWindow` 子类 + 接 `updateRenderedImage()`。
   **已实测确定的前置与路线（Task 1 执行时发现，务必照此写）**：
-  1. **必须先补 GLEW**：`CubismRenderer_OpenGLES2.hpp` 在 `CSM_TARGET_WIN_GL` 下 `#include <GL/glew.h>`，而 SDK 不含 GLEW。
-     建议取官方发布包里的 **静态库 `glew32s.lib` + 头文件**，放 `Mandarin/3rdparty/glew/`，并定义 `GLEW_STATIC`（这样不必随包分发 `glew32.dll`）。
-  2. **Framework 库用官方构建脚本，不要 glob**：
-     ```cmake
-     set(FRAMEWORK_SOURCE OpenGL)                 # 选后端；Rendering/CMakeLists.txt 里 add_subdirectory(${FRAMEWORK_SOURCE})
-     set(FRAMEWORK_DEFINITIOINS CSM_TARGET_WIN_GL GLEW_STATIC)   # 注意上游就是这么拼的（拼写错误，勿"修正"）
-     set(RENDER_INCLUDE_PATH "${CMAKE_SOURCE_DIR}/3rdparty/glew/include")
-     add_subdirectory("${CUBISM_SDK_DIR}/Framework")   # 产出目标名 = Framework (STATIC)
+  1. ~~必须先补 GLEW~~ **已完成（2026-09-28）**：`CubismRenderer_OpenGLES2.hpp` 在 `CSM_TARGET_WIN_GL` 下
+     `#include <GL/glew.h>`，SDK 不含 GLEW。已从官方发布包取 **GLEW 2.3.1 的静态库**，落地为：
      ```
-     然后给消费方（我们自己的目标）**再补一次** `CSM_TARGET_WIN_GL`：框架里这两个定义是 `PRIVATE` 的，
-     而 `CubismRenderer_OpenGLES2.hpp` 是我们要直接 include 的头，缺定义会走到 `<GLES2/gl2.h>` 分支而编译失败。
+     Mandarin/3rdparty/glew/
+     ├── include/GL/{glew.h,wglew.h,glxew.h,eglew.h}
+     ├── lib/x64/glew32s.lib      # 静态库，不必随包分发 glew32.dll
+     └── LICENSE.txt
+     ```
+     取包内 `lib/Release/x64/glew32s.lib`；**不要**取 `glew32.lib`（那是 DLL 的导入库）。
+     注意官方 win32 包只有 Release 版静态库，Debug 配置会链接 Release CRT 版 —— 实测可用（GLEW 内部只做少量分配）。
+  2. **Framework 库用官方构建脚本，不要 glob**（**已完成并实测通过**，下面就是可用的接线）：
+     ```cmake
+     # GLEW 静态库（imported target）
+     add_library(glew_static STATIC IMPORTED)
+     set_target_properties(glew_static PROPERTIES
+         IMPORTED_LOCATION "${GLEW_ROOT}/lib/x64/glew32s.lib"
+         INTERFACE_INCLUDE_DIRECTORIES "${GLEW_ROOT}/include"
+         INTERFACE_COMPILE_DEFINITIONS "GLEW_STATIC")
+
+     set(FRAMEWORK_SOURCE OpenGL)                                # 选后端
+     set(FRAMEWORK_DEFINITIOINS CSM_TARGET_WIN_GL GLEW_STATIC)   # 上游变量名就是这个拼写，勿"修正"
+     set(RENDER_INCLUDE_PATH "${GLEW_ROOT}/include")
+     add_subdirectory("${CUBISM_SDK_DIR}/Framework"
+                      "${CMAKE_CURRENT_BINARY_DIR}/cubism_framework")   # 产出目标名 = Framework (STATIC)
+
+     # 框架把上面两个定义设成 PRIVATE，而我们要直接 include 它的 GL 渲染头，所以自己再补一次；
+     # Core 的头与库框架同样只 PRIVATE 引了，必须显式 PUBLIC 传递给消费方，否则报
+     # "Core: 不是类或命名空间名称" 等一串错。
+     target_compile_definitions(Framework PUBLIC CSM_TARGET_WIN_GL)
+     target_include_directories(Framework PUBLIC "${CUBISM_SDK_DIR}/Core/include")
+     target_link_libraries(Framework PUBLIC ${CUBISM_CORE_LIB} glew_static opengl32)
+     ```
+     实测产物 `build2/cubism_framework/Release/Framework.lib`（2535 KB），
+     验证目标 `tests/test_cubismframework.cpp` 通过：它同时 include 了 GL 渲染头与 `CubismMath.hpp`，
+     可钉住"只编 OpenGL 后端 / GLEW 路径对 / `CSM_TARGET_WIN_GL` 生效"三件事。
+
+     > ⚠️ 写测试/注释时注意：**别在块注释里出现 `*/`**。像 `Framework/src/**/*.cpp` 里的 `**/`
+     > 会提前闭合注释（`C4138`），后续内容被打成代码，还会连带在 SDK 头里报出一堆
+     > 与真实原因无关的错（如 `Core: 不是类或命名空间名称`），极难排查。
   3. 渲染器类名是 **`CubismRenderer_OpenGLES2`**（桌面 GL 也走这套 ES2 风格接口），配套离屏类是
      `CubismOffscreenManager_OpenGLES2` / `CubismOffscreenRenderTarget_OpenGLES2` —— 正对应方案里的离屏管线。
 - **计划 C（阶段 3–7）**：`parameter-map.json` 生成（用 Task 2 的 `Live2DModelInfo` + 模型自带 `vtube.json`）、指纹校验、表情/动作外部加载、水印显式关闭、`PresentationController` 状态机与口型三要素。
