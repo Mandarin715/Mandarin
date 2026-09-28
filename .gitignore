@@ -116,3 +116,9 @@ ssh-test.py
 # 远程访问重启脚本（aproxy/frpc，勿提交）
 restart-aproxy-ws.ps1
 restart-frpc-task.ps1
+
+# Live2D Cubism SDK（专有许可，二进制不入库；见 Mandarin/docs/Live2D方案.md 阶段 0）
+Mandarin/3rdparty/Live2DCubismSDK/
+
+# DSH 调试临时产物（GUI 探针脚本/截图）
+.dsh-probe/
