@@ -1,7 +1,9 @@
 #include <QtTest>
 
 #include "../GlobalConstants.h"
+#include "../utils/AudioEnvelope.h"
 #include "../utils/Live2DOffscreenRenderer.h"
+#include "SyntheticWav.h"
 
 #include <QDir>
 #include <QElapsedTimer>
@@ -11,6 +13,9 @@
 #include <QSet>
 #include <QSettings>
 #include <QThread>
+
+#include <algorithm>
+#include <cmath>
 
 /*Live2D 离屏渲染的端到端验证。
 
@@ -42,6 +47,18 @@ class TestLive2DOffscreen : public QObject
     void speakingDoesNotDisturbOtherParameters();
     /*停止说话后扑动必须回落（不能突然闭嘴）*/
     void stoppingSpeechDecaysFlapToMoodValue();
+
+    /*---------- 响度包络驱动嘴巴（本阶段新增：句间停顿时闭嘴） ---------- */
+    /*头条：前半句有声、后半句静音 → 静音段嘴巴必须回到心情自己的值*/
+    void envelopeSilenceClosesMouth();
+    /*电平恒为 0 = 一点都不动（"停顿闭嘴"的另一半：不许有残余扑动）*/
+    void envelopeZeroLevelKeepsMouthAtMoodValue();
+    /*包络路径不许碰别人的参数（嘴形属于心情）*/
+    void envelopeDoesNotDisturbOtherParameters();
+    /*下一句没有包络（用户配成 mp3）时必须回到今天的盲扑动*/
+    void nextUtteranceWithoutEnvelopeFallsBackToBlindFlap();
+    /*停止说话 + 电平清零 → 嘴回落到心情值*/
+    void stoppingSpeechWithClearedLevelReturnsToMood();
 
   private:
     static QString modelDir();
@@ -101,6 +118,27 @@ class TestLive2DOffscreen : public QObject
     static SettleResult advanceUntilSettled(Live2DOffscreenRenderer *renderer,
                                             const QString &probeParameter, float target,
                                             int maxFrames, int waitMs);
+
+    /*---------- 包络驱动的"播放"辅助（见文件后半段的 ENVELOPE 系列） ---------- */
+    /*一次包络驱动的采样：播放位置 / 电平 / 开口量三者对齐，
+       于是"静音段（位置 ≥ X）的开口量是多少"这类断言可以直接按位置过滤 ——
+       不需要在测试里反推"这一帧对应音频里的哪一段"。*/
+    struct EnvelopeSample
+    {
+        qint64 positionMs = 0;
+        float level = 0.0f;
+        float mouthOpen = 0.0f;
+    };
+
+    /*按**虚拟时间**跑一段"播放"：每帧先按播放位置从包络取电平喂给渲染器，再渲一帧。
+
+       为什么自己写循环而不用 advanceFrames：后者不接受"每帧一个电平"这个输入，
+       而这组用例的核心正是"电平 → 开口量"这条映射。
+       为什么位置由帧序号推出来：注入的步长即虚拟时间，位置与帧时间因此**严格同步**，
+       断言不会随机器负载漂移（真实墙钟会被夹成 100ms/帧，见 setNextFrameDeltaSeconds）。
+       返回 false = 有一帧渲染失败（调用方断言）。*/
+    static bool playEnvelope(Live2DOffscreenRenderer *renderer, const AudioEnvelope &envelope,
+                             int frames, float deltaSeconds, QVector<EnvelopeSample> *samples);
 };
 
 QString TestLive2DOffscreen::modelDir()
@@ -949,6 +987,420 @@ void TestLive2DOffscreen::stoppingSpeechDecaysFlapToMoodValue()
     QVERIFY2(qAbs(tailMax - kMoodMouthOpen) <= 0.02f && qAbs(tailMin - kMoodMouthOpen) <= 0.02f,
              qPrintable(QStringLiteral("停止说话后开口量停在 %1~%2，不等于心情值 %3 ——"
                                        "扑动没有干净地回落，或把嘴合死了")
+                            .arg(double(tailMin))
+                            .arg(double(tailMax))
+                            .arg(double(kMoodMouthOpen))));
+}
+
+/*==================== 响度包络驱动嘴巴（用户诉求：句间停顿要闭嘴） ====================
+
+  用户看到的问题：TTS 在播时嘴按"盲扑动"开合，**句子之间的停顿里嘴照样在动** ——
+  她明明停下来了，嘴还在开合，看着像"在放录音"。用户要的是"说话时嘴动、停顿时嘴闭"，
+  并且明确接受不做音素级口型。于是判据是五条彼此独立的观察量：
+
+    (a) 有声段：嘴真的张开（响度到了嘴没动 = 接线断了）；
+    (b) 静音段：嘴回到**心情自己的值**（不是"幅度小一点"，更不是合死到 0）；
+    (c) 电平恒为 0：一点都不许动（停顿里不许留残余扑动）；
+    (d) 没有包络时（用户把 vits 的 format 配成 mp3）：行为回到今天的盲扑动；
+    (e) 包络路径不许碰 `ParamMouthForm` 等别的参数（嘴形属于心情）。
+
+  为什么用**合成 WAV** 而不是真跑一遍 TTS：包络只能在"响度已知"的输入上证伪，
+  而真实字节来自本机的 vits 服务（测试不能依赖它）。解析那一半另有专测
+  （test_audioenvelope），这里只关心"电平 → 开口量"这条映射。
+
+  ⚠️ 帧时间一律用**注入的虚拟步长**：真实墙钟在负载下会被夹到 100ms/帧
+  （见 setNextFrameDeltaSeconds），那时"播放位置推进了多少"与"帧时间"就脱钩了，
+  断言会随机器而变。注入步长让"位置 → 电平 → 开口量"这条链逐帧可控。*/
+
+bool TestLive2DOffscreen::playEnvelope(Live2DOffscreenRenderer *renderer,
+                                       const AudioEnvelope &envelope, int frames,
+                                       float deltaSeconds, QVector<EnvelopeSample> *samples)
+{
+    if (renderer == nullptr || frames <= 0 || deltaSeconds <= 0.0f)
+        return false;
+    const QSize targetSize(kBlendProbeWidth, kBlendProbeHeight);
+    for (int frame = 0; frame < frames; ++frame)
+    {
+        const qint64 positionMs =
+            qint64(std::lround(double(frame) * double(deltaSeconds) * 1000.0));
+        const float level = envelope.levelAtMs(positionMs);
+        renderer->setSpeechLevel(level);
+        renderer->setNextFrameDeltaSeconds(deltaSeconds);
+        if (renderer->renderFrame(targetSize).isNull())
+            return false;
+        if (samples != nullptr)
+            samples->append({positionMs, level, renderer->parameterValue(kMouthOpenParameter)});
+    }
+    return true;
+}
+
+/*头条用例：前半句有声、后半句静音 → 静音段嘴巴必须回到心情自己的值。
+
+  这就是用户提的那件事："她停下来的时候嘴要闭上"，而不是"幅度小一点"。
+  所以断言是**逐点等于心情值**（1e-3），不是"比有声段小"。*/
+void TestLive2DOffscreen::envelopeSilenceClosesMouth()
+{
+    Live2DOffscreenRenderer renderer;
+    QString error;
+    if (!loadAnyModel(&renderer, &error))
+        QSKIP("本机没有 Live2D 模型（禁二传，不入库），跳过包络闭嘴验证");
+    requireMouthParameters(&renderer);
+    requireBlendProbeParameters(&renderer);
+    QVERIFY(!renderer.renderFrame(QSize(kBlendProbeWidth, kBlendProbeHeight)).isNull());
+
+    /*合成本句音频：前 1s 有声（正弦峰值 0.6）、后 1s 数字静音。
+        静音段从 1000ms 起 —— 与下面"按位置过滤"的判据同源。*/
+    const QByteArray wav = buildPcm16Wav(22050, 1, {{1000, 0.6f}, {1000, 0.0f}});
+    const AudioEnvelope envelope = AudioEnvelope::fromWavBytes(wav);
+    QVERIFY2(envelope.isValid(), "合成 WAV 解析不出包络 —— 本用例的前提不成立");
+    QCOMPARE(envelope.levelAtMs(1000), 0.0f);
+
+    const QHash<QString, Live2DOffscreenRenderer::DeclaredRange> ranges =
+        renderer.declaredParameterRanges();
+    const Live2DOffscreenRenderer::DeclaredRange mouthRange = ranges.value(kMouthOpenParameter);
+    const float span = mouthRange.max - mouthRange.min;
+    QVERIFY2(span > 0.0f, "开口量没有量程，本用例量不出东西");
+
+    /*心情的开口量取**量程中点**：这样"张开"与"闭嘴"两个方向都有余量，
+        断言不会因为撞上 clamp 而失去意义。*/
+    const float moodMouthOpen = mouthRange.min + span * 0.5f;
+    const QHash<QString, float> mood = {{kMoodProbeParameter, 0.35f},
+                                        {kMouthOpenParameter, moodMouthOpen},
+                                        {kMouthFormParameter, -0.7f},
+                                        {kSecondProbeParameter, 0.25f}};
+    renderer.setMoodBlendDurationMs(150);
+    renderer.setParameterOverrides(mood);
+    QVERIFY(advanceUntilSettled(&renderer, kMouthOpenParameter, moodMouthOpen, 200, 20).reached);
+
+    /*播放：1/60s 虚拟步长 × 150 帧 = 2.5s 的虚拟时间，覆盖"有声 → 静音"整段。*/
+    renderer.setSpeaking(true);
+    QVector<EnvelopeSample> samples;
+    QVERIFY(playEnvelope(&renderer, envelope, 150, 1.0f / 60.0f, &samples));
+    QVERIFY2(samples.size() >= 100, "采样帧数不足");
+
+    float loudMax = samples.first().mouthOpen;
+    for (const EnvelopeSample &sample : samples)
+    {
+        if (sample.positionMs < 900) //有声段（留出最后 100ms 给释放，见下）
+            loudMax = std::max(loudMax, sample.mouthOpen);
+    }
+
+    /*静音段从 1000ms 起，但释放需要一点时间，所以从 1400ms 开始判。
+        这一段里每一个采样点都必须贴在心情值上。*/
+    int silentFrames = 0;
+    float silentMaxDeviation = 0.0f;
+    for (const EnvelopeSample &sample : samples)
+    {
+        if (sample.positionMs < 1400)
+            continue;
+        ++silentFrames;
+        QVERIFY2(sample.level == 0.0f,
+                 qPrintable(QStringLiteral("位置 %1ms 的电平是 %2，不是 0")
+                                .arg(sample.positionMs)
+                                .arg(double(sample.level))));
+        silentMaxDeviation =
+            std::max(silentMaxDeviation, qAbs(sample.mouthOpen - moodMouthOpen));
+    }
+    qInfo("ENVELOPE silence: loudMax=%.4f (mood=%.4f span=%.4f) silentFrames=%d "
+          "silentMaxDeviation=%.6f",
+          double(loudMax), double(moodMouthOpen), double(span), silentFrames,
+          double(silentMaxDeviation));
+
+    QVERIFY2(silentFrames >= 60,
+             qPrintable(QStringLiteral("静音段只采到 %1 帧，本用例的前提不成立")
+                            .arg(silentFrames)));
+    // (a) 有声段：嘴真的张开
+    QVERIFY2(loudMax >= moodMouthOpen + span * 0.15f,
+             qPrintable(QStringLiteral("有声段嘴巴最大只到 %1（心情值 %2）—— 电平没有驱动嘴巴")
+                            .arg(double(loudMax))
+                            .arg(double(moodMouthOpen))));
+    // (b) 静音段：回到心情自己的值。**这是用户诉求的钉子**
+    QVERIFY2(silentMaxDeviation <= 1e-3f,
+             qPrintable(QStringLiteral("静音段嘴巴偏离心情值最多 %1（心情值 %2）—— "
+                                       "停顿时嘴没有回到心情自己的值")
+                            .arg(double(silentMaxDeviation))
+                            .arg(double(moodMouthOpen))));
+}
+
+/*电平恒为 0 = 一点都不许动。
+
+  与上一条的区别：上一条量的是"从有声切到静音之后的回落"，这一条量的是
+  "整句都静音"（例如 TTS 返回了一段前导静音、或者用户把音量调静音了）——
+  此时**任何**残余扑动都会让嘴在她说不出话的时候继续开合。
+  "电平为 0 ⇒ 嘴停在心情值"是设计里最硬的一条约定，这条用例就是它的钉子。*/
+void TestLive2DOffscreen::envelopeZeroLevelKeepsMouthAtMoodValue()
+{
+    Live2DOffscreenRenderer renderer;
+    QString error;
+    if (!loadAnyModel(&renderer, &error))
+        QSKIP("本机没有 Live2D 模型（禁二传，不入库），跳过零电平验证");
+    requireMouthParameters(&renderer);
+    requireBlendProbeParameters(&renderer);
+    QVERIFY(!renderer.renderFrame(QSize(kBlendProbeWidth, kBlendProbeHeight)).isNull());
+
+    /*心情故意给一个**非零**开口量：这样"停在心情值"与"合死到 0"能区分开。*/
+    constexpr float kMoodMouthOpen = 0.32f;
+    const QHash<QString, float> mood = {{kMoodProbeParameter, 0.4f},
+                                        {kMouthOpenParameter, kMoodMouthOpen},
+                                        {kMouthFormParameter, -0.7f},
+                                        {kSecondProbeParameter, 0.25f}};
+    renderer.setMoodBlendDurationMs(150);
+    renderer.setParameterOverrides(mood);
+    QVERIFY(advanceUntilSettled(&renderer, kMouthOpenParameter, kMoodMouthOpen, 200, 20).reached);
+
+    renderer.setSpeaking(true);
+    QVector<EnvelopeSample> samples;
+    QVERIFY(playEnvelope(&renderer,
+                         AudioEnvelope::fromWavBytes(buildPcm16Wav(22050, 1, {{500, 0.0f}})),
+                         60, 1.0f / 60.0f, &samples));
+
+    float biggestDeviation = 0.0f;
+    for (const EnvelopeSample &sample : samples)
+        biggestDeviation = std::max(biggestDeviation, qAbs(sample.mouthOpen - kMoodMouthOpen));
+    qInfo("ENVELOPE zero-level: frames=%d mood=%.4f maxDeviation=%.6f",
+          samples.size(), double(kMoodMouthOpen), double(biggestDeviation));
+
+    /*无包络（全静音的 WAV）时 levelAtMs 恒为 0，所以这条同时覆盖了
+        "包络不可用时电平恒 0"这条路径。*/
+    QVERIFY2(biggestDeviation <= 1e-3f,
+             qPrintable(QStringLiteral("电平恒为 0 时嘴巴仍在心情值 %1 附近摆了 %2 —— "
+                                       "静音里还有残余开合")
+                            .arg(double(kMoodMouthOpen))
+                            .arg(double(biggestDeviation))));
+}
+
+/*包络路径不许碰别的参数。
+
+  为什么单独一条：`ParamMouthOpenY` 与 `ParamMouthForm` 在 model3.json 里同属
+  LipSync 组，很容易"顺手把嘴形也按电平写一下" —— 而嘴形（笑/撇嘴）属于**心情**，
+  两个东西都去写就是互相打架（用户看到的是"说话时表情被抹掉"）。
+  这里把"电平在变"的整段时间里所有非嘴参数读一遍，它们必须一动不动。*/
+void TestLive2DOffscreen::envelopeDoesNotDisturbOtherParameters()
+{
+    Live2DOffscreenRenderer renderer;
+    QString error;
+    if (!loadAnyModel(&renderer, &error))
+        QSKIP("本机没有 Live2D 模型（禁二传，不入库），跳过包络干扰验证");
+    requireMouthParameters(&renderer);
+    requireBlendProbeParameters(&renderer);
+    QVERIFY(!renderer.renderFrame(QSize(kBlendProbeWidth, kBlendProbeHeight)).isNull());
+
+    constexpr float kMoodMouthOpen = 0.2f;
+    constexpr float kMoodMouthForm = -0.7f;
+    constexpr float kMoodSmile = 0.4f;
+    constexpr float kMoodBrow = 0.25f;
+    const QHash<QString, float> mood = {{kMoodProbeParameter, kMoodSmile},
+                                        {kMouthOpenParameter, kMoodMouthOpen},
+                                        {kMouthFormParameter, kMoodMouthForm},
+                                        {kSecondProbeParameter, kMoodBrow}};
+    renderer.setMoodBlendDurationMs(150);
+    renderer.setParameterOverrides(mood);
+    QVERIFY(advanceUntilSettled(&renderer, kMoodProbeParameter, kMoodSmile, 200, 20).reached);
+
+    renderer.setSpeaking(true);
+    const QStringList watched = {kMouthFormParameter, kMoodProbeParameter, kSecondProbeParameter};
+    QVector<float> mouth;
+    for (int frame = 0; frame < 40; ++frame)
+    {
+        /*电平在整段里明显起伏（0.3~0.9）：只有"真的按电平写嘴巴"的实现才会
+            在这段时间里改变开口量 —— 否则"没碰别的参数"只是因为什么都没做。*/
+        const float level = 0.6f + 0.3f * std::sin(float(frame) * 0.5f);
+        renderer.setSpeechLevel(level);
+        renderer.setNextFrameDeltaSeconds(1.0f / 60.0f);
+        QVERIFY(!renderer.renderFrame(QSize(kBlendProbeWidth, kBlendProbeHeight)).isNull());
+        mouth.append(renderer.parameterValue(kMouthOpenParameter));
+        for (const QString &id : watched)
+        {
+            const float expected = mood.value(id);
+            const float actual = renderer.parameterValue(id);
+            QVERIFY2(qAbs(actual - expected) <= 1e-4f,
+                     qPrintable(QStringLiteral("包络第 %1 帧：%2 = %3，不等于心情值 %4 —— "
+                                               "包络路径动了不该动的参数（嘴形属于心情）")
+                                    .arg(frame)
+                                    .arg(id)
+                                    .arg(double(actual))
+                                    .arg(double(expected))));
+        }
+    }
+
+    const float mouthMin = *std::min_element(mouth.constBegin(), mouth.constEnd());
+    const float mouthMax = *std::max_element(mouth.constBegin(), mouth.constEnd());
+    qInfo("ENVELOPE isolation: frames=%d mouth=%.4f~%.4f, %s 全程等于心情值 %.3f",
+          mouth.size(), double(mouthMin), double(mouthMax), qPrintable(kMouthFormParameter),
+          double(kMoodMouthForm));
+    QVERIFY2(mouthMax - mouthMin > 0.05f,
+             qPrintable(QStringLiteral("电平在 0.3~0.9 之间起伏时开口量只动了 %1 —— "
+                                       "嘴没有跟着电平走")
+                            .arg(double(mouthMax - mouthMin))));
+}
+
+/*下一句没有包络时必须回到今天的盲扑动。
+
+  为什么必须有这条：包络模式是一个**状态**。如果"停止说话"不把它复位、
+  或者某个实现在没有包络时也进入包络模式（电平恒 0），那么用户把 vits 的 format
+  配成 mp3 之后，嘴会**整句冻在心情值上** —— 比今天的盲扑动还糟，而画面上的
+  症状（"她说话时嘴不动"）与"接线断了"完全一样，极难反推。
+  所以这里把上一句真的推进包络模式，再在第二句**一个电平都不发**，看盲扑动是否回来。*/
+void TestLive2DOffscreen::nextUtteranceWithoutEnvelopeFallsBackToBlindFlap()
+{
+    Live2DOffscreenRenderer renderer;
+    QString error;
+    if (!loadAnyModel(&renderer, &error))
+        QSKIP("本机没有 Live2D 模型（禁二传，不入库），跳过包络回退验证");
+    requireMouthParameters(&renderer);
+    requireBlendProbeParameters(&renderer);
+    QVERIFY(!renderer.renderFrame(QSize(kBlendProbeWidth, kBlendProbeHeight)).isNull());
+
+    const QHash<QString, Live2DOffscreenRenderer::DeclaredRange> ranges =
+        renderer.declaredParameterRanges();
+    const Live2DOffscreenRenderer::DeclaredRange mouthRange = ranges.value(kMouthOpenParameter);
+    const float span = mouthRange.max - mouthRange.min;
+
+    const float moodMouthOpen = 0.2f;
+    const QHash<QString, float> mood = {{kMoodProbeParameter, 0.35f},
+                                        {kMouthOpenParameter, moodMouthOpen},
+                                        {kMouthFormParameter, -0.7f},
+                                        {kSecondProbeParameter, 0.25f}};
+    renderer.setMoodBlendDurationMs(150);
+    renderer.setParameterOverrides(mood);
+    QVERIFY(advanceUntilSettled(&renderer, kMouthOpenParameter, moodMouthOpen, 200, 20).reached);
+
+    /*第一句：有包络，电平恒为 1（相当于"这一整句都在大声说"）。*/
+    renderer.setSpeaking(true);
+    QVector<EnvelopeSample> firstSentence;
+    QVERIFY(playEnvelope(&renderer, AudioEnvelope::fromWavBytes(buildPcm16Wav(22050, 1, {{500, 0.8f}})),
+                         40, 1.0f / 60.0f, &firstSentence));
+    float firstMax = firstSentence.first().mouthOpen;
+    for (const EnvelopeSample &sample : firstSentence)
+        firstMax = std::max(firstMax, sample.mouthOpen);
+    QVERIFY2(firstMax >= moodMouthOpen + span * 0.15f,
+             qPrintable(QStringLiteral("第一句（有包络）嘴巴没张开（%1）—— 本用例的前提不成立")
+                            .arg(double(firstMax))));
+
+    /*停播：Dialog 的停止路径 = 状态 false + 电平清零。*/
+    renderer.setSpeaking(false);
+    renderer.setSpeechLevel(0.0f);
+    QVERIFY(advanceFrames(&renderer, kMouthOpenParameter, 40, 20, nullptr));
+    const float afterStop = renderer.parameterValue(kMouthOpenParameter);
+    QVERIFY2(qAbs(afterStop - moodMouthOpen) <= 0.02f,
+             qPrintable(QStringLiteral("停播后嘴巴停在 %1，不等于心情值 %2")
+                            .arg(double(afterStop))
+                            .arg(double(moodMouthOpen))));
+
+    /*第二句：**没有包络**（一个电平都不发，模拟 format=mp3）。
+        判据与 speakingMouthFlapVariesAndStaysInRange 完全同一口径：
+        方向要反复改（3~5 次/秒）、幅度落在声明量程里。*/
+    renderer.setSpeaking(true);
+    QVector<float> samples;
+    QVERIFY(advanceFrames(&renderer, kMouthOpenParameter, 60, 0, &samples, 1.0f / 60.0f));
+    QVERIFY2(samples.size() >= 20, "采样帧数不足，量不出扑动");
+
+    float minValue = samples.first();
+    float maxValue = samples.first();
+    int alternations = 0;
+    int previousTrend = 0;
+    for (int index = 0; index < samples.size(); ++index)
+    {
+        minValue = std::min(minValue, samples[index]);
+        maxValue = std::max(maxValue, samples[index]);
+        if (index == 0)
+            continue;
+        const int trend = (samples[index] > samples[index - 1]) ? 1 : -1;
+        if (previousTrend != 0 && trend != previousTrend)
+            ++alternations;
+        previousTrend = trend;
+    }
+    qInfo("ENVELOPE fallback: first sentence max=%.4f → second sentence (no envelope) "
+          "%.4f~%.4f alternations=%d",
+          double(firstMax), double(minValue), double(maxValue), alternations);
+
+    QVERIFY2(maxValue - minValue >= span * 0.15f,
+             qPrintable(QStringLiteral("没有包络的第二句嘴巴只在 %1~%2 之间动（量程 %3~%4）—— "
+                                       "盲扑动没有回来")
+                            .arg(double(minValue))
+                            .arg(double(maxValue))
+                            .arg(double(mouthRange.min))
+                            .arg(double(mouthRange.max))));
+    QVERIFY2(alternations >= 5 && alternations <= 14,
+             qPrintable(QStringLiteral("没有包络的第二句开口量换了 %1 次方向（期望 5~14）—— "
+                                       "回退的不是今天的 3~5Hz 盲扑动")
+                            .arg(alternations)));
+    QVERIFY2(minValue >= mouthRange.min - 1e-4f && maxValue <= mouthRange.max + 1e-4f,
+             qPrintable(QStringLiteral("回退的扑动越出了声明范围（%1~%2）")
+                            .arg(double(minValue))
+                            .arg(double(maxValue))));
+}
+
+/*停止说话 + 电平清零 → 嘴回落到心情值（不是"啪一下合死"）。
+
+  与既有的 stoppingSpeechDecaysFlapToMoodValue 的区别：那条走的是**盲扑动**的
+  幅度衰减，这条走的是**包络模式**退出（电平清零 + 幅度衰减）——
+  用户实际经历的正是后者（有包络的句子播完了）。*/
+void TestLive2DOffscreen::stoppingSpeechWithClearedLevelReturnsToMood()
+{
+    Live2DOffscreenRenderer renderer;
+    QString error;
+    if (!loadAnyModel(&renderer, &error))
+        QSKIP("本机没有 Live2D 模型（禁二传，不入库），跳过包络停止验证");
+    requireMouthParameters(&renderer);
+    requireBlendProbeParameters(&renderer);
+    QVERIFY(!renderer.renderFrame(QSize(kBlendProbeWidth, kBlendProbeHeight)).isNull());
+
+    /*心情故意给一个**非零**开口量：这样"回落到心情值"与"合死到 0"能区分开。*/
+    constexpr float kMoodMouthOpen = 0.32f;
+    const QHash<QString, float> mood = {{kMoodProbeParameter, 0.0f},
+                                        {kMouthOpenParameter, kMoodMouthOpen},
+                                        {kSecondProbeParameter, 0.0f}};
+    constexpr int kBlendMs = 200;
+    renderer.setMoodBlendDurationMs(kBlendMs);
+    renderer.setParameterOverrides(mood);
+    QVERIFY(advanceUntilSettled(&renderer, kMouthOpenParameter, kMoodMouthOpen, 200, 20).reached);
+
+    renderer.setSpeaking(true);
+    QVector<EnvelopeSample> speakingSamples;
+    QVERIFY(playEnvelope(&renderer, AudioEnvelope::fromWavBytes(buildPcm16Wav(22050, 1, {{800, 0.9f}})),
+                         30, 1.0f / 60.0f, &speakingSamples));
+    float speakingMin = speakingSamples.first().mouthOpen;
+    float speakingMax = speakingSamples.first().mouthOpen;
+    for (const EnvelopeSample &sample : speakingSamples)
+    {
+        speakingMin = std::min(speakingMin, sample.mouthOpen);
+        speakingMax = std::max(speakingMax, sample.mouthOpen);
+    }
+    QVERIFY2(speakingMax - speakingMin > 0.05f || speakingMax > kMoodMouthOpen + 0.05f,
+             qPrintable(QStringLiteral("说话阶段没量到张嘴（%1~%2），本用例的前提不成立")
+                            .arg(double(speakingMin))
+                            .arg(double(speakingMax))));
+
+    /*Dialog 的停止路径：先状态 false，再把电平清零。*/
+    renderer.setSpeaking(false);
+    renderer.setSpeechLevel(0.0f);
+
+    /*等远超过渡时长（200ms 过渡 ⇒ 采 1.2s 的墙钟）。
+        ⚠️ 判据看**尾部窗口**：衰减是"线性趋近 0"，整段极差里含着开头那几百毫秒的
+        残余摆动（那是正确行为，不是没衰减）。*/
+    QVector<float> afterSamples;
+    QVERIFY(advanceFrames(&renderer, kMouthOpenParameter, 60, 20, &afterSamples));
+    const int tailBegin = afterSamples.size() * 3 / 4;
+    float tailMin = afterSamples[tailBegin];
+    float tailMax = afterSamples[tailBegin];
+    for (int index = tailBegin; index < afterSamples.size(); ++index)
+    {
+        tailMin = std::min(tailMin, afterSamples[index]);
+        tailMax = std::max(tailMax, afterSamples[index]);
+    }
+    qInfo("ENVELOPE stop[%s]: speaking=%.4f~%.4f → tail(last 1/4)=%.4f~%.4f, mood=%.4f",
+          qPrintable(kMouthOpenParameter), double(speakingMin), double(speakingMax),
+          double(tailMin), double(tailMax), double(kMoodMouthOpen));
+
+    QVERIFY2(tailMax - tailMin <= 0.02f,
+             qPrintable(QStringLiteral("停止说话 1.2s 后开口量仍在 %1~%2 之间摆（稳态极差 %3）")
+                            .arg(double(tailMin))
+                            .arg(double(tailMax))
+                            .arg(double(tailMax - tailMin))));
+    QVERIFY2(qAbs(tailMax - kMoodMouthOpen) <= 0.02f && qAbs(tailMin - kMoodMouthOpen) <= 0.02f,
+             qPrintable(QStringLiteral("停止说话后开口量停在 %1~%2，不等于心情值 %3 —— "
+                                       "包络没有干净地退场，或把嘴合死了")
                             .arg(double(tailMin))
                             .arg(double(tailMax))
                             .arg(double(kMoodMouthOpen))));

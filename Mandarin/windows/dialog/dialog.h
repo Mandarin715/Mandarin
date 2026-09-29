@@ -2,6 +2,7 @@
 #define DIALOG_H
 
 #include "AiProvider.h"
+#include "../../utils/AudioEnvelope.h"
 #include "../../utils/SearchProvider.h"
 #include "../../utils/FaceDetector.h"
 #include "ZcJsonLib.h"
@@ -82,6 +83,20 @@ class Dialog : public QWidget
        为什么用布尔而不是把音频数据送出去：需求要的就是"在说话"这一个信号，
        音频分析要么引依赖、要么在播放线程里做活儿，得不偿失。*/
     void requestSpeakState(bool speaking);
+
+    /*TTS 这一拍的**响度电平**（0~1），与 requestSpeakState 成对：
+       那个说"在不在播"，这个说"这一拍有多响"。
+       立绘据此让开口量跟着真实响度走 —— 于是句子之间的停顿（电平为 0）嘴会闭上，
+       这就是用户要的"停顿闭嘴"（盲扑动做不到：它不知道音频里有没有声音）。
+
+       为什么只送一个数而不是音频数据：
+         - 没有解码器/依赖：包络就在 Dialog 里从 TTS 返回的 **WAV（16 位 PCM）** 字节直接算出来
+           （vits-simple-api 的默认格式，实测），不必把音频交给窗口层；
+         - 窗口层与渲染层因此不需要知道采样率/位深/声道 —— 音频格式的事到此为止。
+
+       **只有真的算出包络时才发这个信号**：算不出来（例如用户把 vits 的 format 配成 mp3）
+       就一个都不发，渲染器据此保持今天逐位相同的盲扑动（回退契约）。*/
+    void requestSpeakLevel(float level);
 
   public slots:
     void ReloadAIConfig();          // 完整重载（角色切换/F5）
@@ -183,6 +198,21 @@ class Dialog : public QWidget
     QAudioOutput *m_vitsAudioOutput = nullptr;
     QBuffer *m_vitsTempFile = nullptr;
     void tryStartNextVitsPlayback();
+
+    /*---------- TTS 响度包络（见 requestSpeakLevel） ----------
+       包络按**序号**存：并发最多 3 句在途，谁先回来不重要，播放时按游标取。
+       "没有这一项"就是"这一句没有包络"（用户配成 mp3 的情形）—— 一个电平都不发。*/
+    QMap<int, AudioEnvelope> m_vitsEnvelopes;
+    int m_vitsPlayingSeq = -1;          // 当前在播的序号（取包络用）
+    QTimer *m_vitsLevelTimer = nullptr; // 采样节拍：把 position() 换成渲染器要的那一个数
+    /*50ms 一拍。与语音音节量级相称（一个音节 80~150ms ⇒ 每音节 2~3 个电平），
+       且低于渲染帧率的量级：中间几帧沿用上一个电平，由渲染器的攻击/释放平滑掉。
+       再快只是重复问同一个窗口（包络自己的窗口是 20ms），再慢就会漏掉短促的音节。*/
+    static constexpr int kVitsLevelSampleMs = 50;
+    /*算出并记下这一句的包络（有就存、没有就算了 —— 算不出来不是错误路径）。*/
+    void prepareVitsEnvelope(int seq, const QByteArray &bytes);
+    /*把当前播放位置换算成电平发出去（没有包络时什么都不发）。*/
+    void emitVitsSpeakLevel();
     bool submitCurrentInput();
     // 记忆功能
     QJsonObject m_memoryData;

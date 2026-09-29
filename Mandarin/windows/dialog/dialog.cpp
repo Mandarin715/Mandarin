@@ -592,6 +592,17 @@ void Dialog::initServices()
     // VITS 服务就绪检查（延迟5秒后每3秒重试，就绪后不重复）
     QTimer::singleShot(5000, this, [this]() { checkVitsServerReady(); });
 
+    /*响度包络的采样节拍：把播放位置换成"这一拍有多响"（见 requestSpeakLevel）。
+
+       为什么要有它：包络是**时间**上的一条曲线，而"当前播到哪儿"只有播放器知道；
+       窗口/渲染器的帧循环在另一个对象里，Dialog 无从知道它跑到第几帧。
+       定时器把"位置 → 电平"收敛成**一个数**发给立绘 ——
+       于是窗口层既不用知道音频格式，也不用自己算时间。
+       50ms 一拍的依据见 kVitsLevelSampleMs 的说明。*/
+    m_vitsLevelTimer = new QTimer(this);
+    m_vitsLevelTimer->setInterval(kVitsLevelSampleMs);
+    connect(m_vitsLevelTimer, &QTimer::timeout, this, [this]() { emitVitsSpeakLevel(); });
+
     //播放完成后播放下一条
     connect(m_vitsPlayer, &QMediaPlayer::playbackStateChanged, this,
             [this](QMediaPlayer::PlaybackState state)
@@ -603,8 +614,40 @@ void Dialog::initServices()
                    出错时嘴必须停下来（否则一个坏文件会让她的嘴一直动）。*/
                 emit requestSpeakState(state == QMediaPlayer::PlayingState);
 
+                /*响度电平的采样开关。
+                   ⚠️ **只有真的有包络时才发电平**：没有包络（用户把 vits 的 format 配成 mp3）
+                   就一个都不发，渲染器据此保持今天逐位相同的盲扑动。
+                   反过来（没包络也发 0）会让渲染器切进"包络模式"、把嘴整句冻在心情值上 ——
+                   症状（"她说话时嘴不动"）与"接线断了"一模一样，极难反推。*/
+                if (state == QMediaPlayer::PlayingState)
+                {
+                    const AudioEnvelope envelope = m_vitsEnvelopes.value(m_vitsPlayingSeq);
+                    if (envelope.isValid())
+                    {
+                        // 立刻发第一个电平：等第一个 50ms 到点会让起音晚半拍
+                        emit requestSpeakLevel(envelope.levelAtMs(m_vitsPlayer->position()));
+                        m_vitsLevelTimer->start();
+                    }
+                    else
+                    {
+                        m_vitsLevelTimer->stop();
+                    }
+                }
+                else
+                {
+                    m_vitsLevelTimer->stop();
+                    // 停播（含出错）：电平清零，嘴回到心情值上（顺序上必须在下面丢包络之前）
+                    if (m_vitsEnvelopes.value(m_vitsPlayingSeq).isValid())
+                        emit requestSpeakLevel(0.0f);
+                }
+
                 if (state == QMediaPlayer::StoppedState)
                 {
+                    /*这一句播完了：包络可以丢（一条几十~几百个 float 的向量，
+                       留着只是白占内存；并发在途的那几句各有各的条目，不受影响）。*/
+                    if (m_vitsPlayingSeq >= 0)
+                        m_vitsEnvelopes.remove(m_vitsPlayingSeq);
+
                     if (m_vitsTempFile)
                     {
                         m_vitsTempFile->deleteLater();
@@ -1488,6 +1531,7 @@ void Dialog::tryStartNextVitsRequest()
     QObject::connect(reply, &QNetworkReply::finished, this, [=]() {
         if (vitsGen != m_vitsGeneration) {
             audioBuffer->deleteLater();
+            m_vitsEnvelopes.remove(seq);
             reply->deleteLater();
             delete timer;
             return;
@@ -1500,6 +1544,11 @@ void Dialog::tryStartNextVitsRequest()
 
         if (reply->error() == QNetworkReply::NoError && audioBuffer->size() > 0)
         {
+            /*响度包络在这里算：**只有这一刻**同时握着"这一句的字节"与"它的序号"。
+               为什么不让渲染器去算：那等于把音频格式的知识（采样率/位深/声道）
+               漏进渲染层；Dialog 是本工程里唯一见过 TTS 字节的地方。
+               算不出来（不是 16 位 PCM）不是错误路径：不存条目，播放时自然没有电平可发。*/
+            prepareVitsEnvelope(seq, audioBuffer->data());
             audioBuffer->open(QIODevice::ReadOnly);
             // QMap 按序号自动排序，并发乱序完成也不会错位
             m_vitsReadyFiles[seq] = audioBuffer;
@@ -1508,6 +1557,7 @@ void Dialog::tryStartNextVitsRequest()
         else
         {
             audioBuffer->deleteLater();
+            m_vitsEnvelopes.remove(seq);
             // 记录失败序号并尝试推进游标，避免卡死后续播放
             m_vitsFailedSeqs.insert(seq);
             tryStartNextVitsPlayback();
@@ -1538,6 +1588,9 @@ void Dialog::resetVitsPipeline()
         if (file) file->deleteLater();
     }
     m_vitsReadyFiles.clear();
+    m_vitsEnvelopes.clear();
+    m_vitsPlayingSeq = -1;
+    if (m_vitsLevelTimer) m_vitsLevelTimer->stop();
     m_vitsFailedSeqs.clear();
     if (m_vitsTempFile) { m_vitsTempFile->deleteLater(); m_vitsTempFile = nullptr; }
     if (m_vitsPlayer) m_vitsPlayer->stop();
@@ -1612,6 +1665,11 @@ void Dialog::tryStartNextVitsPlayback()
     if (!m_vitsTempFile)
         return;
 
+    /*记下"当前在播的是哪一句"：包络按序号取（见 m_vitsEnvelopes）。
+       必须在 play() **之前**赋值 —— play() 会同步触发 playbackStateChanged，
+       那条连接要用这个序号去取包络。条目在这里**不删**：播放中每 50ms 还要取一次。*/
+    m_vitsPlayingSeq = nextKey;
+
     // QBuffer 已在 finished 中设为 ReadOnly，QMediaPlayer 直接读取，免磁盘 I/O
     m_vitsPlayer->setSourceDevice(m_vitsTempFile, QUrl("audio.mp3"));
     m_vitsPlayer->play();
@@ -1620,6 +1678,49 @@ void Dialog::tryStartNextVitsPlayback()
              << "| device:" << m_vitsAudioOutput->device().description()
              << "| volume:" << m_vitsAudioOutput->volume()
              << "| muted:" << m_vitsAudioOutput->isMuted();
+}
+
+/*算出并记下这一句的响度包络（key = 合成序号）。
+
+  为什么在这里算：包络是**音频字节**的属性，而"字节 + 序号"只有刚收到回复的这一刻
+  同时握在手里。为什么不让渲染器算：那等于把音频格式（采样率/位深/声道）的知识
+  漏进渲染层；Dialog 是本工程里唯一见过 TTS 字节的地方。
+
+  算不出来**不是错误路径**：vits-simple-api 默认返回 WAV（实测），但用户可以把
+  format 配成 mp3 —— 那时不存条目、不打警告（一行 qDebug 说明即可，不是故障），
+  播放时自然一个电平都不发，渲染器保持盲扑动。
+
+  ⚠️ 这段跑在主线程：一段 5s / 32kHz 的语音约 16 万样本，实测在**亚毫秒**量级
+  （见 AudioEnvelope 的实现），远小于一次渲染帧，不构成"卡一下"。*/
+void Dialog::prepareVitsEnvelope(int seq, const QByteArray &bytes)
+{
+    const AudioEnvelope envelope = AudioEnvelope::fromWavBytes(bytes);
+    if (!envelope.isValid())
+    {
+        m_vitsEnvelopes.remove(seq);
+        qDebug() << "[VITS] no loudness envelope (not 16-bit PCM) | seq:" << seq
+                 << "| bytes:" << bytes.size();
+        return;
+    }
+    m_vitsEnvelopes.insert(seq, envelope);
+    qDebug() << "[VITS] loudness envelope | seq:" << seq
+             << "| levels:" << envelope.levelCount()
+             << "| windowMs:" << envelope.windowMs()
+             << "| sampleRate:" << envelope.sampleRate();
+}
+
+/*把当前播放位置换算成电平发出去（50ms 一拍）。
+
+  没有包络、或者已经不在播，就什么都不发 —— 与 requestSpeakLevel 的契约一致：
+  "没有包络"必须表现为**一个电平都不发**（发 0 会让渲染器切进包络模式、冻住嘴）。*/
+void Dialog::emitVitsSpeakLevel()
+{
+    if (!m_vitsPlayer || m_vitsPlayer->playbackState() != QMediaPlayer::PlayingState)
+        return;
+    const AudioEnvelope envelope = m_vitsEnvelopes.value(m_vitsPlayingSeq);
+    if (!envelope.isValid())
+        return;
+    emit requestSpeakLevel(envelope.levelAtMs(m_vitsPlayer->position()));
 }
 
 /*极窄的"纯寒暄"白名单：只有这些才跳过 AI 搜索意图分类、直接走对话。

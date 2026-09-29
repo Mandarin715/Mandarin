@@ -90,6 +90,11 @@ class Live2DCharacterWindow : public CharacterWindowBase
        Live2DOffscreenRenderer::setSpeaking）。基类默认实现什么都不做（PNG 路径）。*/
     void SetSpeaking(bool speaking) override;
 
+    /*TTS 这一拍的响度电平（0~1）：转给渲染器，让开口量跟着**真实响度**走，
+       于是句子之间的停顿（电平为 0）嘴会回到心情值上 —— 用户要的就是这个
+       （见 Live2DOffscreenRenderer::setSpeechLevel）。基类默认实现什么都不做。*/
+    void SetSpeechLevel(float level) override;
+
   protected:
     void relayoutContent() override; //按 m_tachieSizePercent 重算逻辑画布并渲染首帧
 

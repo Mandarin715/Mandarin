@@ -96,6 +96,9 @@ class TestLive2DWindow : public QObject
     /*窗口的 SetSpeaking（Dialog::requestSpeakState 的落点）必须一路走到渲染器：
        嘴巴随时间开合、且回落到心情值。这条钉住"接线"，渲染器级的数学另有专测。*/
     void setSpeakingDrivesMouthFlapThroughWindow();
+    /*窗口的 SetSpeechLevel（Dialog::requestSpeakLevel 的落点）必须一路走到渲染器：
+       满电平时嘴张开、电平清零后嘴停在心情值上（= 句间停顿闭嘴）。*/
+    void setSpeechLevelClosesMouthThroughWindow();
 
     /*---------- 立绘大小变更的性能与重入（本阶段修复的缺陷） ----------*/
     /*用户报告：「改立绘大小后卡约 5 秒才变，之后持续掉帧」。
@@ -3431,6 +3434,108 @@ void TestLive2DWindow::setSpeakingDrivesMouthFlapThroughWindow()
              qPrintable(QStringLiteral("停止说话后开口量停在 %1，不等于心情值 %2")
                             .arg(double(tailMax))
                             .arg(double(neutralMouthOpen))));
+}
+
+/*[接线] 窗口的 SetSpeechLevel（= main.cpp 里 Dialog::requestSpeakLevel 的落点）
+  必须一路走到渲染器：满电平 → 嘴张开；电平清零 → 嘴**停在心情自己的值**上。
+
+  为什么这条不能省（渲染器级已有五条 ENVELOPE 用例）：
+  那些用例直接调 renderer.setSpeechLevel()，证明的是**数学**；
+  而用户路径多两跳 —— Dialog 的信号 → 基类槽（虚函数）→ 派生类 → 渲染器。
+  少了这里，一个"槽忘了转给渲染器"的改动在渲染器级测试里是全绿的。
+
+  判据为什么取"清零之后"：只喊 SetSpeaking(true) 时，嘴本来就（按今天的盲扑动）会动，
+  所以"满电平下嘴张开"分辨不出接线有没有接上；**清零后嘴必须完全静止**
+  才是这条线的证据 —— 接不上的话，盲扑动会继续开合。
+
+  ⚠️ 帧时间来自墙钟，所以必须 QTest::qWait（见 waitForMoodSettle 的说明）。*/
+void TestLive2DWindow::setSpeechLevelClosesMouthThroughWindow()
+{
+    const QString modelName = preferredModelName();
+    const QString dir = modelDirFor(modelName);
+    if (!QFileInfo::exists(dir))
+        QSKIP("本机没有用户配置的模型（禁二传，不入库），跳过电平接线验证");
+
+    Live2DMoodPreset preset;
+    if (!loadConfiguredMoodPreset(&preset))
+        QSKIP("本机没有当前角色/模型的心情预设数据（Documents 下，不入库），跳过");
+
+    Live2DCharacterWindow window;
+    window.loadModel(modelName);
+    QVERIFY2(window.isModelLoaded(), "模型装载失败，无法验证电平接线");
+    QVERIFY2(window.isMoodPresetEnabled(), "情绪预设没装载成功");
+
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QCoreApplication::processEvents();
+    window.hide();
+    QCoreApplication::processEvents();
+
+    /*用 neutral 原型：它的开口量接近 0，于是"张嘴"一定来自电平，
+        不会与心情自己的开口量混在一起。*/
+    const QString neutralMood = preset.representativeMoodForArchetype(QStringLiteral("neutral"));
+    QVERIFY2(!neutralMood.isEmpty(), "neutral 没有别名");
+    const float neutralMouthOpen =
+        preset.parametersForArchetype(QStringLiteral("neutral"))
+            .value(QStringLiteral("ParamMouthOpenY"), -1.0f);
+    QVERIFY2(qAbs(neutralMouthOpen) <= 0.05f,
+             qPrintable(QStringLiteral("neutral 原型的开口量是 %1（不是 0）")
+                            .arg(double(neutralMouthOpen))));
+
+    window.reloadContent(neutralMood);
+    QVERIFY2(waitForMoodSettle(&window), "neutral 过渡没走完");
+
+    // ① 说话 + 满电平：嘴必须张开（这一步是②的前提：电平真的到了渲染器）
+    window.SetSpeaking(true);
+    float loudMax = -1.0f;
+    for (int index = 0; index < 30; ++index)
+    {
+        QTest::qWait(20);
+        window.SetSpeechLevel(1.0f);
+        QVERIFY2(window.renderFrameNow(), "满电平帧渲染失败");
+        loudMax = std::max(loudMax, window.parameterValue(QStringLiteral("ParamMouthOpenY")));
+    }
+
+    /*② 电平清零（用户听到的就是"她停下来了"）：嘴必须**停在心情值上** ——
+        既不许再动，也不许回到 0 以外的别处。这就是"句间停顿闭嘴"。*/
+    QVector<float> silent;
+    for (int index = 0; index < 30; ++index)
+    {
+        QTest::qWait(20);
+        window.SetSpeechLevel(0.0f);
+        QVERIFY2(window.renderFrameNow(), "零电平帧渲染失败");
+        silent.append(window.parameterValue(QStringLiteral("ParamMouthOpenY")));
+    }
+    const int tailBegin = silent.size() * 2 / 3; //释放 140ms ≈ 7 帧，留出两倍余量
+    float tailMin = silent[tailBegin];
+    float tailMax = silent[tailBegin];
+    for (int index = tailBegin; index < silent.size(); ++index)
+    {
+        tailMin = std::min(tailMin, silent[index]);
+        tailMax = std::max(tailMax, silent[index]);
+    }
+    qInfo("ENVELOPE window[%s]: 满电平 max=%.4f → 电平清零 tail span=%.5f（%.5f~%.5f），"
+          "mood=%.5f",
+          qPrintable(modelName), double(loudMax), double(tailMax - tailMin), double(tailMin),
+          double(tailMax), double(neutralMouthOpen));
+
+    QVERIFY2(loudMax >= 0.2f,
+             qPrintable(QStringLiteral("满电平时开口量最大只有 %1 —— 电平没有走到渲染器")
+                            .arg(double(loudMax))));
+    QVERIFY2(tailMax - tailMin <= 0.02f,
+             qPrintable(QStringLiteral("电平清零后开口量仍在 %1~%2 之间摆 —— "
+                                       "包络模式下仍在盲扑动（槽没接线？）")
+                            .arg(double(tailMin))
+                            .arg(double(tailMax))));
+    QVERIFY2(qAbs(tailMax - neutralMouthOpen) <= 0.02f
+                 && qAbs(tailMin - neutralMouthOpen) <= 0.02f,
+             qPrintable(QStringLiteral("电平清零后开口量停在 %1~%2，不等于心情值 %3 —— "
+                                       "停顿时嘴没有回到心情自己的值")
+                            .arg(double(tailMin))
+                            .arg(double(tailMax))
+                            .arg(double(neutralMouthOpen))));
+
+    window.SetSpeaking(false);
 }
 
 /*==================================================================================

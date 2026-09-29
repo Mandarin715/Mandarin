@@ -193,6 +193,12 @@ int main(int argc, char *argv[])
        走基类的槽是为了让两种立绘共用同一条连接：连到派生类就要在这里写 if 分支。*/
     QObject::connect(&dialogWin, &Dialog::requestSpeakState, characterWin,
                      &CharacterWindowBase::SetSpeaking);
+    /*TTS 响度电平 → 立绘的开口量（Live2D 按真实响度驱动嘴巴，句间停顿闭嘴）。
+       同样走基类：PNG 路径的空实现什么都不做。
+       没有包络的句子（用户把 vits 的 format 配成 mp3）**一个电平都不发**，
+       渲染器据此保持今天的盲扑动 —— 这条回退在 Dialog 侧就决定了。*/
+    QObject::connect(&dialogWin, &Dialog::requestSpeakLevel, characterWin,
+                     &CharacterWindowBase::SetSpeechLevel);
 
     /*托盘*/
     QSystemTrayIcon tray;

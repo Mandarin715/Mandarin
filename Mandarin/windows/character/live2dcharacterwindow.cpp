@@ -328,6 +328,15 @@ void Live2DCharacterWindow::SetSpeaking(bool speaking)
     m_renderer.setSpeaking(speaking);
 }
 
+/*TTS 响度电平 → 渲染器的包络驱动。
+
+  与 SetSpeaking 一样**不**顺手渲染一帧：电平每 50ms 就有一个新值，
+  帧循环最迟 8ms 就会带着它渲下一帧（同步渲染那 4ms 主线程卡顿正是要避免的）。*/
+void Live2DCharacterWindow::SetSpeechLevel(float level)
+{
+    m_renderer.setSpeechLevel(level);
+}
+
 float Live2DCharacterWindow::parameterValue(const QString &parameterId) const
 {
     return m_renderer.parameterValue(parameterId);

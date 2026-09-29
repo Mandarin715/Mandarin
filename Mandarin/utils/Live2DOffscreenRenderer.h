@@ -85,6 +85,25 @@ class Live2DOffscreenRenderer
         - 不在说话时扑动量恒为 0（对渲染结果零影响）。*/
     void setSpeaking(bool speaking);
 
+    /***这一帧的 TTS 响度电平**（0~1，由 Dialog 从 TTS 字节算出的包络提供）。
+
+      与 `setSpeaking` 成对：那个说"在不在播"，这个说"这一拍有多响"。
+
+      语义与约定（都是可观察行为，见 test_live2doffscreen 的 ENVELOPE 系列）：
+        - 电平**只在真的有包络时**才被喂进来。一旦喂过，渲染器进入"包络模式"：
+          `开口量 = clamp(心情值 + 电平 × 量程比例 × (1+不规则抖动), 声明min, 声明max)`；
+        - **电平为 0 = 嘴停在心情自己的值**（一丝残余开合都不许有）——
+          这就是用户要的"句子之间闭嘴"；
+        - `setSpeaking(false)` 会把包络模式复位。于是**下一句没有包络时**
+          （例如用户把 vits 的 format 配成 mp3）行为回到与今天逐位相同的盲扑动：
+          忘了复位 = 嘴整句冻在心情值上，而画面症状与"接线断了"一模一样，极难反推；
+        - 离散电平（Dialog 每 50ms 一拍）由攻击/释放平滑，否则嘴是一格一格地跳；
+        - 与扑动一样**只驱动 `ParamMouthOpenY`**，绝不碰 `ParamMouthForm`（嘴形属于心情）。
+
+      窗口层只转手这一个数 —— 采样率/位深/声道那些事到 Dialog 为止，
+      渲染器不该知道世上存在 WAV。*/
+    void setSpeechLevel(float level);
+
     /***情绪睁闭眼乘数**（默认 1.0 = 眨眼自己说了算）。
 
       语义：对模型声明的**眨眼参数**（model3.json 的 Groups[EyeBlink]），

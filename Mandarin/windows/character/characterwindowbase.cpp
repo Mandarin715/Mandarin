@@ -142,6 +142,16 @@ void CharacterWindowBase::SetSpeaking(bool speaking)
     Q_UNUSED(speaking);
 }
 
+/*TTS 响度电平（0~1）。
+
+  PNG 路径的默认实现同样**故意什么都不做**：一张静止立绘没有能跟着响度动的嘴，
+  强行让整张图抖一下反而是用户没要求的行为。
+  Live2D 路径覆写它（见 Live2DCharacterWindow::SetSpeechLevel）。*/
+void CharacterWindowBase::SetSpeechLevel(float level)
+{
+    Q_UNUSED(level);
+}
+
 void CharacterWindowBase::contextMenuEvent(QContextMenuEvent *event)
 {
     emit requestToggleVisible(); //发出信号

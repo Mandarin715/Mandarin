@@ -153,6 +153,9 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
         utils/OfflineSpeechRecognizer.h utils/OfflineSpeechRecognizer.cpp
         utils/ChatLogStore.h utils/ChatLogStore.cpp
         utils/FaceDetector.h utils/FaceDetector.cpp
+        # TTS 响度包络（说话时嘴跟着响度开合、句间停顿闭嘴）。
+        # 与 Live2D 无关：算包络的地方是 Dialog，立绘只收一个电平。
+        utils/AudioEnvelope.h utils/AudioEnvelope.cpp
         windows/setting/child/settingchild_llm.h windows/setting/child/settingchild_llm.cpp windows/setting/child/settingchild_llm.ui
         windows/setting/child/settingchild_char.h windows/setting/child/settingchild_char.cpp windows/setting/child/settingchild_char.ui
         windows/setting/child/settingchild_vits.h windows/setting/child/settingchild_vits.cpp windows/setting/child/settingchild_vits.ui
@@ -525,6 +528,33 @@ if(BUILD_TESTING)
     )
     add_test(NAME test_tachiegeometry COMMAND test_tachiegeometry)
 
+    # TTS 响度包络的解析与归一化（纯计算：不需要模型、不需要 GL、不需要音频设备）。
+    # 它是"句间停顿闭嘴"这条用户诉求的**数据源头**：参考值取错（例如取最大值）时
+    # 画面只是"嘴张不开"，从像素上极难反推，所以必须在这里用合成 WAV 钉死。
+    add_executable(test_audioenvelope
+        tests/test_audioenvelope.cpp
+        utils/AudioEnvelope.cpp
+    )
+    target_include_directories(test_audioenvelope PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_BINARY_DIR}
+    )
+    target_link_libraries(test_audioenvelope PRIVATE
+        Qt${QT_VERSION_MAJOR}::Test
+        Qt${QT_VERSION_MAJOR}::Core
+    )
+    set_target_properties(test_audioenvelope PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_custom_command(TARGET test_audioenvelope POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Test>"
+            "$<TARGET_FILE_DIR:test_audioenvelope>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Core>"
+            "$<TARGET_FILE_DIR:test_audioenvelope>"
+    )
+    add_test(NAME test_audioenvelope COMMAND test_audioenvelope)
+
     # 立绘窗口基类的**窗口层契约**：Dialog::requestSpeakState → CharacterWindowBase::SetSpeaking
     # 这条连接挂在基类上（PNG 与 Live2D 共用），PNG 路径的默认实现必须"接受任何值且零副作用"。
     # 纯 Qt Widgets，不需要模型、不需要 GL、不需要真窗口。
@@ -623,6 +653,7 @@ if(BUILD_TESTING)
             utils/Live2DOffscreenRenderer.cpp
             utils/Live2DCubismRuntime.cpp
             utils/Live2DModelInfo.cpp
+            utils/AudioEnvelope.cpp
         )
         target_include_directories(test_live2doffscreen PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}

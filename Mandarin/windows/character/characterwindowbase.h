@@ -41,6 +41,15 @@ class CharacterWindowBase : public QWidget
        与 ShowInnerThought/HideInnerThought 同一套理由 —— 基类承接信号，子类各自实现。*/
     virtual void SetSpeaking(bool speaking);
 
+    /*TTS 这一拍的**响度电平**（0~1，由 Dialog::requestSpeakLevel 驱动；见下）。
+       与 SetSpeaking 成对：那个说"在不在播"，这个说"这一拍有多响"。
+       PNG 路径同样什么都不做（一张静止立绘没有能跟着响度动的嘴），
+       Live2D 路径覆写它转给渲染器 —— 句间停顿（电平为 0）嘴就停在心情值上。
+
+       ⚠️ 语义边界：电平是**唯一**从这里过的东西。采样率/位深/声道那些音频格式的事
+       到 Dialog 为止，窗口层与渲染层都不该知道世上存在 WAV。*/
+    virtual void SetSpeechLevel(float level);
+
   protected:
     /*子类渲染完成后调用：登记 alpha 图及其窗口内位置，并重算交互区*/
     void updateRenderedImage(const QImage &image, const QPoint &topLeft);

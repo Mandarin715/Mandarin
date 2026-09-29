@@ -102,6 +102,32 @@ constexpr float kSpeakingFlapMaxAmplitude = 0.55f;
 /*过零时"最张开"仍要保留一点开度：完全合到 0 会让开合在低帧率下闪烁。*/
 constexpr float kSpeakingFlapFloor = 0.05f;
 
+/*===== 包络驱动嘴巴的参数（见 setSpeechLevel 与 AudioEnvelope 的说明）=====
+
+  量程比例 0.75：满电平（正常语音里最强的音节）给出约 3/4 量程的开度。
+    为什么不是 1.0：扑动量是**加在心情值上**的，而心情本身可能已经张着嘴
+    （surprised 预设把开口量放到 0.8）—— 满量程只会让它更早顶到上限。
+    0.75 留出的余量正是给"心情本来就张着嘴"的情形（clamp 只挡越界、不做平均）。
+    为什么不是 0.4：包络的参考值是 95 分位，正常句子里"响亮的常态"才接近 1，
+    0.4 会让中等音量的句子看起来"嘴张不开"。
+
+  抖动 ±25%（慢速随机游走，约 150ms 换一次目标）：这是"纸片人的不规则感"在
+    包络模式里的**唯一**来源。真实语音的电平在音节内部几乎恒定，
+    只按电平开合会像"跟着音量条张嘴"；慢速游走让同一段响度的口型也有细微变化。
+    抖动**乘**在电平上（而不是相加）：电平为 0 时它乘不出任何东西 ——
+    静音必须精确等于"嘴停在心情值"，一个字节的残余开合都不许有。
+
+  电平平滑：攻击 60ms、释放 140ms（Dialog 每 50ms 才给一个新电平，直接施加是一格一格跳）。
+    两个方向不对称是有理由的：起音要跟得上（不然每个字都晚 50ms 张嘴，口型发拖），
+    收音拖一点（不然字与字、音节之间的低电平会让嘴一闪一闪）。
+    与心情过渡同一套"时间制线性逼近 + 到达即 snap"的写法：静态电平下必须**精确**
+    落到目标，否则静音时电平永远差一丝、嘴闭不严（那是本功能唯一要解决的事）。*/
+constexpr float kSpeechEnvelopeScale = 0.75f;
+constexpr float kSpeechWobbleRange = 0.25f;
+constexpr float kSpeechWobbleIntervalSeconds = 0.15f;
+constexpr float kSpeechLevelAttackSeconds = 0.06f;
+constexpr float kSpeechLevelReleaseSeconds = 0.14f;
+
 /*把文件读成字节。**唯一**的读盘入口：QFile 走 Windows 宽字符 API，中文路径没问题。*/
 bool readAllBytes(const QString &path, QByteArray *out)
 {
@@ -365,7 +391,53 @@ class OffscreenUserModel : public Csm::CubismUserModel
     void setExplicitEyeMultiplier(bool on) { m_eyeMultiplierExplicit = on; }
 
     /*说话开关。语义只是"目标状态"：真正的幅度爬升/衰减在 advanceSpeakingFlap 里按帧时间做。*/
-    void setSpeaking(bool speaking) { m_speaking = speaking; }
+    void setSpeaking(bool speaking)
+    {
+        m_speaking = speaking;
+        if (!speaking)
+        {
+            /*停播 = 这一句结束了：**包络模式必须在这里复位**。
+
+                为什么非复位不可：用户可能把 vits 的 format 配成 mp3（那一句没有包络）。
+                如果渲染器还留在"包络模式"、电平恒 0，嘴会**整句冻在心情值上** ——
+                那比今天的盲扑动更糟，而且画面症状（"她说话时嘴不动"）与"接线断了"
+                一模一样，从像素上几乎无法反推。复位后下一句自动回到盲扑动。
+
+                顺序无关：即使 Dialog 紧接着补一个"电平清零"，setSpeechLevel 也不会
+                因此重新进入包络模式（见那里的条件）。*/
+            m_speechLevelValid = false;
+            setSpeechLevelTarget(0.0f);
+        }
+    }
+
+    /*说话电平（0~1，来自 Dialog 对 TTS 字节算出的包络；语义见公开头文件）。*/
+    void setSpeechLevel(float level)
+    {
+        const float clamped = std::clamp(level, 0.0f, 1.0f);
+        setSpeechLevelTarget(clamped);
+        /*只有"这一句真的带来了包络"才进入包络模式。
+            停播后 Dialog 会把电平清零（那是**上**一句的收尾，不是新一句的包络），
+            把它当包络就会让嘴从盲扑动切进包络模式、冻在心情值上。*/
+        if (m_speaking || clamped > 0.0f)
+            m_speechLevelValid = true;
+        /*⚠️ 不在这里把平滑值归零：连着两句之间电平是有连续性的，
+            从残留值出发比"打回 0 再来"更平滑（相位那种"随机起点"的问题这里不存在）。
+            真正需要起点快照的是**目标变化**的那一刻，见 setSpeechLevelTarget。*/
+    }
+
+    /*把电平目标改成新值：**起点取当前平滑值**（不跳变），计时清零。
+
+       与心情过渡同一套"快照起点 + 时间制线性推进"的写法，理由也一样：
+       指数逼近（value += (target-value)×k×dt）永远到不了目标 ——
+       那意味着释放到 0 之后嘴还留着一条缝，"停顿闭嘴"就不成立。*/
+    void setSpeechLevelTarget(float level)
+    {
+        if (level == m_speechLevelTarget)
+            return;
+        m_speechLevelFrom = m_speechLevelSmoothed;
+        m_speechLevelElapsedSeconds = 0.0f;
+        m_speechLevelTarget = level;
+    }
 
     /*心情过渡时长（毫秒）。0 = 关掉插值，立刻跳到目标。
 
@@ -540,6 +612,13 @@ class OffscreenUserModel : public Csm::CubismUserModel
         if (m_speakingFlapAmplitude <= 0.0f)
             return 0.0f;
 
+        /*包络模式：Dialog 这一句真的带来了电平（见 setSpeechLevel）。
+            放在这里而不是函数开头是有意的 —— "说话幅度"的爬升/衰减上面已经算完，
+            两种模式共用同一个开关，所以"停播后回落"天然只有一条路径。
+            没有包络时（用户配成 mp3）走下面逐位不变的盲扑动。*/
+        if (m_speechLevelValid)
+            return advanceSpeechEnvelope(deltaSeconds);
+
         // 推进相位；转过一个周期就重新摇频率（这就是"不规则"的来源）
         m_speakingFlapPhase += 2.0f * static_cast<float>(M_PI) * m_speakingFlapFrequencyHz
                                * deltaSeconds;
@@ -568,6 +647,65 @@ class OffscreenUserModel : public Csm::CubismUserModel
         const float wave = 0.5f + 0.5f * std::sin(m_speakingFlapPhase); // 0~1
         const float shaped = kSpeakingFlapFloor + (1.0f - kSpeakingFlapFloor) * wave;
         return m_speakingFlapAmplitude * m_speakingFlapCurrentAmplitude * span * shaped;
+    }
+
+    /*包络模式的一帧：把这一句的响度电平变成一个开口量。
+
+      `开口量 = 电平 × 量程比例 × (1 + 不规则抖动)`，由调用方加在心情值上、再 clamp。
+      返回**本身**的扑动量（参数单位）；电平为 0 时是**精确的 0** ——
+      嘴停在心情值上，这正是用户要的"句子之间闭嘴"。
+
+      为什么必须精确：用户诉求的另一半是"停顿闭嘴"，"接近 0 的电平"会在屏幕上留下
+      一条一直在微微抖的缝。所以下面的平滑一旦落到目标就 snap（与心情过渡同一套机制），
+      而抖动是**乘**在电平上的（0 乘任何数还是 0）。*/
+    float advanceSpeechEnvelope(float deltaSeconds)
+    {
+        // 1) 电平平滑：攻击快、释放慢（见 kSpeechLevelAttackSeconds 的说明）
+        const float tau = (m_speechLevelTarget >= m_speechLevelFrom) ? kSpeechLevelAttackSeconds
+                                                                     : kSpeechLevelReleaseSeconds;
+        m_speechLevelElapsedSeconds += deltaSeconds;
+        const float progress =
+            (tau > 0.0f) ? std::min(m_speechLevelElapsedSeconds / tau, 1.0f) : 1.0f;
+        /*进度满 ⇒ **直接落到目标**（不是"接近"）。这一条是"静音 = 心情值"的前提：
+            线性逼近走到头就是目标本身，而指数逼近会永远差一丝。*/
+        m_speechLevelSmoothed =
+            (progress >= 1.0f)
+                ? m_speechLevelTarget
+                : (m_speechLevelFrom + (m_speechLevelTarget - m_speechLevelFrom) * progress);
+
+        const float span = speakingMouthSpan();
+        if (span <= 0.0f)
+            return 0.0f;
+
+        /*2) 不规则抖动：慢速随机游走（每 ~150ms 换一个目标，期间平滑过渡）。
+            为什么不能省：真实语音在音节内部的电平几乎恒定，只按电平开合看起来是
+            "跟着音量条张嘴"；这一层细微摆动才是"像在说话"的来源。*/
+        m_speechWobbleElapsedSeconds += deltaSeconds;
+        if (m_speechWobbleElapsedSeconds >= kSpeechWobbleIntervalSeconds)
+        {
+            m_speechWobbleElapsedSeconds = 0.0f;
+            m_speechWobbleTarget = (uniformUnitRandom() * 2.0f - 1.0f) * kSpeechWobbleRange;
+        }
+        const float wobbleStep =
+            std::min(deltaSeconds / kSpeechWobbleIntervalSeconds, 1.0f);
+        m_speechWobble += (m_speechWobbleTarget - m_speechWobble) * wobbleStep;
+
+        /*3) 静音（电平已落到 0）**精确**返回 0：一个字节的残余都不许有。
+            顺序上先判它再乘抖动，是为了让"静音 = 心情值"这件事不依赖抖动的正负。*/
+        if (m_speechLevelSmoothed <= 0.0f)
+            return 0.0f;
+
+        return m_speakingFlapAmplitude * m_speechLevelSmoothed * kSpeechEnvelopeScale * span
+               * (1.0f + m_speechWobble);
+    }
+
+    /*嘴巴参数**模型声明**的量程（span）。取不到（模型没声明这个参数）时返回 0，
+       于是两条扑动路径都自动失效，而不是拿硬编码量程去写越界值。*/
+    float speakingMouthSpan() const
+    {
+        const Live2DOffscreenRenderer::DeclaredRange mouthRange =
+            declaredRangeOf(kSpeakingMouthParameter);
+        return mouthRange.max - mouthRange.min;
     }
 
     /*[0,1) 均匀随机。用 QRandomGenerator 而不是 rand()：后者在多线程/库混用下
@@ -1123,6 +1261,21 @@ class OffscreenUserModel : public Csm::CubismUserModel
     float m_speakingFlapTargetAmplitude = kSpeakingFlapMinAmplitude;
     float m_speakingFlapCurrentAmplitude = kSpeakingFlapMinAmplitude;
 
+    /*说话电平（见 setSpeechLevel 的说明）。
+       m_speechLevelValid = "这一句有包络"，由 setSpeechLevel 置真、setSpeaking(false) 复位；
+       为假时走今天逐位相同的盲扑动（这就是 mp3 配置下的回退契约）。*/
+    bool m_speechLevelValid = false;
+    float m_speechLevelTarget = 0.0f;
+    float m_speechLevelSmoothed = 0.0f;
+    /*电平平滑是一次"时间制线性推进"：目标一变就快照起点并重新计时（见 setSpeechLevelTarget）。
+       为什么不是"每帧按比例逼近"：那样释放到 0 永远差一丝，嘴在停顿里会留一条缝。*/
+    float m_speechLevelFrom = 0.0f;
+    float m_speechLevelElapsedSeconds = 0.0f;
+    /*不规则抖动（±kSpeechWobbleRange）与其慢速游走状态，见 advanceSpeechEnvelope。*/
+    float m_speechWobble = 0.0f;
+    float m_speechWobbleTarget = 0.0f;
+    float m_speechWobbleElapsedSeconds = 0.0f;
+
     /*睁闭眼的乘数（**只包含眨眼声明的参数**），由 setEyeOpennessMultiplier 从覆盖表里挑出来。
       为什么单独存一份而不是每次从 m_parameterOverrides 里筛：眨眼参数要在 OnLateUpdate
       之后重写一次，而"哪些参数归眨眼管"是模型声明（Groups[EyeBlink]）决定的，
@@ -1469,6 +1622,12 @@ void Live2DOffscreenRenderer::setSpeaking(bool speaking)
 {
     if (m_impl->model != nullptr)
         m_impl->model->setSpeaking(speaking);
+}
+
+void Live2DOffscreenRenderer::setSpeechLevel(float level)
+{
+    if (m_impl->model != nullptr)
+        m_impl->model->setSpeechLevel(level);
 }
 
 void Live2DOffscreenRenderer::clearParameterOverrides()

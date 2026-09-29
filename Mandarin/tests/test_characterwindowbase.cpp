@@ -7,7 +7,8 @@
 /*CharacterWindowBase 的**窗口层契约**验证。
 
   为什么这个用例值得单独存在：`Dialog::requestSpeakState → CharacterWindowBase::SetSpeaking`
-  这条连接在 main.cpp 里指向的是**基类**（这样 PNG 与 Live2D 两条路径共用同一条连接）。
+  与 `Dialog::requestSpeakLevel → CharacterWindowBase::SetSpeechLevel` 这两条连接在
+  main.cpp 里指向的都是**基类**（这样 PNG 与 Live2D 两条路径共用同一条连接）。
   一旦基类那个槽缺了实现或语义错了，PNG 路径（默认立绘渲染器）就会在每次
   TTS 播放开始/结束时受影响 —— 而它本来什么都不该做。
   这里用最小的具体子类把基类**单独**装起来，不需要模型、不需要 GL、不需要真窗口。*/
@@ -50,6 +51,18 @@ class SpeakStateEmitter : public QObject
   signals:
     void requestSpeakState(bool speaking);
 };
+
+/*第二个假信号源：复刻 Dialog::requestSpeakLevel 的形状（float → 槽）。
+   为什么要单独一个而不是给上面那个加个信号：两条连接的**参数类型不同**，
+   混在一个类里会让"哪一个信号连到哪一个槽"变得看不出来。*/
+class SpeakLevelEmitter : public QObject
+{
+    Q_OBJECT
+  public:
+    void fire(float level) { emit requestSpeakLevel(level); }
+  signals:
+    void requestSpeakLevel(float level);
+};
 } // namespace
 
 class TestCharacterWindowBase : public QObject
@@ -59,6 +72,9 @@ class TestCharacterWindowBase : public QObject
   private slots:
     void defaultSetSpeakingIsAcceptedAndInert();
     void setSpeakingIsAConnectableSlot();
+    /*响度电平同理：PNG 路径没有可以跟着电平动的嘴，默认实现必须零副作用*/
+    void defaultSetSpeechLevelIsAcceptedAndInert();
+    void setSpeechLevelIsAConnectableSlot();
 };
 
 /*默认实现必须"接受任何值、什么都不做" —— 别的行为都属于越权。*/
@@ -97,6 +113,41 @@ void TestCharacterWindowBase::setSpeakingIsAConnectableSlot()
     emitter.fire(true);
     emitter.fire(false);
     qInfo("BASE SetSpeaking: metaObject 槽索引 %d，信号两次触发均无异常", index);
+    QVERIFY(!window.isVisible());
+}
+
+/*默认实现必须"接受任何电平、什么都不做" —— 与 SetSpeaking 同理，别的行为都属于越权。*/
+void TestCharacterWindowBase::defaultSetSpeechLevelIsAcceptedAndInert()
+{
+    ProbeCharacterWindow window;
+
+    window.SetSpeechLevel(0.0f);
+    window.SetSpeechLevel(0.35f);
+    window.SetSpeechLevel(1.0f);
+    window.SetSpeechLevel(-5.0f); // 越界值也必须安静接受（不许断言/不许崩）
+
+    QCOMPARE(window.reloadCount, 0);
+    QVERIFY(window.lastContentName.isEmpty());
+    QVERIFY(window.probeContentSize().isEmpty());
+    QVERIFY2(!window.isVisible(), "默认 SetSpeechLevel 不该把窗口显出来");
+    qInfo("BASE SetSpeechLevel: 四次调用（0/0.35/1/-5）无任何副作用，reloadCount=0");
+}
+
+/*它同样必须是**能连的槽**（main.cpp 那条 connect 用的是基类成员函数指针）。*/
+void TestCharacterWindowBase::setSpeechLevelIsAConnectableSlot()
+{
+    ProbeCharacterWindow window;
+    const QMetaObject *meta = window.metaObject();
+    const int index = meta->indexOfSlot("SetSpeechLevel(float)");
+    QVERIFY2(index >= 0, "CharacterWindowBase 里找不到 SetSpeechLevel(float) 槽");
+
+    SpeakLevelEmitter emitter;
+    const bool connected = QObject::connect(&emitter, &SpeakLevelEmitter::requestSpeakLevel,
+                                            &window, &CharacterWindowBase::SetSpeechLevel);
+    QVERIFY2(connected, "requestSpeakLevel(float) 连不上 CharacterWindowBase::SetSpeechLevel");
+    emitter.fire(0.0f);
+    emitter.fire(0.8f);
+    qInfo("BASE SetSpeechLevel: metaObject 槽索引 %d，信号两次触发均无异常", index);
     QVERIFY(!window.isVisible());
 }
 
