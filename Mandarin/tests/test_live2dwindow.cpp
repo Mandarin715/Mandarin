@@ -1,6 +1,7 @@
 #include <QtTest>
 
 #include "../GlobalConstants.h"
+#include "../utils/Live2DMoodPreset.h"
 #include "../windows/character/live2dcharacterwindow.h"
 
 #include <QBitmap>
@@ -10,6 +11,8 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QImage>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPixmap>
@@ -62,11 +65,94 @@ class TestLive2DWindow : public QObject
     /*诊断用：量「清晰度」在渲染管线的哪一段被吃掉。**只测量、不断言阈值。**/
     void reportsSharpnessAcrossScales();
 
+    /*---------- 心情 → 表情（本阶段新增） ----------*/
+    /*心情词表与实际 Tachie/ 目录双向核对：少一个别名 = 那个心情会掉到 neutral*/
+    void moodPresetCoversEveryTachieMood();
+    /*[范围纪律] parameter-map.json 的 min/max/neutral 必须**逐条等于**模型自己声明的
+      最小值/最大值/默认值 —— 范围是模型的事实，不是可以手抄的东西*/
+    void parameterMapRangesMatchModelDeclarations();
+    /*初稿数值不许越界、不许碰驱动器/物理占用的参数*/
+    void moodPresetValuesWithinParameterRanges();
+    /*词表外的词必须回退 neutral（而不是"保持上一种情绪"）*/
+    void unknownMoodFallsBackToNeutral();
+    /*换心情真的会改变渲染出来的帧，且预设值真的落到模型参数上*/
+    void applyingMoodChangesRenderedFrame();
+    /*还没装载模型时施加心情也必须安全（启动期时序：AI 的第一句可能早于首次布局）*/
+    void applyingMoodWithoutModelIsSafe();
+    /*[眨眼合成] 情绪的睁闭眼必须是**乘在眨眼结果上**的：闭眼看得见、眨眼还活着、
+      不碰眼睛的心情对眨眼零影响。旧实现（绝对覆盖后又被眨眼盖掉）在这条上必然失败。*/
+    void moodEyeOpennessComposesWithBlink();
+    void moodIgnoringEyesLeavesBlinkUnchanged();
+    /***残留情绪的回归测试**：happy → neutral 后参数必须全部回到中立*/
+    void switchingMoodDoesNotAccumulate();
+    /*校准素材：14 个原型各出一张固定区域的脸部裁切图（只出图，不判断好坏）*/
+    void rendersMoodArchetypeCalibrationSheet();
+
   private:
     static QString modelDir();
     static QString modelDirFor(const QString &name);
     /*用户实际在用的模型名（config.ini 的 character/live2dModel，当前是 atri）*/
     static QString preferredModelName();
+    /*按当前用户配置（CharSelect + live2dModel）装载情绪预设。
+      返回 false 表示数据不在（模型/JSON 都在 Documents/ 下，禁二传不入库）→ 调用方 QSKIP。*/
+    static bool loadConfiguredMoodPreset(Live2DMoodPreset *preset);
+    /*情绪数据目录（= Live2DMoodPreset 推导出来的那一层，parameter-map.json 在这里）。
+      注意它**不是**模型文件目录 —— 本机模型在 Documents/Mandarin/Live2D/<模型名>，
+      情绪数据在 Documents/Mandarin/Character/Assets/<角色>/Live2D/<模型名>。
+      用 renderer 自己的装载去打开同一个 moc（不另写一套 moc 解析，也就不会把
+      "数据对不对"这件事绑死在测试自己的读取实现上）。返回 false = 本机没有。*/
+    static bool openConfiguredModel(Live2DOffscreenRenderer *renderer);
+    /*读回值能直接断言"等于预设值"的参数清单。
+      排除在外的、以及**为什么**排除 —— 这几条本身就是本阶段的实测结论：
+        - ParamMouthForm：moc 自己把范围声明成 **[-1, 0] / 默认 -0.5**。预设里写的
+          happy +0.9 / excited +0.8 / confident +0.6 都**越界**，会被 Core 夹成 0.0
+          （范围核对测试 parameterMapRangesMatchModelDeclarations 现在钉着这件事，
+          越界值也在装载时汇总成一条警告）—— 这是**数据待校准**，不是覆盖没生效，
+          所以这里排除它；偏差仍会打进下面"未落地清单"的日志，不会悄悄消失；
+        - ParamEyeLOpen / ParamEyeROpen：它们是**乘数**语义（情绪值 × 眨眼值），
+          读回值逐帧随眨眼变化，不能与预设值直接比较 —— 由 moodEyeOpennessComposesWithBlink
+          专门验证（那里同时看最终值与眨眼原始值）；
+        - ParamAngleX/Y/Z、ParamBodyAngleX：呼吸驱动器每帧**加**一个摆动量（加性），
+          读回值是"预设值 + 摆动"，不能与预设值直接比较；
+        - ParamBreath / ParamHair*：物理/呼吸所有，预设根本不写（见 Live2DMoodPreset）。*/
+    static QStringList readBackParameters();
+
+    /*在一串真实帧上采样眼睛（与眨眼原始值）。
+
+      为什么必须跨帧采样：眨眼是**时间**上的事件（默认 4s 间隔里眨一次），
+      单帧既证明不了"闭眼看得见"（那一帧眨眼可能恰好全睁），也证明不了"眨眼还活着"。
+      返回值的 min/max 就是这两件事的证据：min 小 = 闭眼落到了屏幕上；
+      blinkMin < blinkMax = 眨眼在整个采样窗口里仍在变化。
+
+      只记**数值区间**、不留帧：这几百帧的像素对照既贵又不可比（相位不同），
+      像素证据由相邻帧的 renderEyeProbe 负责。
+      eyeParameterId：要采样的眼睛参数（ParamEyeLOpen 等）
+      samples：采样帧数；moodName 非空时先切到该心情（reloadContent 会立刻出一帧）。*/
+    struct EyeBlinkSamples
+    {
+        int frames = 0;
+        float composedMin = 0.0f;
+        float composedMax = 0.0f;
+        float blinkMin = 1.0f;
+        float blinkMax = 1.0f;
+    };
+    static EyeBlinkSamples sampleEyeOpenness(Live2DCharacterWindow *window,
+                                             const QString &eyeParameterId,
+                                             const QString &moodName, int samples,
+                                             int waitMs = 100);
+
+    /*再走一帧并读回"这一帧"的三样东西：像素帧、眼睛参数最终值、眨眼原始值。
+
+      eyeMultiplier：这一帧的睁闭眼乘数（1.0 = 眼睛完全交给眨眼；<1 = 情绪把眼睛压小）。
+      **必须显式给**，因为它决定了帧的样子 —— renderEyeProbe 内部在读值之前会把
+      乘数设成这个值再渲染，所以"读到的值"与"渲出的帧"必定属于同一帧。*/
+    static void renderEyeProbe(Live2DCharacterWindow *window,
+                               const QHash<QString, float> &eyeMultiplier,
+                               const QString &eyeParameterId, QImage *frame, float *composed,
+                               float *blink);
+    /*脸部裁切区：横取人物包围盒中间 45%、纵取上部 22%（与清晰度诊断同一套比例，
+      那里已经证实"人物包围盒上部"就是脸）。14 张对照图**共用同一个 QRect**。*/
+    static QRect faceRegionOfInterest(const QRect &figureBounds);
 
     QTemporaryDir m_tempDir;
     QString m_tempConfigPath;
@@ -154,6 +240,116 @@ QString TestLive2DWindow::preferredModelName()
     if (!configured.isEmpty() && QFileInfo::exists(modelDirFor(configured)))
         return configured;
     return QStringLiteral("atri");
+}
+
+/*情绪数据（parameter-map.json / presets/moods.json）与模型一样在用户数据区，
+  禁二传、不入库：拿不到就当"本机没这套数据"，调用方 QSKIP 而不是失败。
+
+  注意预设的**路径推导**（Live2DMoodPreset::resolveModelDir）读的是**真实** config.ini 的
+  character/CharSelect（+ CharacterAssestPath + 模型名）：那是用户数据实际所在的位置。
+  MANDARIN_CONFIG_INI 的重定向只管 fps/scale —— 如果这里也吃它，测试就会在"临时 ini 里
+  没有 CharSelect"时把功能静默关掉，看着是跳过、实际什么都没验证。*/
+bool TestLive2DWindow::loadConfiguredMoodPreset(Live2DMoodPreset *preset)
+{
+    if (preset == nullptr)
+        return false;
+    const QString modelName = preferredModelName();
+    if (modelName.isEmpty())
+        return false;
+    return preset->load(modelName);
+}
+
+QStringList TestLive2DWindow::readBackParameters()
+{
+    // ParamMouthForm / ParamEye{L,R}Open 故意不在列：理由见声明处注释
+    return {QStringLiteral("ParamEyeLSmile"), QStringLiteral("ParamEyeRSmile"),
+            QStringLiteral("ParamCheek"), QStringLiteral("ParamBrowLY"),
+            QStringLiteral("ParamBrowRY")};
+}
+
+TestLive2DWindow::EyeBlinkSamples
+TestLive2DWindow::sampleEyeOpenness(Live2DCharacterWindow *window, const QString &eyeParameterId,
+                                    const QString &moodName, int samples, int waitMs)
+{
+    EyeBlinkSamples result;
+    if (window == nullptr || samples <= 0)
+        return result;
+
+    if (!moodName.isEmpty())
+        window->reloadContent(moodName); //会立刻出一帧（本函数随后每帧都取一次）
+
+    /*每帧之间等的毫秒数（默认 100）决定"采样窗口在**虚拟时间**里有多长"。
+      眨眼间隔是随机 0~7s 一次（默认 SetBlinkingInterval(4.0)），
+      默认值 100ms × 130 帧 = 13s 才足以稳过一次眨眼；
+      只验"乘数恒等"的用例不需要覆盖眨眼，可以调短（见各调用点的说明）。*/
+    constexpr int kDefaultWaitMs = 100;
+    const int sampleWaitMs = waitMs > 0 ? waitMs : kDefaultWaitMs;
+
+    bool first = true;
+    for (int index = 0; index < samples; ++index)
+    {
+        /*⚠️ 必须真的等一小会儿再渲下一帧。帧的时间步长来自 QElapsedTimer 的**墙钟**，
+           这里连着调 renderFrameNow() 的话两帧之间只隔几微秒 → 眨眼状态机根本走不动，
+           采样窗口再长也只能看到一个常量（实测瞎眼：眨眼原始值区间 0 宽）。
+           这不是"测试技巧"：眨眼本来就是时间上的事件，不推进时间就看不到它。*/
+        QTest::qWait(sampleWaitMs);
+        if (!window->renderFrameNow())
+            break;
+        const float composed = window->parameterValue(eyeParameterId);
+        const float blink = window->blinkValue();
+        if (first)
+        {
+            result.composedMin = result.composedMax = composed;
+            result.blinkMin = result.blinkMax = blink;
+            first = false;
+        }
+        else
+        {
+            result.composedMin = std::min(result.composedMin, composed);
+            result.composedMax = std::max(result.composedMax, composed);
+            result.blinkMin = std::min(result.blinkMin, blink);
+            result.blinkMax = std::max(result.blinkMax, blink);
+        }
+        ++result.frames;
+    }
+    return result;
+}
+
+void TestLive2DWindow::renderEyeProbe(Live2DCharacterWindow *window,
+                                      const QHash<QString, float> &eyeMultiplier,
+                                      const QString &eyeParameterId, QImage *frame, float *composed,
+                                      float *blink)
+{
+    //先定这一帧的睁闭眼乘数，再渲染：读到的值与渲出的帧才属于同一帧
+    window->setEyeOpennessMultiplierForTest(eyeMultiplier);
+    if (!window->renderFrameNow())
+        return;
+    if (frame != nullptr)
+        *frame = window->renderedImage();
+    if (composed != nullptr)
+        *composed = window->parameterValue(eyeParameterId);
+    if (blink != nullptr)
+        *blink = window->blinkValue();
+}
+
+/*把"眼睛全睁"的乘数（= 眨眼自己说了算，值恒为 1）+ "眼睛闭到某心情的开度"
+   各做一份，供 renderEyeProbe 交替使用。key 是**真实参数 ID**（ParamEyeLOpen 等）。*/
+static QHash<QString, float> eyeMultiplierFrom(const QStringList &eyeParameterIds, float value)
+{
+    QHash<QString, float> multipliers;
+    for (const QString &id : eyeParameterIds)
+        multipliers.insert(id, value);
+    return multipliers;
+}
+QRect TestLive2DWindow::faceRegionOfInterest(const QRect &figureBounds)
+{
+    if (figureBounds.isEmpty())
+        return QRect();
+    const int width = std::max(8, static_cast<int>(std::lround(figureBounds.width() * 0.45)));
+    const int height = std::max(8, static_cast<int>(std::lround(figureBounds.height() * 0.22)));
+    const int x = figureBounds.x() + (figureBounds.width() - width) / 2;
+    const int y = figureBounds.y();
+    return QRect(x, y, width, height);
 }
 
 /*把配置读取重定向到一次性临时文件：用户真实 config.ini 全程只读。
@@ -540,8 +736,8 @@ void TestLive2DWindow::shapesWindowFromRenderedModel()
         QSKIP("本机没有可用模型（禁二传，不入库），跳过立绘窗口验证");
 
     Live2DCharacterWindow window;
-    window.reloadContent(modelName);
-    QVERIFY2(window.isModelLoaded(), "模型装载失败（Live2DCharacterWindow::reloadContent）");
+    window.loadModel(modelName);
+    QVERIFY2(window.isModelLoaded(), "模型装载失败（Live2DCharacterWindow::loadModel）");
 
     // 先真正显示一次：Windows 上的原生窗口区域要有窗口才谈得上生效。
     window.show();
@@ -787,7 +983,7 @@ void TestLive2DWindow::animatesAcrossFrames()
       不是性能。用的是临时文件里的 60fps / 1.0x，用户的 config.ini 不参与、也不被改。*/
     {
         Live2DCharacterWindow window;
-        window.reloadContent(modelName);
+        window.loadModel(modelName);
         QVERIFY2(window.isModelLoaded(), "模型装载失败，无法验证动画");
 
         window.show();
@@ -860,7 +1056,7 @@ void TestLive2DWindow::keepsWholeFigureInsideCanvas()
     /*用临时配置（60fps / 1.0x）确实能复现 bug：裁切与帧率/渲染倍数无关，
       它只取决于逻辑画布与人物包围盒的关系。用户真实 config.ini 全程只读。*/
     Live2DCharacterWindow window;
-    window.reloadContent(modelName);
+    window.loadModel(modelName);
     QVERIFY2(window.isModelLoaded(), "模型装载失败，无法验证画布余量");
 
     window.show();
@@ -961,7 +1157,7 @@ void TestLive2DWindow::fillsFrameInBothAxes()
         }
 
         Live2DCharacterWindow window;
-        window.reloadContent(modelName);
+        window.loadModel(modelName);
         QVERIFY2(window.isModelLoaded(),
                  qPrintable(QStringLiteral("模型 %1 装载失败，无法验证画布填充").arg(modelName)));
 
@@ -1068,7 +1264,7 @@ void TestLive2DWindow::loadsModelByDirectoryName()
                                 .arg(QString::fromUtf8(c.expectedJson))));
 
         Live2DCharacterWindow window;
-        window.reloadContent(QString::fromUtf8(c.dirName));
+        window.loadModel(QString::fromUtf8(c.dirName));
         QVERIFY2(window.isModelLoaded(),
                  qPrintable(QStringLiteral("按目录名 %1 装载失败：入口文件实际叫 %2")
                                 .arg(QString::fromUtf8(c.dirName))
@@ -1151,7 +1347,7 @@ void TestLive2DWindow::reportsFullPipelineFrameCost()
         }
 
         Live2DCharacterWindow window;
-        window.reloadContent(modelName);
+        window.loadModel(modelName);
         QVERIFY2(window.isModelLoaded(),
                  qPrintable(QStringLiteral("[%1] 模型装载失败，无法量帧成本")
                                 .arg(QString::fromUtf8(config.model))));
@@ -1229,7 +1425,7 @@ void TestLive2DWindow::paintsRegisteredFrameWithoutResampling()
     }
 
     Live2DCharacterWindow window;
-    window.reloadContent(modelName);
+    window.loadModel(modelName);
     QVERIFY2(window.isModelLoaded(), "模型装载失败，无法验证绘制一致性");
 
     window.show();
@@ -1468,7 +1664,7 @@ void TestLive2DWindow::reportsSharpnessAcrossScales()
 
     for (double scale : scales)
     {
-        /*只写临时配置。窗口在 reloadContent() 里读它（applyRenderScaleFromConfig）。*/
+        /*只写临时配置。窗口在 loadModel() 里读它（applyRenderScaleFromConfig）。*/
         {
             QSettings settings(m_tempConfigPath, QSettings::IniFormat);
             settings.setValue("character/live2dFps", 60);
@@ -1479,7 +1675,7 @@ void TestLive2DWindow::reportsSharpnessAcrossScales()
         log << QStringLiteral("SHARPNESS scale=%1 --------").arg(scale);
 
         Live2DCharacterWindow window;
-        window.reloadContent(modelName);
+        window.loadModel(modelName);
         QVERIFY2(window.isModelLoaded(),
                  qPrintable(QStringLiteral("scale %1：模型装载失败").arg(scale)));
 
@@ -1743,6 +1939,1075 @@ void TestLive2DWindow::reportsSharpnessAcrossScales()
     log << QStringLiteral("SHARPNESS note: this is a MEASUREMENT, not an assertion - "
                           "no sharpness threshold is enforced.");
     emitLog();
+}
+
+/*==================== 心情 → 表情 ====================
+
+  背景（本阶段的 bug）：AI 每句回复都发一个心情名，而 Live2D 路径把它当成**模型名** ——
+  找不到同名模型就静默 return，于是立绘永远一副表情。
+  `reloadContent(心情名)` 现在按基类契约"按名切换内容"，Live2D 侧解释成"换情绪预设"。
+
+  数据（用户数据区，不入库）：
+    parameter-map.json  语义参数名 → 参数 ID + [min,max] + neutral
+    presets/moods.json  14 个情绪原型（只写与 neutral 的差异）+ 26 个心情名 → 原型
+  心情名 = 角色 Tachie/ 下 PNG 的文件名（AI 的可选词表也是从那里生成的）。
+
+  参数取值域（min/max/neutral）**只能来自模型自己声明的值**（moc 的 Core API），
+  不许手推/手抄：手抄的代价是"表情里写着一个永远到不了的值"（mouthForm 的正数被夹成 0）
+  与"中立位不是模型的静息值"。这条纪律由 parameterMapRangesMatchModelDeclarations 钉住。*/
+
+/*词表核对：Tachie/ 里每个 PNG 名都必须能在 moods.json 里解析出原型。
+
+  为什么必须**双向**核对：只查"别名 → 原型"会漏掉"用户新加了一张立绘、词表没跟上"——
+  那个心情在实机上会安静地回退成 neutral，也就是"她对这个词没反应"。
+  反方向（别名表里有、Tachie 里没有）则是孤儿条目，说明数据该清理了。*/
+void TestLive2DWindow::moodPresetCoversEveryTachieMood()
+{
+    const QString tachieDir = ReadCharacterTachiePath();
+    if (tachieDir.isEmpty())
+        QSKIP("本机没有当前角色的 Tachie 目录（角色资源不入库），跳过心情词表核对");
+
+    QStringList pngNames;
+    for (const QFileInfo &info : QDir(tachieDir).entryInfoList({QStringLiteral("*.png")}, QDir::Files))
+        pngNames.append(info.completeBaseName());
+    pngNames.sort();
+    QVERIFY2(!pngNames.isEmpty(),
+             qPrintable(QStringLiteral("%1 里没有任何 PNG，心情词表无从核对").arg(tachieDir)));
+
+    Live2DMoodPreset preset;
+    if (!loadConfiguredMoodPreset(&preset))
+        QSKIP("本机没有当前角色/模型的心情预设数据（Documents 下，不入库），跳过");
+
+    const QHash<QString, QString> aliases = preset.moodAliases();
+
+    // ① 立绘名 → 别名：缺一个就是"这个词她没反应"
+    QStringList missing;
+    for (const QString &moodName : pngNames)
+    {
+        if (!aliases.contains(moodName))
+            missing.append(moodName);
+    }
+    QVERIFY2(missing.isEmpty(),
+             qPrintable(QStringLiteral("Tachie 里有 %1 个立绘名在 moods.json 里没有别名"
+                                       "（这些心情会静默回退成 neutral）：%2")
+                            .arg(missing.size())
+                            .arg(missing.join(QStringLiteral(", ")))));
+
+    // ② 别名 → 立绘名：孤儿别名（立绘已删）也要报出来
+    QStringList orphans;
+    for (auto it = aliases.constBegin(); it != aliases.constEnd(); ++it)
+    {
+        if (!pngNames.contains(it.key()))
+            orphans.append(it.key());
+    }
+    QVERIFY2(orphans.isEmpty(),
+             qPrintable(QStringLiteral("moods.json 里有 %1 个别名在 Tachie 里找不到对应立绘：%2")
+                            .arg(orphans.size())
+                            .arg(orphans.join(QStringLiteral(", ")))));
+
+    // ③ 每个原型都得能解析出参数组、并且查得到一个代表它的心情名 ——
+    //    否则校准对照图会出现空的一格 / 一格都出不来
+    for (const QString &archetype : preset.archetypeNames())
+    {
+        const QHash<QString, float> params = preset.parametersForArchetype(archetype);
+        QVERIFY2(!params.isEmpty(),
+                 qPrintable(QStringLiteral("原型 %1 解析不出任何参数").arg(archetype)));
+        QVERIFY2(!preset.representativeMoodForArchetype(archetype).isEmpty(),
+                 qPrintable(QStringLiteral("原型 %1 没有任何别名指向它，校准图出不了这一格")
+                                .arg(archetype)));
+    }
+
+    qInfo("心情词表核对[%s]：Tachie 立绘 %d 个、别名 %d 条、原型 %d 个，双向零缺失零孤儿",
+          qPrintable(preset.modelName()), pngNames.size(), aliases.size(),
+          preset.archetypeNames().size());
+}
+
+/*按用户配置装载**模型**（不是情绪数据）。两处路径在本机是分开的：
+
+  模型文件  Documents/Mandarin/Live2D/<模型名>/
+  情绪数据  Documents/Mandarin/Character/Assets/<角色>/Live2D/<模型名>/
+
+  （名字对不上是模型作者与用户各自的组织方式，代码从第一天就走"两个候选目录"匹配，
+  见 Live2DCharacterWindow::resolveModelDir；这里沿用同样的两条路径，不新造规则。）*/
+bool TestLive2DWindow::openConfiguredModel(Live2DOffscreenRenderer *renderer)
+{
+    if (renderer == nullptr)
+        return false;
+    const QString modelName = preferredModelName();
+    if (modelName.isEmpty())
+        return false;
+
+    /*候选①：用户配置的模型根目录；候选②：角色资源目录（与情绪数据同层）。
+      两者都找不到就返回 false（调用方 QSKIP）。*/
+    QStringList candidates;
+    candidates << modelDirFor(modelName)
+               << Live2DMoodPreset::resolveModelDir(modelName);
+    for (const QString &dir : candidates)
+    {
+        if (dir.isEmpty() || !QFileInfo::exists(dir))
+            continue;
+        const QStringList jsonCandidates =
+            QDir(dir).entryList({QStringLiteral("*.model3.json")}, QDir::Files);
+        for (const QString &jsonName : jsonCandidates)
+        {
+            QString error;
+            if (renderer->load(dir, jsonName, &error))
+                return true;
+        }
+    }
+    return false;
+}
+
+/*==================== 范围纪律：数据必须来自模型，不能手抄 ====================
+
+  背景（这条测试就是为它写的）：`parameter-map.json` 的 [min,max] 当初是**手推**的，
+  参照的是模型自带的 `*.vtube.json`（VTS 的 OutputRange）。VTS 的 OutputRange 是
+  **某个 VTube Studio 配置允许把参数推到多远**，不是这个 moc 声明的取值域 —— 两回事。
+
+  实测后果（本模型 atri，都是 Core 自己夹的，写在屏幕上看得见）：
+    - `ParamMouthForm`：moc 声明 **[-1, 0] / 默认 -0.5**，map 写了 [-1, +1] / 中立 0.0。
+      happy/excited/confident 想笑（+0.6~+0.9）被夹成 0.0，读回值永远是 0；
+      更糟的是中立位被钉在 0.0 —— 而模型的**静息值**是 -0.5，于是"中立"这张脸从一开始
+      就不是模型作者设计的静息表情。
+    - `ParamEyeLOpen/ROpen`：moc 最大 **1.0**，map 写了 1.9（surprised 的 1.7 被夹成 1.0）。
+    - `ParamMouthOpenY`：moc 最大 **1.0**，map 写了 2.1。
+
+  所以这里**逐条**核对：map 的 min/max/neutral 必须等于模型声明的 最小/最大/默认，
+  只允许一个抗浮点噪声的 eps（JSON 里的十进制字面量到 float 的往返）。
+  少一条、多一条、任一项不等，都是数据错 —— 而且要在目视校准之前就报出来，
+  否则人会去校准一个永远不会生效的数字。
+
+  **报出全部差异再断言**：只报第一条会让人修一轮跑一轮，n 条差异要跑 n 遍。*/
+void TestLive2DWindow::parameterMapRangesMatchModelDeclarations()
+{
+    Live2DMoodPreset preset;
+    if (!loadConfiguredMoodPreset(&preset))
+        QSKIP("本机没有当前角色/模型的心情预设数据（Documents 下，不入库），跳过");
+
+    Live2DOffscreenRenderer renderer;
+    if (!openConfiguredModel(&renderer))
+        QSKIP("本机没有用户配置的模型（禁二传，不入库），跳过参数范围核对");
+
+    // 模型自己声明的取值域，直接问 Core（renderer 已经把 moc 打开成 CubismModel）
+    const QHash<QString, Live2DOffscreenRenderer::DeclaredRange> declared =
+        renderer.declaredParameterRanges();
+    QVERIFY2(!declared.isEmpty(), "模型没有声明任何参数（装载失败或读不出取值域）");
+
+    /*JSON 里的十进制字面量经 double→float 往返会有 ~1e-7 的噪声；模型自己声明的
+      0.5/-0.5 也一样。1e-4 足够盖住噪声，又远小于任何一个有意的手抄偏差
+      （最小的那个也有 0.1 量级：mouthForm 的 +1 vs 0）。*/
+    constexpr float kEpsilon = 1e-4f;
+
+    const QHash<QString, Live2DMoodPreset::ParameterRange> ranges = preset.parameters();
+    QVERIFY2(!ranges.isEmpty(), "parameter-map.json 里一条参数都没有");
+
+    QStringList missing;   // map 里写了、模型里没有
+    QStringList wrongMin;  // map.min ≠ 模型声明的最小值
+    QStringList wrongMax;
+    QStringList wrongNeutral;
+    int matched = 0;
+
+    for (auto it = ranges.constBegin(); it != ranges.constEnd(); ++it)
+    {
+        const QString semanticName = it.key();
+        const Live2DMoodPreset::ParameterRange range = it.value();
+        if (!declared.contains(range.id))
+        {
+            missing.append(QStringLiteral("%1(%2)").arg(semanticName, range.id));
+            continue;
+        }
+        const Live2DOffscreenRenderer::DeclaredRange d = declared.value(range.id);
+        bool ok = true;
+        if (qAbs(range.min - d.min) > kEpsilon)
+        {
+            wrongMin.append(QStringLiteral("%1(%2) map %3 ≠ 模型 %4")
+                                .arg(semanticName, range.id)
+                                .arg(double(range.min))
+                                .arg(double(d.min)));
+            ok = false;
+        }
+        if (qAbs(range.max - d.max) > kEpsilon)
+        {
+            wrongMax.append(QStringLiteral("%1(%2) map %3 ≠ 模型 %4")
+                                .arg(semanticName, range.id)
+                                .arg(double(range.max))
+                                .arg(double(d.max)));
+            ok = false;
+        }
+        if (qAbs(range.neutral - d.neutral) > kEpsilon)
+        {
+            wrongNeutral.append(QStringLiteral("%1(%2) map %3 ≠ 模型默认 %4")
+                                    .arg(semanticName, range.id)
+                                    .arg(double(range.neutral))
+                                    .arg(double(d.neutral)));
+            ok = false;
+        }
+        if (ok)
+            ++matched;
+    }
+
+    /*把"模型的真值"打出来（每台机器都能看到自己那份数据的事实）：
+      目视校准的人应该照着这张表去调，而不是照 map 里的数字。*/
+    QStringList table;
+    for (auto it = ranges.constBegin(); it != ranges.constEnd(); ++it)
+    {
+        const Live2DMoodPreset::ParameterRange range = it.value();
+        const Live2DOffscreenRenderer::DeclaredRange d = declared.value(range.id);
+        table.append(QStringLiteral("%1 %2 map=[%3,%4] neutral=%5 | model=[%6,%7] default=%8")
+                         .arg(it.key(), range.id)
+                         .arg(double(range.min))
+                         .arg(double(range.max))
+                         .arg(double(range.neutral))
+                         .arg(double(d.min))
+                         .arg(double(d.max))
+                         .arg(double(d.neutral)));
+    }
+    table.sort();
+    for (const QString &line : table)
+        qInfo("%s", qPrintable(QStringLiteral("RANGE ") + line));
+
+    QStringList problems;
+    if (!missing.isEmpty())
+        problems.append(QStringLiteral("模型里没有这些参数（%1）：%2")
+                            .arg(missing.size())
+                            .arg(missing.join(QStringLiteral(", "))));
+    if (!wrongMin.isEmpty())
+        problems.append(QStringLiteral("min 不是模型声明的最小值（%1）：%2")
+                            .arg(wrongMin.size())
+                            .arg(wrongMin.join(QStringLiteral(" | "))));
+    if (!wrongMax.isEmpty())
+        problems.append(QStringLiteral("max 不是模型声明的最大值（%1）：%2")
+                            .arg(wrongMax.size())
+                            .arg(wrongMax.join(QStringLiteral(" | "))));
+    if (!wrongNeutral.isEmpty())
+        problems.append(QStringLiteral("neutral 不是模型声明的默认值（%1）：%2")
+                            .arg(wrongNeutral.size())
+                            .arg(wrongNeutral.join(QStringLiteral(" | "))));
+
+    qInfo("参数范围核对[%s]：模型声明 %d 个参数，parameter-map 里 %d 条，逐项相符 %d 条",
+          qPrintable(preset.modelName()), declared.size(), ranges.size(), matched);
+
+    QVERIFY2(problems.isEmpty(),
+             qPrintable(QStringLiteral("parameter-map.json 的取值域与模型声明不符 —— "
+                                       "范围/中立值必须从模型读，不能手抄：\n%1")
+                            .arg(problems.join(QStringLiteral("\n")))));
+}
+
+/*数值范围核对：moods.json 的每个原型的**原始**取值都必须在 parameter-map 的 [min,max] 内，
+  且不许出现驱动器/物理占用的参数。
+
+  为什么查"原始值"而不是查夹取后的结果：装载器会把越界值夹回范围内（那是运行期的安全网），
+  所以夹取后的结果永远合法 —— 那条断言等于什么都没验。真正要钉住的是**初稿数据本身**：
+  越界 = 数据写错了，得在目视校准前先发现，而不是被夹取悄悄改掉。*/
+void TestLive2DWindow::moodPresetValuesWithinParameterRanges()
+{
+    Live2DMoodPreset preset;
+    if (!loadConfiguredMoodPreset(&preset))
+        QSKIP("本机没有当前角色/模型的心情预设数据（Documents 下，不入库），跳过");
+
+    const QHash<QString, Live2DMoodPreset::ParameterRange> ranges = preset.parameters();
+    const QHash<QString, QHash<QString, float>> deltas = preset.archetypeDeltas();
+    QVERIFY2(!ranges.isEmpty() && !deltas.isEmpty(), "参数表或原型表是空的");
+
+    int checkedValues = 0;
+    for (auto archetype = deltas.constBegin(); archetype != deltas.constEnd(); ++archetype)
+    {
+        const QHash<QString, float> values = archetype.value();
+        for (auto value = values.constBegin(); value != values.constEnd(); ++value)
+        {
+            const QString semanticName = value.key();
+            const Live2DMoodPreset::ParameterRange range = ranges.value(semanticName);
+            QVERIFY2(!range.id.isEmpty(),
+                     qPrintable(QStringLiteral("原型 %1 用了 parameter-map 里没有的语义名 %2")
+                                    .arg(archetype.key())
+                                    .arg(semanticName)));
+            // 不许碰驱动器/物理占用的参数（呼吸、头发）：语义名与真实 ID 两侧都查
+            QVERIFY2(!Live2DMoodPreset::isUpdaterOwnedParameter(range.id),
+                     qPrintable(QStringLiteral("原型 %1 写了驱动器/物理占用的参数 %2 (%3)")
+                                    .arg(archetype.key())
+                                    .arg(semanticName)
+                                    .arg(range.id)));
+            QVERIFY2(semanticName != QStringLiteral("breath") &&
+                         semanticName != QStringLiteral("hairFront") &&
+                         semanticName != QStringLiteral("hairSide") &&
+                         semanticName != QStringLiteral("hairBack"),
+                     qPrintable(QStringLiteral("原型 %1 写了驱动器/物理占用的语义名 %2")
+                                    .arg(archetype.key())
+                                    .arg(semanticName)));
+            QVERIFY2(value.value() >= range.min && value.value() <= range.max,
+                     qPrintable(QStringLiteral("原型 %1 的 %2 = %3 越界（%4 的允许范围 [%5, %6]）")
+                                    .arg(archetype.key())
+                                    .arg(semanticName)
+                                    .arg(double(value.value()))
+                                    .arg(range.id)
+                                    .arg(double(range.min))
+                                    .arg(double(range.max))));
+            ++checkedValues;
+        }
+    }
+
+    // 夹取**结果**的一层一致性：解析出的参数组里同样不许有驱动器参数，且值都在范围内
+    QHash<QString, Live2DMoodPreset::ParameterRange> byId;
+    for (auto it = ranges.constBegin(); it != ranges.constEnd(); ++it)
+        byId.insert(it.value().id, it.value());
+
+    int checkedResolved = 0;
+    for (const QString &archetype : preset.archetypeNames())
+    {
+        const QHash<QString, float> params = preset.parametersForArchetype(archetype);
+        for (auto it = params.constBegin(); it != params.constEnd(); ++it)
+        {
+            QVERIFY2(!Live2DMoodPreset::isUpdaterOwnedParameter(it.key()),
+                     qPrintable(QStringLiteral("原型 %1 的覆盖表里混进了驱动器参数 %2")
+                                    .arg(archetype)
+                                    .arg(it.key())));
+            const Live2DMoodPreset::ParameterRange range = byId.value(it.key());
+            QVERIFY2(!range.id.isEmpty() && it.value() >= range.min && it.value() <= range.max,
+                     qPrintable(QStringLiteral("原型 %1 的 %2 = %3 不在 [%4, %5] 内")
+                                    .arg(archetype)
+                                    .arg(it.key())
+                                    .arg(double(it.value()))
+                                    .arg(double(range.min))
+                                    .arg(double(range.max))));
+            ++checkedResolved;
+        }
+    }
+
+    qInfo("心情数值核对[%s]：原型 %d 个、初稿取值 %d 项全部在 parameter-map 的 [min,max] 内，"
+          "无一落在 breath/hair*；解析后的覆盖表共 %d 项（%d 个原型）",
+          qPrintable(preset.modelName()), deltas.size(), checkedValues, checkedResolved,
+          preset.archetypeNames().size());
+}
+
+/*未知心情 → neutral。
+
+  这是"AI 说了个词表外的词"这条路：绝不能什么都不做（屏幕上留着上一种情绪，
+  而且没有任何人知道为什么），也绝不能崩。必须显式回到中立。*/
+void TestLive2DWindow::unknownMoodFallsBackToNeutral()
+{
+    Live2DMoodPreset preset;
+    if (!loadConfiguredMoodPreset(&preset))
+        QSKIP("本机没有当前角色/模型的心情预设数据（Documents 下，不入库），跳过");
+
+    const QHash<QString, float> neutral = preset.parametersForArchetype(QStringLiteral("neutral"));
+    QVERIFY2(!neutral.isEmpty(), "neutral 解析不出参数，回退目标本身是空的");
+
+    // 词表外的词（含空串/纯空白）：必须与 neutral 逐项相同
+    const QStringList unknown = {QStringLiteral("绝对不是心情名"), QStringLiteral("SLEEPY"),
+                                 QStringLiteral("happy"), QString(), QStringLiteral("   ")};
+    for (const QString &moodName : unknown)
+    {
+        const QHash<QString, float> resolved = preset.parametersForMood(moodName);
+        QCOMPARE(resolved.size(), neutral.size());
+        for (auto it = neutral.constBegin(); it != neutral.constEnd(); ++it)
+        {
+            QVERIFY2(resolved.contains(it.key()),
+                     qPrintable(QStringLiteral("未知心情 %1 的解析结果缺参数 %2")
+                                    .arg(moodName, it.key())));
+            QVERIFY2(qAbs(resolved.value(it.key()) - it.value()) <= 1e-4f,
+                     qPrintable(QStringLiteral("未知心情 %1 的 %2 = %3，不等于中立值 %4")
+                                    .arg(moodName)
+                                    .arg(it.key())
+                                    .arg(double(resolved.value(it.key())))
+                                    .arg(double(it.value()))));
+        }
+    }
+
+    /*反例必须成立：**词表内的**词不能被当成未知。
+      取一个"会明显改变参数"的原型（sleepy：闭眼 + 张嘴 + 低头）来对照，
+      否则"全都不认识"这种退化实现也能通过上面那几条。*/
+    const QString knownMood = QStringLiteral("睡觉");
+    if (preset.moodAliases().contains(knownMood))
+    {
+        const QHash<QString, float> resolved = preset.parametersForMood(knownMood);
+        QCOMPARE(resolved.size(), neutral.size());
+        int differing = 0;
+        for (auto it = resolved.constBegin(); it != resolved.constEnd(); ++it)
+        {
+            if (qAbs(it.value() - neutral.value(it.key())) > 1e-4f)
+                ++differing;
+        }
+        QVERIFY2(differing > 0,
+                 qPrintable(QStringLiteral("词表内的心情 %1 解析结果与 neutral 完全一致")
+                                .arg(knownMood)));
+        qInfo("未知心情回退验证[%s]：%d 个未知名全部回退 neutral；词表内的 %s 与 neutral 有 %d 项不同",
+              qPrintable(preset.modelName()), unknown.size(), qPrintable(knownMood), differing);
+    }
+    else
+    {
+        qInfo("未知心情回退验证[%s]：%d 个未知名全部回退 neutral（本机没有 %s 这个别名）",
+              qPrintable(preset.modelName()), unknown.size(), qPrintable(knownMood));
+    }
+}
+
+/*换心情真的会改变渲染出来的帧，且预设值真的落到模型参数上。
+
+  为什么要**两条**观察量：
+  - 像素差单独用不可靠：呼吸/眨眼/物理本来就让相邻帧不同（这正是 animatesAcrossFrames
+    在断言的事），所以必须在同一轮里量一个"什么都不改时的相邻帧漂移"当对照；
+  - 参数读回是直接证据：预设写的就是 0.9，模型里读出来就得是 0.9。
+    读回只挑**不归任何驱动器管**的参数（见 readBackParameters 的说明）。*/
+void TestLive2DWindow::applyingMoodChangesRenderedFrame()
+{
+    const QString modelName = preferredModelName();
+    const QString dir = modelDirFor(modelName);
+    if (!QFileInfo::exists(dir))
+        QSKIP("本机没有用户配置的模型（禁二传，不入库），跳过心情渲染验证");
+
+    // 只写临时配置：本用例量的是"换心情帧会不会变"，不是性能，取 60fps/1.0x 即可
+    {
+        QSettings settings(m_tempConfigPath, QSettings::IniFormat);
+        settings.setValue("character/live2dFps", 60);
+        settings.setValue("character/live2dScale", 1.0);
+        settings.sync();
+    }
+
+    Live2DMoodPreset preset;
+    if (!loadConfiguredMoodPreset(&preset))
+        QSKIP("本机没有当前角色/模型的心情预设数据（Documents 下，不入库），跳过");
+
+    const QString happyMood = preset.representativeMoodForArchetype(QStringLiteral("happy"));
+    QVERIFY2(!happyMood.isEmpty(), "happy 原型没有任何别名，无法测换心情");
+
+    Live2DCharacterWindow window;
+    window.loadModel(modelName);
+    QVERIFY2(window.isModelLoaded(), "模型装载失败，无法验证换心情");
+    QVERIFY2(window.isMoodPresetEnabled(), "情绪预设没装载成功");
+
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QCoreApplication::processEvents();
+
+    // 冻住帧循环（hideEvent 停表）后再自己渲帧：基准帧/对照帧/心情帧之间的差别里，
+    // 只允许剩下"真的改了参数"这一项，不能再掺进定时器带来的任意时间推进。
+    window.hide();
+    QCoreApplication::processEvents();
+
+    window.reloadContent(QStringLiteral("default")); // 显式回到 neutral（默认别名）
+    QVERIFY2(window.renderFrameNow(), "中立基准帧渲染失败");
+    const QImage neutralFrame = window.renderedImage();
+    QVERIFY2(!neutralFrame.isNull(), "中立基准帧为空");
+
+    // 对照帧：什么都不改，再渲一帧。它与基准帧的差 = 呼吸/眨眼/物理在"一帧"里的漂移
+    QVERIFY2(window.renderFrameNow(), "中立对照帧渲染失败");
+    const QImage controlFrame = window.renderedImage();
+
+    // 换 happy：applyMood 内部会立刻出一帧，所以 renderedImage() 就是心情后的第一帧
+    window.reloadContent(happyMood);
+    const QImage moodFrame = window.renderedImage();
+    QVERIFY2(!moodFrame.isNull(), "心情帧为空");
+
+    QCOMPARE(moodFrame.size(), neutralFrame.size());
+    constexpr int kChannelDelta = 8; // 抗 8bit 量化/抗锯齿的通道噪声
+    const qint64 drift = countDifferingPixels(neutralFrame, controlFrame, kChannelDelta);
+    const qint64 moodDiff = countDifferingPixels(controlFrame, moodFrame, kChannelDelta);
+    QVERIFY2(drift >= 0 && moodDiff >= 0, "两帧尺寸不一致，无法比较");
+    const qint64 total = static_cast<qint64>(moodFrame.width()) * moodFrame.height();
+    qInfo("心情渲染验证[%s]：neutral→%s 逐通道差 >%d 的像素 = %lld/%lld（%.3f%%）；"
+          "同一心情相邻两帧的漂移(对照) = %lld（%.3f%%）",
+          qPrintable(modelName), qPrintable(happyMood), kChannelDelta, moodDiff, total,
+          static_cast<double>(moodDiff) * 100.0 / static_cast<double>(total), drift,
+          static_cast<double>(drift) * 100.0 / static_cast<double>(total));
+
+    /*阈值：2000 像素远高于"什么都不改时的漂移"（紧邻两帧只有几百），
+       又远低于"笑起来的眼睛/嘴巴/腮红"该有的量级（数万像素）。
+       再乘 2 倍对照，是防"某次漂移恰好很大"把结论蒙对。*/
+    QVERIFY2(moodDiff > 2000,
+             qPrintable(QStringLiteral("换心情只差 %1 个像素，看不出表情变化").arg(moodDiff)));
+    QVERIFY2(moodDiff > drift * 2,
+             qPrintable(QStringLiteral("换心情的像素差 %1 没有明显超过同心情相邻帧的漂移 %2，"
+                                       "无法证明变化来自心情")
+                            .arg(moodDiff)
+                            .arg(drift)));
+
+    // 参数读回：预设写什么，模型里就该读到什么
+    const QHash<QString, float> expected = preset.parametersForMood(happyMood);
+    const QStringList readBack = readBackParameters();
+    for (const QString &parameterId : readBack)
+    {
+        QVERIFY2(expected.contains(parameterId),
+                 qPrintable(QStringLiteral("预设 %1 里没有 %2，读回断言写错了")
+                                .arg(happyMood, parameterId)));
+        const float actual = window.parameterValue(parameterId);
+        qInfo("参数读回[%s]：%s 预设 %.3f 实际 %.3f", qPrintable(happyMood),
+              qPrintable(parameterId), double(expected.value(parameterId)), double(actual));
+        QVERIFY2(qAbs(actual - expected.value(parameterId)) <= 0.02f,
+                 qPrintable(QStringLiteral("参数 %1 读回 %2，不等于预设值 %3（覆盖没生效）")
+                                .arg(parameterId)
+                                .arg(double(actual))
+                                .arg(double(expected.value(parameterId)))));
+    }
+
+    /*把"没落到模型上"的参数全列出来（**只报不断言**）。上面断言的 5 项之外，还有三类
+      注定对不上，校准时必须先知道它们，否则会去改一个永远不会生效的数字：
+        ① ParamEyeLOpen/ParamEyeROpen：眨眼驱动器每帧绝对赋值，预设在这两项上是死的；
+        ② ParamMouthForm：moc 自身范围 [-1,0]，正数被夹成 0（本模型的"笑"只能靠眼睛）；
+        ③ ParamAngleX/Y/Z 与 ParamBodyAngleX：呼吸的加性摆动（读回 = 预设 + 摆动）。
+      这条日志是把"死参数"变成可看见证据的地方。*/
+    QStringList notLanded;
+    for (auto it = expected.constBegin(); it != expected.constEnd(); ++it)
+    {
+        const float actual = window.parameterValue(it.key());
+        if (qAbs(actual - it.value()) > 0.05f)
+        {
+            notLanded << QStringLiteral("%1=%2(want %3)")
+                             .arg(it.key())
+                             .arg(double(actual), 0, 'f', 2)
+                             .arg(double(it.value()), 0, 'f', 2);
+        }
+    }
+    notLanded.sort();
+    qInfo("参数未落地清单[%s]（读回 ≠ 预设，含驱动器/范围夹取）：%s", qPrintable(happyMood),
+          notLanded.isEmpty() ? "none" : qPrintable(notLanded.join(QStringLiteral(", "))));
+}
+
+/*「还没装载模型时施加心情」也必须安全 —— 这是启动期的**真实时序**：
+   Dialog 先 show，AI 的第一句回复可能早于立绘窗口的首次布局（那时画布/dpr 都还没定）。
+
+   两条观察量：
+     ① 不崩、也不登记任何画布（没有画布时渲出来的帧尺寸是错的，宁可不渲）；
+     ② 心情要**记住**，模型装载完成后补上 —— 丢掉这一句的心情就等于"她对第一句话没反应"。*/
+void TestLive2DWindow::applyingMoodWithoutModelIsSafe()
+{
+    Live2DMoodPreset preset;
+    if (!loadConfiguredMoodPreset(&preset))
+        QSKIP("本机没有当前角色/模型的心情预设数据（Documents 下，不入库），跳过");
+
+    const QString happyMood = preset.representativeMoodForArchetype(QStringLiteral("happy"));
+    QVERIFY2(!happyMood.isEmpty(), "happy 原型没有别名");
+
+    Live2DCharacterWindow window;
+    QVERIFY2(!window.isModelLoaded(), "本用例要从「还没装载模型」的状态开始");
+
+    // ① 未装载模型：施加心情什么都不该发生（不崩、不装载、不登记画布）
+    window.reloadContent(happyMood);
+    QVERIFY2(!window.isModelLoaded(), "施加心情不该顺手装载模型");
+    QVERIFY2(window.contentSize().isEmpty(), "还没装载模型就登记了画布");
+    QVERIFY2(!window.renderFrameNow(), "没有模型却渲染成功了");
+    qInfo("未装载模型时施加心情[%s]：无异常、无画布登记", qPrintable(happyMood));
+
+    const QString modelName = preferredModelName();
+    if (!QFileInfo::exists(modelDirFor(modelName)))
+        QSKIP("本机没有用户配置的模型（禁二传，不入库），本用例只验到「不崩」为止");
+
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QCoreApplication::processEvents();
+
+    // ② 心情被记住：模型装载完成后立刻生效（不需要再发一次心情）
+    QVERIFY2(window.loadModel(modelName), "模型装载失败");
+    QVERIFY2(window.renderFrameNow(), "装载后的帧渲染失败");
+    const QHash<QString, float> expected = preset.parametersForMood(happyMood);
+    const QString probe = QStringLiteral("ParamEyeLSmile");
+    const float actual = window.parameterValue(probe);
+    qInfo("装载后补上心情[%s]：%s 预设 %.3f 实际 %.3f", qPrintable(happyMood), qPrintable(probe),
+          double(expected.value(probe)), double(actual));
+    QVERIFY2(qAbs(actual - expected.value(probe)) <= 0.02f,
+             qPrintable(QStringLiteral("装载模型前收到的心情 %1 没有被补上：%2 读回 %3，"
+                                       "预设是 %4")
+                            .arg(happyMood)
+                            .arg(probe)
+                            .arg(double(actual))
+                            .arg(double(expected.value(probe)))));
+}
+
+/***残留情绪的回归测试**（本阶段这个 bug 的核心）。
+
+   `setParameter` 只能增改单条、删不掉：先来 happy（eyeLSmile=0.9、cheek=0.5…），
+   再切回 neutral 时，旧条目仍留在覆盖表里每帧施加 —— 屏幕上就是"切了中立，
+   她还在笑"。所以这里必须断言：切回 neutral 后读回值**全部**回到中立值。
+
+  参数读回只挑不归驱动器管的参数，理由见 readBackParameters。*/
+void TestLive2DWindow::switchingMoodDoesNotAccumulate()
+{
+    const QString modelName = preferredModelName();
+    const QString dir = modelDirFor(modelName);
+    if (!QFileInfo::exists(dir))
+        QSKIP("本机没有用户配置的模型（禁二传，不入库），跳过情绪残留验证");
+
+    Live2DMoodPreset preset;
+    if (!loadConfiguredMoodPreset(&preset))
+        QSKIP("本机没有当前角色/模型的心情预设数据（Documents 下，不入库），跳过");
+
+    const QString happyMood = preset.representativeMoodForArchetype(QStringLiteral("happy"));
+    const QString neutralMood = preset.representativeMoodForArchetype(QStringLiteral("neutral"));
+    QVERIFY2(!happyMood.isEmpty() && !neutralMood.isEmpty(), "happy/neutral 缺别名");
+
+    Live2DCharacterWindow window;
+    window.loadModel(modelName);
+    QVERIFY2(window.isModelLoaded(), "模型装载失败，无法验证情绪残留");
+    QVERIFY2(window.isMoodPresetEnabled(), "情绪预设没装载成功");
+
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QCoreApplication::processEvents();
+    window.hide();
+    QCoreApplication::processEvents();
+
+    const QStringList readBack = readBackParameters();
+    const QHash<QString, float> happyExpected = preset.parametersForMood(happyMood);
+
+    // ① 先确认 happy 真的落到了模型上（否则"切回中立"这条断言毫无意义 —— 什么都没变过）
+    window.reloadContent(happyMood);
+    QVERIFY2(window.renderFrameNow(), "happy 帧渲染失败");
+    int happyApplied = 0;
+    for (const QString &parameterId : readBack)
+    {
+        const float actual = window.parameterValue(parameterId);
+        const float expectedValue = happyExpected.value(parameterId);
+        if (qAbs(actual - expectedValue) <= 0.02f)
+            ++happyApplied;
+        qInfo("残留验证①[%s]：%s 预设 %.3f 实际 %.3f", qPrintable(happyMood),
+              qPrintable(parameterId), double(expectedValue), double(actual));
+    }
+    QVERIFY2(happyApplied == readBack.size(),
+             qPrintable(QStringLiteral("%1 只有 %2/%3 个参数落到模型上，先修装载路径")
+                            .arg(happyMood)
+                            .arg(happyApplied)
+                            .arg(readBack.size())));
+
+    // ② 切回 neutral：读回值必须**全部**回到中立，一个都不许残留
+    window.reloadContent(neutralMood);
+    QVERIFY2(window.renderFrameNow(), "neutral 帧渲染失败");
+    const QHash<QString, float> neutralExpected =
+        preset.parametersForArchetype(QStringLiteral("neutral"));
+    for (const QString &parameterId : readBack)
+    {
+        const float actual = window.parameterValue(parameterId);
+        const float expectedValue = neutralExpected.value(parameterId);
+        qInfo("残留验证②[%s]：%s 中立项 %.3f 实际 %.3f", qPrintable(neutralMood),
+              qPrintable(parameterId), double(expectedValue), double(actual));
+        QVERIFY2(qAbs(actual - expectedValue) <= 0.02f,
+                 qPrintable(QStringLiteral("切回 %1 后参数 %2 读回 %3，没有回到中立值 %4 —— "
+                                           "上一种情绪的覆盖条目还留在表里（残留情绪）")
+                                .arg(neutralMood)
+                                .arg(parameterId)
+                                .arg(double(actual))
+                                .arg(double(expectedValue))));
+    }
+}
+
+/*==================== 情绪 × 眨眼：必须是合成，不能互相抢写 ====================
+
+  **这个问题长什么样**（用户看到的就是"mood-sleepy.png 里眼睛睁着"）：
+  情绪的睁闭眼值原本和其他参数一样在 LoadParameters 之后写绝对覆盖，
+  但 `CubismEyeBlink` 在 OnLateUpdate 里对同一批参数**绝对赋值**（0~1 的眨眼进度），
+  于是每一帧的最终值都是"眨眼说的算" —— 情绪那几项（sleepy 0.05 / surprised 1.7 /
+  sad 0.55 / cry 0.35 / angry 0.85 / excited 1.25）全部被丢掉。
+  实测：sleepy 帧与 neutral 帧逐像素相同、读回恒为 1.00。
+
+  **修法**：情绪值改成**乘数**，在 OnLateUpdate **之后**乘到眨眼刚写下的值上
+  （final = mood × blink）。不关掉眨眼 —— 眨眼是"她还活着"的唯一线索
+  （本模型没有身体待机动作，只有呼吸/眨眼/物理）。
+
+  这条测试要证的正是"合成"的三件事，任何一件都对应一种错的实现：
+    (a) 闭眼真的落到了屏幕上（像素证据）：**相邻两帧**之间只换心情，
+        眼睛闭下去造成的像素差必须远超同一呼吸/物理在相邻帧里本来就会造成的漂移；
+    (b) 闭眼心情的最终值 ≈ 预设值 × 眨眼原始值 —— 证明是**乘法**，不是"被覆盖"也不是"被夹"；
+        （旧实现下这个等式必然不成立：最终值恒等于眨眼原始值。）
+    (c) 眨眼在采样窗口里仍然变化（blinkMin < blinkMax）—— 证明没有被情绪钉死。
+        同一窗口里 neutral 也必须变化，否则"眨眼活着"这个前提本身没被验证。
+
+  ⚠️ 像素对照为什么必须是**相邻帧**：两次独立的长采样之间，呼吸/物理已经跑过几百帧，
+  相位完全不同，末帧逐像素差异里"背景摆动"占绝对多数（实测 5.3 万像素，比闭眼本身还大），
+  用它证明"闭眼看得见"根本不成立 —— 这条错误设计在开发时真的踩到过，
+  当时的读数（9.16% 像素差）在**关掉合成之后依然出现**，一测就露馅。
+  相邻帧对照把时间推进限制在"一帧"内，漂移被压到几百像素量级，闭眼的贡献才是主导项。*/
+void TestLive2DWindow::moodEyeOpennessComposesWithBlink()
+{
+    const QString modelName = preferredModelName();
+    const QString dir = modelDirFor(modelName);
+    if (!QFileInfo::exists(dir))
+        QSKIP("本机没有用户配置的模型（禁二传，不入库），跳过眨眼合成验证");
+
+    Live2DMoodPreset preset;
+    if (!loadConfiguredMoodPreset(&preset))
+        QSKIP("本机没有当前角色/模型的心情预设数据（Documents 下，不入库），跳过");
+
+    const QString sleepyMood = preset.representativeMoodForArchetype(QStringLiteral("sleepy"));
+    const QString neutralMood = preset.representativeMoodForArchetype(QStringLiteral("neutral"));
+    QVERIFY2(!sleepyMood.isEmpty() && !neutralMood.isEmpty(), "sleepy/neutral 缺别名");
+
+    // 眨眼是**时间**上的事件：采样窗口必须足够长到必然覆盖一次眨眼。
+    // 60fps 的帧率只决定定时器间隔；采样窗口的虚拟时间由 sampleEyeOpenness 的
+    // 每帧等待（60ms）× 帧数（200）≈ 12s 决定，> 眨眼间隔上限（2 × 默认 4s = 7s）。
+    {
+        QSettings settings(m_tempConfigPath, QSettings::IniFormat);
+        settings.setValue("character/live2dFps", 60);
+        settings.setValue("character/live2dScale", 1.0);
+        settings.sync();
+    }
+
+    Live2DCharacterWindow window;
+    window.loadModel(modelName);
+    QVERIFY2(window.isModelLoaded(), "模型装载失败");
+    QVERIFY2(window.isMoodPresetEnabled(), "情绪预设没装载成功");
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QCoreApplication::processEvents();
+    // 冻住定时器：采样只推进"我们自己要求的那几帧"，不再掺进任意时间推进
+    window.hide();
+    QCoreApplication::processEvents();
+
+    constexpr int kSamples = 130; // 100ms × 130 ≈ 13s 虚拟时间，稳过一次眨眼（上限 7s）
+    const QString eyeParameter = QStringLiteral("ParamEyeLOpen");
+    const float sleepyMoodValue = preset.parametersForMood(sleepyMood).value(eyeParameter, 1.0f);
+    QVERIFY2(sleepyMoodValue < 0.5f,
+             qPrintable(QStringLiteral("原型 sleepy 的 %1 = %2，不是一个「近乎闭眼」的值，"
+                                       "本用例的前提不成立")
+                            .arg(eyeParameter)
+                            .arg(double(sleepyMoodValue))));
+
+    /*眨眼参数的真实 ID 取自模型声明的眼睛语义名（不硬编码 ParamEyeLOpen/ROpen）*/
+    QStringList eyeParameterIds;
+    for (const QString &semantic :
+         {QStringLiteral("eyeLOpen"), QStringLiteral("eyeROpen")})
+    {
+        const QString id = preset.parameters().value(semantic).id;
+        QVERIFY2(!id.isEmpty(), "parameter-map 里没有眼睛参数，无法验证眨眼合成");
+        eyeParameterIds.append(id);
+    }
+
+    // ① 中立基准（也是"眨眼在动"的对照：它必须动，否则本测试的前提不成立）
+    const EyeBlinkSamples neutral =
+        sampleEyeOpenness(&window, eyeParameter, neutralMood, kSamples);
+    QVERIFY2(neutral.frames > 0, "中立采样一帧都没渲出来");
+    QVERIFY2(neutral.blinkMax - neutral.blinkMin > 0.05f,
+             qPrintable(QStringLiteral("采样窗口里眨眼原始值几乎没变（%1~%2）——"
+                                       "要么眨眼没在跑，要么窗口太短，本用例的前提不成立")
+                            .arg(double(neutral.blinkMin))
+                            .arg(double(neutral.blinkMax))));
+
+    /*② 相邻帧对照：同一时刻的呼吸/物理相位基本不变，只切换**眼睛的乘数**。
+
+       为什么用"切换乘数"而不是"切换心情"：换心情会同时改头身角度/嘴，
+       那些本来就让画面变（实测相邻帧差 5.1 万像素），于是"闭眼有没有落到屏幕上"
+       被淹没在一个与眼睛无关的大数字里 —— 这条错误设计在开发时真的踩到过。
+       关掉乘数（=1.0）正是**旧行为**：眨眼自己说了算，情绪完全压不住眼睛。
+
+       ⚠️ 必须等眨眼处于**全睁**（interval 态，值恒为 1.0）时再量：
+       若这一对相邻帧恰好落在眨眼中，眼睛的开度差就从 (1.0→0.05) 缩成 (0.5→0.02)，
+       像素差会掉到 353 这种量级 —— 实测就是这么抓到偶发失败的（同一个用例
+       上一次跑出 1218、下一次 353，纯粹取决于眨眼相位）。等到全睁再量，
+       读数只由模型几何决定，与时间无关。
+       三次渲染之间没有任何等待 → delta 只有几毫秒，物理不跳、眨眼进度不动。*/
+    const QHash<QString, float> openEyes = eyeMultiplierFrom(eyeParameterIds, 1.0f);
+    const QHash<QString, float> moodEyes = eyeMultiplierFrom(eyeParameterIds, sleepyMoodValue);
+
+    QImage blinkOpenA;
+    QImage blinkOpenB;
+    float blinkA = 1.0f;
+    float blinkB = 1.0f;
+    renderEyeProbe(&window, openEyes, eyeParameter, &blinkOpenA, nullptr, &blinkA);
+    //等待"眨眼全睁"：interval 态占绝大部分时间（间隔 0~7s、闭眼全过程 0.3s），
+    //循环上限给得比最坏情况宽（100 × 100ms = 10s）
+    for (int attempt = 0; attempt < 100 && blinkA < 0.999f; ++attempt)
+    {
+        QTest::qWait(100);
+        renderEyeProbe(&window, openEyes, eyeParameter, &blinkOpenA, nullptr, &blinkA);
+    }
+    QVERIFY2(blinkA >= 0.999f,
+             qPrintable(QStringLiteral("10s 内没等到眨眼全睁（当前 %1）——基准帧不可比")
+                            .arg(double(blinkA))));
+    renderEyeProbe(&window, openEyes, eyeParameter, &blinkOpenB, nullptr, &blinkB);
+
+    QImage eyesClosed;
+    float closedComposed = 1.0f;
+    float closedBlink = 1.0f;
+    renderEyeProbe(&window, moodEyes, eyeParameter, &eyesClosed, &closedComposed, &closedBlink);
+
+    QVERIFY2(!blinkOpenA.isNull() && !blinkOpenB.isNull() && !eyesClosed.isNull(),
+             "相邻帧渲染失败");
+    QCOMPARE(eyesClosed.size(), blinkOpenA.size());
+
+    constexpr int kChannelDelta = 8;
+    const qint64 drift = countDifferingPixels(blinkOpenA, blinkOpenB, kChannelDelta);
+    const qint64 eyeDiff = countDifferingPixels(blinkOpenB, eyesClosed, kChannelDelta);
+    const qint64 total = static_cast<qint64>(eyesClosed.width()) * eyesClosed.height();
+    qInfo("眨眼合成验证[%s]：相邻帧对照 —— 眼睛乘数不动时的漂移 = %lld 像素（%.3f%%，眨眼 "
+          "%.4f→%.4f）；把眼睛从 1.0 压到 %.4f 后 = %lld 像素（%.3f%%，眨眼原始值 %.4f，"
+          "眼睛读回 %.4f）；倍数 = %.0fx",
+          qPrintable(modelName), drift,
+          static_cast<double>(drift) * 100.0 / static_cast<double>(total), double(blinkA),
+          double(blinkB), double(sleepyMoodValue), eyeDiff,
+          static_cast<double>(eyeDiff) * 100.0 / static_cast<double>(total), double(closedBlink),
+          double(closedComposed),
+          drift > 0 ? static_cast<double>(eyeDiff) / static_cast<double>(drift) : -1.0);
+
+    /*(a) 闭眼真的落到屏幕上。先定标：实测 atri 上"眼睛 1.0 → 0.05"只改变 **1212** 像素
+       （0.207% 画布）—— 闭眼参数动的是眼睑那一小块，不是半张脸，所以绝对量级本来就不大；
+       而**旧行为**（乘数不生效）下同一个切换只改变 **1** 个像素。两条一起断言：
+         - 绝对下限 500：比"完全没生效"（0~1 像素）高三个数量级，又不假装眼睛有半张脸大；
+         - 相对倍数 5x：挡住"某次漂移恰好很大"把结论蒙对（实测漂移 0~1 像素）。
+       修改眼睛参数建模（例如换成眼睑面积大得多的模型）可能让这个绝对值变化，
+       但"远超同类相邻帧漂移"这条与模型无关，是主要判据。*/
+    QVERIFY2(eyeDiff > 500,
+             qPrintable(QStringLiteral("眼睛乘数压到 %1 之后画面只差 %2 个像素 ——"
+                                       "闭眼没有落到屏幕上（旧行为：眨眼把情绪盖掉）")
+                            .arg(double(sleepyMoodValue))
+                            .arg(eyeDiff)));
+    QVERIFY2(eyeDiff > drift * 5,
+             qPrintable(QStringLiteral("闭眼造成的像素差 %1 没有明显超过相邻帧漂移 %2 ——"
+                                       "无法证明变化来自眼睛而不是背景摆动")
+                            .arg(eyeDiff)
+                            .arg(drift)));
+
+    /*(b) 是乘积：这一刻的最终值 ≈ 乘数 × 这一刻的眨眼原始值。
+       两张帧是相邻渲染的（眨眼进度只差几个百分点，落在下面的容差里），
+       所以这是**逐帧**等式。旧实现下最终值恒等于眨眼原始值（0.05 对不上 ~1），必然失败。*/
+    const float product = sleepyMoodValue * closedBlink;
+    qInfo("眨眼合成验证：%s 乘数 %.4f × 眨眼原始值 %.4f = %.4f，实测最终值 %.4f（差 %.4f）",
+          qPrintable(eyeParameter), double(sleepyMoodValue), double(closedBlink),
+          double(product), double(closedComposed), double(qAbs(closedComposed - product)));
+    QVERIFY2(qAbs(closedComposed - product) <= 0.02f,
+             qPrintable(QStringLiteral("最终值 %1 ≠ 乘数 %2 × 眨眼原始值 %3 = %4 —— "
+                                       "说明不是「乘在眨眼结果上」")
+                            .arg(double(closedComposed))
+                            .arg(double(sleepyMoodValue))
+                            .arg(double(closedBlink))
+                            .arg(double(product))));
+    /*把"被压住"钉在数值上：闭眼帧的最终值必须**明显小于**眨眼全睁。
+       旧实现下它等于眨眼原始值（这一刻约 1）；合成后 = 0.05 × 它 ≤ 0.05。*/
+    QVERIFY2(closedComposed <= 0.25f,
+             qPrintable(QStringLiteral("闭眼帧的最终值到 %1（眨眼原始值 %2）——"
+                                       "眼睛并没有被压到近乎闭合")
+                            .arg(double(closedComposed))
+                            .arg(double(closedBlink))));
+
+    /*(c) 眨眼还活着：**闭眼心情下再采一段**，眨眼原始值必须仍在变化。
+       它证明"乘数只缩放、不冻结" —— 若为了让闭眼好看把眨眼中性化/关掉，
+       这里会退化成一条常量（而 (a)(b) 那两条都察觉不到这种错解法）。
+       用同一个 12s 窗口：比它短就不足以稳过"眨眼间隔 0~7s"这个随机性。*/
+    const EyeBlinkSamples sleepy =
+        sampleEyeOpenness(&window, eyeParameter, sleepyMood, kSamples);
+    QVERIFY2(sleepy.frames > 0, "闭眼心情下采样一帧都没渲出来");
+    QVERIFY2(sleepy.blinkMax - sleepy.blinkMin > 0.05f,
+             qPrintable(QStringLiteral("闭眼心情下眨眼原始值被钉死了（%1~%2）——"
+                                       "眨眼必须继续按自己的节奏走")
+                            .arg(double(sleepy.blinkMin))
+                            .arg(double(sleepy.blinkMax))));
+    qInfo("眨眼合成验证：闭眼心情下眨眼原始值区间 %.4f~%.4f、眼睛最终值区间 %.4f~%.4f"
+          "（各 %d 帧采样）",
+          double(sleepy.blinkMin), double(sleepy.blinkMax), double(sleepy.composedMin),
+          double(sleepy.composedMax), sleepy.frames);
+}
+
+/*不碰眼睛的心情（neutral / happy 都不写 eyeLOpen）必须对眨眼**零影响**：
+  最终值就是眨眼原始值本身，区间也必须与眨眼区间一致。
+
+  为什么这条不能省：把乘数逻辑写成"对覆盖表里所有参数一律相乘"也能让上面那条测试通过
+  （乘数 1.0 的乘法看不出错），但那样会造出每帧累积的连乘（见
+  Live2DOffscreenRenderer::applyEyeOpennessMultiplier 的说明）。
+  这里用"最终值 == 眨眼原始值"把"不该动的绝不动"钉死。*/
+void TestLive2DWindow::moodIgnoringEyesLeavesBlinkUnchanged()
+{
+    const QString modelName = preferredModelName();
+    const QString dir = modelDirFor(modelName);
+    if (!QFileInfo::exists(dir))
+        QSKIP("本机没有用户配置的模型（禁二传，不入库），跳过眨眼不受影响验证");
+
+    Live2DMoodPreset preset;
+    if (!loadConfiguredMoodPreset(&preset))
+        QSKIP("本机没有当前角色/模型的心情预设数据（Documents 下，不入库），跳过");
+
+    const QString neutralMood = preset.representativeMoodForArchetype(QStringLiteral("neutral"));
+    const QString happyMood = preset.representativeMoodForArchetype(QStringLiteral("happy"));
+    QVERIFY2(!neutralMood.isEmpty() && !happyMood.isEmpty(), "neutral/happy 缺别名");
+
+    // 这两个原型都不写 eyeLOpen —— 前提被数据破坏时这条测试就失去意义了
+    for (const QString &archetype : {QStringLiteral("neutral"), QStringLiteral("happy")})
+    {
+        /*⚠️ 查的是**原始差异表**（moods.json 里这个原型真正写了什么），
+           不是 parametersForArchetype() 的解析结果 —— 后者是"整组替换"，
+           每个我们拥有的参数都会有一条，拿它判断"这个原型碰不碰眼睛"永远为真。*/
+        const QHash<QString, float> delta = preset.archetypeDeltas().value(archetype);
+        QVERIFY2(!delta.contains(QStringLiteral("eyeLOpen")) &&
+                     !delta.contains(QStringLiteral("eyeROpen")),
+                 qPrintable(QStringLiteral("原型 %1 现在会写 eyeLOpen/eyeROpen 了，"
+                                           "本用例的前提（不碰眼睛）不再成立，请更新断言")
+                                .arg(archetype)));
+    }
+
+    {
+        QSettings settings(m_tempConfigPath, QSettings::IniFormat);
+        settings.setValue("character/live2dFps", 60);
+        settings.setValue("character/live2dScale", 1.0);
+        settings.sync();
+    }
+
+    Live2DCharacterWindow window;
+    window.loadModel(modelName);
+    QVERIFY2(window.isModelLoaded() && window.isMoodPresetEnabled(), "模型/预设装载失败");
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QCoreApplication::processEvents();
+    window.hide();
+    QCoreApplication::processEvents();
+
+    const QString eyeParameter = QStringLiteral("ParamEyeLOpen");
+
+    // ①② 交替切换 neutral / happy：两者都不碰眼睛，切换本身也不该改变任何东西
+    /*采样窗口故意取短（30ms × 40 帧 ≈ 1.2s 虚拟时间）：这条要证的是"乘数恒等"
+       —— 它每一帧都必须成立，不需要等到眨眼发生；而"眨眼仍会走到全睁"也必然成立，
+      因为眨眼状态机的 interval 态（值恰好 1.0）占了 >90% 的时间，窗口只要不是 0 就能撞上。
+      真正需要 13s 窗口的"眨眼活着"证据在 moodEyeOpennessComposesWithBlink 里。*/
+    const EyeBlinkSamples neutral =
+        sampleEyeOpenness(&window, eyeParameter, neutralMood, 40, 30);
+    const EyeBlinkSamples happy = sampleEyeOpenness(&window, eyeParameter, happyMood, 40, 30);
+    QVERIFY2(neutral.frames > 0 && happy.frames > 0, "采样一帧都没渲出来");
+
+    qInfo("眨眼不受影响验证[%s]：neutral 最终 %.4f~%.4f / 眨眼 %.4f~%.4f；%s 最终 %.4f~%.4f / "
+          "眨眼 %.4f~%.4f",
+          qPrintable(modelName), double(neutral.composedMin), double(neutral.composedMax),
+          double(neutral.blinkMin), double(neutral.blinkMax), qPrintable(happyMood),
+          double(happy.composedMin), double(happy.composedMax), double(happy.blinkMin),
+          double(happy.blinkMax));
+
+    for (const EyeBlinkSamples *sample : {&neutral, &happy})
+    {
+        // 乘数恒等：最终值与眨眼原始值必须逐项一致（同一个采样窗口）
+        QVERIFY2(qAbs(sample->composedMin - sample->blinkMin) <= 1e-3f &&
+                     qAbs(sample->composedMax - sample->blinkMax) <= 1e-3f,
+                 qPrintable(QStringLiteral("最终值 %.4f~%.4f 与眨眼原始值 %.4f~%.4f 不一致 ——"
+                                           "不碰眼睛的心情不该改动眨眼")
+                                .arg(double(sample->composedMin))
+                                .arg(double(sample->composedMax))
+                                .arg(double(sample->blinkMin))
+                                .arg(double(sample->blinkMax))));
+    }
+
+    /*眨眼仍在正常范围里走完一个循环（上限 1.0 = 全睁）。
+       这条同时挡住"把眨眼中性化"这种错解法：那样最大最终值会永远停在某个常数上。*/
+    QVERIFY2(neutral.blinkMax >= 0.99f && happy.blinkMax >= 0.99f,
+             qPrintable(QStringLiteral("采样窗口里眨眼没有一次全睁（neutral %1 / %2 %3）——"
+                                       "眨眼被改坏了")
+                            .arg(double(neutral.blinkMax))
+                            .arg(happyMood)
+                            .arg(double(happy.blinkMax))));
+}
+
+/*校准素材：14 个情绪原型各出一张**固定区域**的脸部裁切图到
+  `build2/tests/live2d-probe/mood-<原型>.png`。
+
+  **只出图、不判断好坏**：这些数值是未校准的初稿，判读由人来做（照 2 倍放大看，
+  见「判断锐度必须放大看」那条纪律）。所以这里不断言"表情对不对"，
+  只钉住"14 张图尺寸与裁切区完全一致"——否则并排目视时根本对不上。
+
+  顺带把"预设值 vs 模型读回"打出来：被 Core **夹取**的值（写了但越界）会被列出来，
+  目视校准时必须知道哪几项其实不是他写的那个数，不然会去改一个永远不会生效的数字。
+  （眼睛的睁闭不在此列 —— 它是乘数合成值，见下面 deviations 处的说明。）*/
+void TestLive2DWindow::rendersMoodArchetypeCalibrationSheet()
+{
+    const QString modelName = preferredModelName();
+    const QString dir = modelDirFor(modelName);
+    if (!QFileInfo::exists(dir))
+        QSKIP("本机没有用户配置的模型（禁二传，不入库），跳过校准图");
+
+    // 固定 60fps/1.0x：裁切区尺寸必须可复现（本用例只出对照图，不量性能）
+    {
+        QSettings settings(m_tempConfigPath, QSettings::IniFormat);
+        settings.setValue("character/live2dFps", 60);
+        settings.setValue("character/live2dScale", 1.0);
+        settings.sync();
+    }
+
+    Live2DMoodPreset preset;
+    if (!loadConfiguredMoodPreset(&preset))
+        QSKIP("本机没有当前角色/模型的心情预设数据（Documents 下，不入库），跳过");
+
+    Live2DCharacterWindow window;
+    window.loadModel(modelName);
+    QVERIFY2(window.isModelLoaded(), "模型装载失败，无法出校准图");
+    QVERIFY2(window.isMoodPresetEnabled(), "情绪预设没装载成功");
+
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QCoreApplication::processEvents();
+    // 冻住帧循环：14 张图之间不再有定时器插进来的任意时间推进（只留每次渲染自身的一帧）
+    window.hide();
+    QCoreApplication::processEvents();
+
+    // 先用 neutral 出一帧，从它的**人物包围盒**定脸部裁切区；14 张图共用这一个 QRect
+    const QString neutralMood = preset.representativeMoodForArchetype(QStringLiteral("neutral"));
+    QVERIFY2(!neutralMood.isEmpty(), "neutral 没有别名");
+    window.reloadContent(neutralMood);
+    QVERIFY2(window.renderFrameNow(), "neutral 帧渲染失败");
+    const QImage neutralFrame = window.renderedImage();
+    QVERIFY2(!neutralFrame.isNull(), "neutral 帧为空");
+    QRect figureBounds;
+    QVERIFY2(opaqueBounds(neutralFrame, 32, &figureBounds), "neutral 帧里量不到人物");
+    const QRect roi = faceRegionOfInterest(figureBounds).intersected(neutralFrame.rect());
+    QVERIFY2(!roi.isEmpty(), "脸部裁切区是空的");
+
+    const QString outDir = QDir(QCoreApplication::applicationDirPath())
+                               .absoluteFilePath(QStringLiteral("../live2d-probe"));
+    QVERIFY2(QDir().mkpath(outDir), qPrintable(QStringLiteral("建不出输出目录 %1").arg(outDir)));
+
+    qInfo("MOOD calibration: model=%s frame=%dx%d figure=%d,%d %dx%d roi=%d,%d %dx%d outDir=%s",
+          qPrintable(modelName), neutralFrame.width(), neutralFrame.height(),
+          figureBounds.x(), figureBounds.y(), figureBounds.width(), figureBounds.height(), roi.x(),
+          roi.y(), roi.width(), roi.height(), qPrintable(outDir));
+
+    QStringList savedPaths;
+    int mismatchedParams = 0;
+    for (const QString &archetype : preset.archetypeNames())
+    {
+        const QString moodName = preset.representativeMoodForArchetype(archetype);
+        QVERIFY2(!moodName.isEmpty(),
+                 qPrintable(QStringLiteral("原型 %1 没有别名，出不了这一格").arg(archetype)));
+
+        window.reloadContent(moodName);
+        QVERIFY2(window.renderFrameNow(), qPrintable(QStringLiteral("原型 %1 渲染失败").arg(archetype)));
+        const QImage frame = window.renderedImage();
+        QVERIFY2(!frame.isNull(), "渲染帧为空");
+        // 同一模型、同一画布：尺寸必须完全一致，裁切区才能共用
+        QCOMPARE(frame.size(), neutralFrame.size());
+        const QImage crop = frame.copy(roi);
+        QCOMPARE(crop.size(), roi.size());
+
+        const QString path =
+            QDir(outDir).absoluteFilePath(QStringLiteral("mood-%1.png").arg(archetype));
+        QVERIFY2(crop.save(path), qPrintable(QStringLiteral("写不出 %1").arg(path)));
+        savedPaths.append(path);
+
+        /*预设值 vs 读回：把"被驱动器/范围盖掉的参数"暴露出来
+          （目视校准时必须知道哪几项其实不是他写的那个数）。
+
+          ⚠️ 眼睛的睁闭**排除在偏差清单外**：它们是"乘数 × 眨眼进度"的合成值，
+          这一帧恰好眨眼（0~0.05 而不是 0.05）是**正确行为**，不是没落地。
+          拿它当偏差会让人误以为 sleepy 坏了 —— 眼睛的真实性由
+          moodEyeOpennessComposesWithBlink 用帧像素证明，这里不再重复判断。
+          （被 Core 夹取的值仍然会出现在清单里：夹取是"你写的数没生效"的另一种形态。）*/
+        const QHash<QString, float> expected = preset.parametersForMood(moodName);
+        const QString eyeLId = preset.parameters().value(QStringLiteral("eyeLOpen")).id;
+        const QString eyeRId = preset.parameters().value(QStringLiteral("eyeROpen")).id;
+        QStringList deviations;
+        for (auto it = expected.constBegin(); it != expected.constEnd(); ++it)
+        {
+            if (it.key() == eyeLId || it.key() == eyeRId)
+                continue;
+            const float actual = window.parameterValue(it.key());
+            if (qAbs(actual - it.value()) > 0.05f)
+            {
+                deviations.append(QStringLiteral("%1=%2(want %3)")
+                                      .arg(it.key())
+                                      .arg(double(actual), 0, 'f', 2)
+                                      .arg(double(it.value()), 0, 'f', 2));
+                ++mismatchedParams;
+            }
+        }
+        qInfo("MOOD archetype=%s alias=%s crop=%dx%d file=%s deviations=%s", qPrintable(archetype),
+              qPrintable(moodName), crop.width(), crop.height(), qPrintable(path),
+              deviations.isEmpty() ? "none" : qPrintable(deviations.join(QStringLiteral(", "))));
+    }
+
+    QVERIFY2(savedPaths.size() == preset.archetypeNames().size(),
+             qPrintable(QStringLiteral("只出了 %1 张图，原型有 %2 个")
+                            .arg(savedPaths.size())
+                            .arg(preset.archetypeNames().size())));
+    qInfo("MOOD calibration summary: %d files, roi=%d,%d %dx%d (identical region), "
+          "requested-vs-actual deviations=%d entries (see per-archetype lines above)",
+          savedPaths.size(), roi.x(), roi.y(), roi.width(), roi.height(), mismatchedParams);
 }
 
 QTEST_MAIN(TestLive2DWindow)

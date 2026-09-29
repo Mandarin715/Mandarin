@@ -31,6 +31,7 @@
 #include <QHash>
 #include <QOffscreenSurface>
 #include <QOpenGLContext>
+#include <QStringList>
 #include <QSurfaceFormat>
 #include <QVector>
 
@@ -44,6 +45,16 @@ namespace
   0 = 水印可见，1 = 水印隐藏。别把它当成普通的"0 就是关"。*/
 constexpr float kWatermarkVisibleValue = 0.0f;
 constexpr float kWatermarkHiddenValue = 1.0f;
+
+/*睁闭眼乘数的下限。
+
+  为什么要一个下限：预设里写着 `sleepy: eyeLOpen 0.05` 这种"近乎闭眼"的值，
+  乘出来是 0.05×眨眼进度；但**表情数据必须落在模型声明的 [min,max] 内**（0~1），
+  而 0 会让模型进入"闭合到底"的姿态（对 0.05 这种"半梦半醒"的意图是过头的）。
+  取 0.01 的意思是"保留一丝开度"，同时把夹取空间留给数据侧 ——
+  数据超出 [0,1] 时 Core 本来也会夹，这里只是提前一步把负值/零值挡在乘数之外。
+  注意这不是"修数据"：预设的 0.05 原样生效，只有 ≤0 的非法值才被抬到这个下限。*/
+constexpr float kEyeOpennessMultiplierFloor = 0.01f;
 
 /*把文件读成字节。**唯一**的读盘入口：QFile 走 Windows 宽字符 API，中文路径没问题。*/
 bool readAllBytes(const QString &path, QByteArray *out)
@@ -252,6 +263,12 @@ class OffscreenUserModel : public Csm::CubismUserModel
         // 眨眼 / 呼吸 / 物理统一由调度器驱动（这里**不能**再单独调 _physics->Evaluate）
         _updateScheduler.OnLateUpdate(_model, deltaSeconds);
 
+        /*情绪的睁闭眼乘数必须在 OnLateUpdate **之后**：眨眼刚把 ParamEyeLOpen/ROpen
+          绝对赋值成本帧的眨眼进度，这里再乘上情绪给的系数 —— 顺序反了就什么都看不见
+          （那正是 sleepy 帧与 neutral 逐像素相同的成因）。其余覆盖不动，仍在老位置，
+          因为物理/呼吸要看到它们（呼吸是加性的，预设值就是摆动基准）。*/
+        applyEyeOpennessMultiplier();
+
         _model->Update();
     }
 
@@ -262,12 +279,163 @@ class OffscreenUserModel : public Csm::CubismUserModel
         m_parameterOverrides.insert(parameterId, value);
     }
 
+    /*整组替换：一次赋值换掉整张表（不是"清空 + 逐条插入"）。
+      为什么要这样：情绪预设换了之后，上一种情绪的条目**必须消失**，
+      否则它每帧继续施加、新预设看起来没生效（见头文件说明）。*/
+    void setParameterOverrides(const QHash<QString, float> &overrides)
+    {
+        m_parameterOverrides = overrides;
+    }
+
+    /*睁闭眼的**乘数**（情绪预设专用），在 OnLateUpdate 之后施加。
+
+      为什么不能在 Override 阶段"写绝对值"：`CubismEyeBlink` 在 OnLateUpdate 里对
+      眨眼参数是**绝对赋值**（0~1 的眨眼进度，见 Effect/CubismEyeBlink.cpp），
+      谁先写谁被盖 —— 实测 sleepy(0.05) 的帧与 neutral 逐像素相同、读回恒为 1.00。
+      为了"让情绪看得见"去关掉/中性化眨眼是错解法：眨眼是"她还活着"的唯一线索。
+
+      所以约定成 final = mood × blink：
+        - mood 不碰眼睛（值 == 1）→ 乘数恒等，眨眼行为完全不受影响；
+        - mood 把眼睛压到近乎闭合（小正数）→ final 也是小正数，闭眼看得见；
+        - 眨眼进度仍在变化 → final 随时间变化，眨眼依然活着（**绝不冻结**）；
+        - 眨眼参数为 0（闭到最紧）时 final 也是 0，与"闭眼"的语义一致。
+
+      为什么按"眨眼声明的参数集合"判定而不是按名字硬编码：哪些参数归眨眼管是
+      model3.json 的 Groups[EyeBlink] 说的（换模型可能不同）；不在这组里的参数
+      （例如 ParamEyeLSmile）继续走普通绝对值覆盖，语义不变。*/
+    void setEyeOpennessMultiplier(const QHash<QString, float> &moodValues)
+    {
+        m_eyeOpennessMultiplier.clear();
+        if (_model == nullptr || _eyeBlink == nullptr)
+            return; //模型没声明眨眼参数组：睁闭眼就是普通参数，交给覆盖表写绝对值
+
+        const Csm::csmVector<Csm::CubismIdHandle> &ids = _eyeBlink->GetParameterIds();
+        for (Csm::csmUint32 index = 0; index < ids.GetSize(); ++index)
+        {
+            const Csm::CubismIdHandle id = ids[index];
+            if (id == nullptr)
+                continue;
+            const QString idName = QString::fromUtf8(id->GetString().GetRawString());
+            if (!moodValues.contains(idName))
+                continue; //这个心情不碰眼睛 → 乘数保持 1（眨眼按自己的节奏走）
+            const float moodValue = moodValues.value(idName);
+            m_eyeOpennessMultiplier.insert(
+                idName, moodValue < kEyeOpennessMultiplierFloor ? kEyeOpennessMultiplierFloor
+                                                                : moodValue);
+        }
+    }
+
+    /*OnLateUpdate 之后的收尾：把情绪给的睁闭眼乘数乘到眨眼刚写下的值上。
+
+      位置是这件事的全部要点 —— OnLateUpdate 之前做没用（眨眼会盖掉），
+      之后做才能"既让步给眨眼、又让情绪的闭眼看得见"。
+      其余覆盖（眉毛/嘴/腮红/头身角度）**保持原位置不动**：物理与呼吸必须看到情绪值
+      （呼吸是加性的，预设值就是它围绕摆动的基准），挪到眨眼之后会让它们看不到。
+
+      ⚠️ 只对**本帧眨眼真的写过的参数**动手（`_eyeBlink` 声明的那些）。
+      为什么不能对覆盖表里所有参数一律相乘：那样会造出一个"每帧乘一次"的连乘 ——
+      乘数 1.0 时结果不变（所以看不出错），但一旦某帧的乘数不等于 1，
+      下一帧读到的是上一帧乘过的结果，眨眼参数会指数衰减。判定必须按"谁归眨眼管"，
+      而不是按"表里有什么"。*/
+    void applyEyeOpennessMultiplier()
+    {
+        if (_model == nullptr || m_eyeOpennessMultiplier.isEmpty())
+            return;
+        for (auto it = m_eyeOpennessMultiplier.constBegin();
+             it != m_eyeOpennessMultiplier.constEnd(); ++it)
+        {
+            const Csm::csmString id(it.key().toUtf8().constData());
+            const Csm::CubismIdHandle handle =
+                Csm::CubismFramework::GetIdManager()->RegisterId(id);
+            const float blinked = _model->GetParameterValue(handle);
+            _model->SetParameterValue(handle, blinked * it.value());
+        }
+    }
+
+    void clearParameterOverrides()
+    {
+        m_parameterOverrides.clear();
+        m_eyeOpennessMultiplier.clear();
+    }
+
     float parameterValue(const QString &parameterId) const
     {
         if (_model == nullptr || parameterId.isEmpty())
             return 0.0f;
         const Csm::csmString id(parameterId.toUtf8().constData());
         return _model->GetParameterValue(Csm::CubismFramework::GetIdManager()->RegisterId(id));
+    }
+
+    /*眨眼驱动器**本帧写下的原始值**（0 = 闭紧、1 = 全睁）。
+
+      为什么要单独暴露它：`parameterValue()` 给的是"情绪乘完之后的最终值"，
+      单看它分不清"眨眼活着但被情绪压小"与"眨眼被情绪钉死了"——
+      这两种情况在校准一张闭眼图时给出的结论完全相反。
+      读法：眨眼参数**声明**的那几个（`eyeBlinkParameterIds`）在本帧 OnLateUpdate 里
+      被绝对写成同一个进度值；这里把乘数除掉就能还原它。别用来判定别的参数。*/
+    float blinkValue() const
+    {
+        if (_model == nullptr || _eyeBlink == nullptr)
+            return 1.0f;
+        const Csm::csmVector<Csm::CubismIdHandle> &ids = _eyeBlink->GetParameterIds();
+        if (ids.GetSize() == 0)
+            return 1.0f;
+        const Csm::CubismIdHandle id = ids[0];
+        if (id == nullptr)
+            return 1.0f;
+        const QString idName = QString::fromUtf8(id->GetString().GetRawString());
+        const float finalValue = _model->GetParameterValue(id);
+        const float multiplier = m_eyeOpennessMultiplier.value(idName, 1.0f);
+        if (multiplier <= 0.0f)
+            return finalValue; //除零保护：乘数不该是 0（下限见 kEyeOpennessMultiplierFloor）
+        return finalValue / multiplier;
+    }
+
+    /*模型声明的参数取值域。真源就是 moc 本身（CubismModel 的三个 GetParameter*Value），
+      不读 vtube.json / cdi3.json —— 那两个是作者/VTS 的配置，不是模型的能力边界。
+      换模型时这份数据自然跟着换，数据表（parameter-map.json）照它填即可。*/
+    QHash<QString, Live2DOffscreenRenderer::DeclaredRange> declaredParameterRanges() const
+    {
+        QHash<QString, Live2DOffscreenRenderer::DeclaredRange> ranges;
+        if (_model == nullptr)
+            return ranges;
+        const Csm::csmInt32 count = _model->GetParameterCount();
+        for (Csm::csmInt32 index = 0; index < count; ++index)
+        {
+            const Csm::CubismIdHandle id = _model->GetParameterId(index);
+            if (id == nullptr)
+                continue;
+            const QString idName = QString::fromUtf8(id->GetString().GetRawString());
+            if (idName.isEmpty())
+                continue;
+            Live2DOffscreenRenderer::DeclaredRange range;
+            range.min = _model->GetParameterMinimumValue(static_cast<Csm::csmUint32>(index));
+            range.neutral = _model->GetParameterDefaultValue(static_cast<Csm::csmUint32>(index));
+            range.max = _model->GetParameterMaximumValue(static_cast<Csm::csmUint32>(index));
+            ranges.insert(idName, range);
+        }
+        return ranges;
+    }
+
+    /*归眨眼管的参数（model3.json 的 Groups[Name=EyeBlink].Ids）。
+      没声明眨眼组时返回空 —— 调用方据此知道"睁闭眼就是普通参数"，
+      而不是去猜哪两个参数是眼睛。*/
+    QStringList eyeBlinkParameterIds() const
+    {
+        QStringList ids;
+        if (m_setting == nullptr)
+            return ids;
+        const Csm::csmInt32 count = m_setting->GetEyeBlinkParameterCount();
+        for (Csm::csmInt32 index = 0; index < count; ++index)
+        {
+            const Csm::CubismIdHandle id = m_setting->GetEyeBlinkParameterId(index);
+            if (id == nullptr)
+                continue;
+            const QString idName = QString::fromUtf8(id->GetString().GetRawString());
+            if (!idName.isEmpty())
+                ids.append(idName);
+        }
+        return ids;
     }
 
     /*模型画布 → 输出空间的缩放：把模型画布高度映射到 2（= 满画布），居中、无平移。
@@ -631,6 +799,12 @@ class OffscreenUserModel : public Csm::CubismUserModel
     QVector<GLuint> m_textureIds;
     QHash<QString, float> m_parameterOverrides;
 
+    /*睁闭眼的乘数（**只包含眨眼声明的参数**），由 setEyeOpennessMultiplier 从覆盖表里挑出来。
+      为什么单独存一份而不是每次从 m_parameterOverrides 里筛：眨眼参数要在 OnLateUpdate
+      之后重写一次，而"哪些参数归眨眼管"是模型声明（Groups[EyeBlink]）决定的，
+      每次筛都要问一遍 m_setting；存下来也让"这一帧到底乘了什么"可以一眼看清。*/
+    QHash<QString, float> m_eyeOpennessMultiplier;
+
     Csm::ACubismMotion *m_idleMotion = nullptr; // 待机动作；所有权在 _motionManager
     /*眨眼 Updater 拿的是这个标志的**引用**：动作没更新参数的那些帧才让眨眼生效。
       成员不能挪位置/不能是临时量，否则引用悬空。*/
@@ -938,11 +1112,54 @@ void Live2DOffscreenRenderer::setParameter(const QString &parameterId, float val
         m_impl->model->setParameter(parameterId, value);
 }
 
+void Live2DOffscreenRenderer::setParameterOverrides(const QHash<QString, float> &overrides)
+{
+    if (m_impl->model != nullptr)
+    {
+        m_impl->model->setParameterOverrides(overrides);
+        /*同一份覆盖表顺手推给"睁闭眼乘数"：哪些参数算眼睛由模型声明决定，
+          这里不重复判断一次（也不会漏掉"换了模型、眨眼参数不同"的情况）。*/
+        m_impl->model->setEyeOpennessMultiplier(overrides);
+    }
+}
+
+void Live2DOffscreenRenderer::clearParameterOverrides()
+{
+    if (m_impl->model != nullptr)
+    {
+        m_impl->model->clearParameterOverrides();
+        // 乘数也必须一起清：否则"关掉情绪功能"之后眨眼仍被上一次的系数压着
+        m_impl->model->setEyeOpennessMultiplier(QHash<QString, float>());
+    }
+}
+
+void Live2DOffscreenRenderer::setEyeOpennessMultiplier(const QHash<QString, float> &moodValues)
+{
+    if (m_impl->model != nullptr)
+        m_impl->model->setEyeOpennessMultiplier(moodValues);
+}
+
+QHash<QString, Live2DOffscreenRenderer::DeclaredRange>
+Live2DOffscreenRenderer::declaredParameterRanges() const
+{
+    QHash<QString, DeclaredRange> ranges;
+    if (m_impl->model == nullptr)
+        return ranges;
+    return m_impl->model->declaredParameterRanges();
+}
+
 float Live2DOffscreenRenderer::parameterValue(const QString &parameterId) const
 {
     if (m_impl->model == nullptr)
         return 0.0f;
     return m_impl->model->parameterValue(parameterId);
+}
+
+float Live2DOffscreenRenderer::blinkValue() const
+{
+    if (m_impl->model == nullptr)
+        return 1.0f;
+    return m_impl->model->blinkValue();
 }
 
 void Live2DOffscreenRenderer::setWatermarkVisible(bool visible)

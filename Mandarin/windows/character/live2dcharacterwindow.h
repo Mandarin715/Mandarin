@@ -3,6 +3,7 @@
 
 #include "characterwindowbase.h"
 
+#include "../../utils/Live2DMoodPreset.h"
 #include "../../utils/Live2DOffscreenRenderer.h"
 
 #include <QImage>
@@ -25,6 +26,11 @@ class Live2DCharacterWindow : public CharacterWindowBase
     explicit Live2DCharacterWindow(QWidget *parent = nullptr);
     ~Live2DCharacterWindow() override;
 
+    /*装载模型（按模型名找目录 + 入口文件）。只在启动/换模型时调用一次 ——
+      **换心情不再走这条路**，否则"心情名找不到同名模型"会被静默忽略（这就是本来的 bug）。
+      返回是否装载成功；失败时保留上一版画布，不做任何清理（避免闪烁成空白窗口）。*/
+    bool loadModel(const QString &modelName);
+
     /*模型是否装载成功（main.cpp 据此决定要不要回退到 PNG 立绘）*/
     bool isModelLoaded() const { return m_modelLoaded; }
 
@@ -42,13 +48,34 @@ class Live2DCharacterWindow : public CharacterWindowBase
     QImage renderedImage() const { return m_scaledImg; }
     QString modelDir() const { return m_modelDir; }
 
+    /*读模型参数的当前值。与上面几个访问器同样的理由：情绪预设到底有没有真的落到模型上，
+      只有"读回参数"能证明（两帧像素差无法区分"换了心情"和"呼吸多走了一拍"）。
+      没装载模型或参数不存在时返回 0。*/
+    float parameterValue(const QString &parameterId) const;
+
+    /*眨眼驱动器本帧写下的原始开眼度（0 = 闭紧、1 = 全睁）。
+      情绪闭眼是**乘在它上面**的（见 Live2DOffscreenRenderer::blinkValue 的说明）：
+      要证伪"情绪把眨眼钉死了"就必须能看见这个值本身。*/
+    float blinkValue() const;
+
+    /*单独设定情绪睁闭眼乘数（默认 1.0 = 眨眼自己说了算）。
+      正常路径不需要它 —— applyMood 会从预设里自动带上；它是给"关掉情绪对眨眼的干预"
+      与校准实验用的（见 Live2DOffscreenRenderer::setEyeOpennessMultiplier）。*/
+    void setEyeOpennessMultiplierForTest(const QHash<QString, float> &moodValues);
+
+    /*情绪预设是否可用（两份 JSON 装载成功）。不可用时情绪功能自关：不施加任何覆盖。*/
+    bool isMoodPresetEnabled() const { return m_moodPreset.isEnabled(); }
+
     /*帧循环节拍（毫秒），由 character/live2dFps 推出*/
     int frameIntervalMs() const { return m_frameIntervalMs; }
     /*实际提交给渲染器的分辨率（逻辑尺寸 × 有效 dpr）*/
     QSize renderSize() const;
 
   public slots:
-    /*contentName 为模型名（如 miku）；找不到时保留当前模型不重载*/
+    /*按**心情名**应用情绪预设（基类契约：PNG 路径用同一个入口按名切换内容）。
+      心情名 = 角色 Tachie/ 下 PNG 的文件名；经 moods.json 映射成一组参数覆盖值。
+      找不到/非法的名字回退 neutral（绝不会把上一种情绪留在屏幕上）。
+      没装载模型时调用也是安全的：只记住心情，模型装载成功后补上。*/
     void reloadContent(const QString &contentName) override;
 
   protected:
@@ -120,6 +147,10 @@ class Live2DCharacterWindow : public CharacterWindowBase
     void refreshInteractiveRegion(); //低频重算交互区（构建 QBitmap 很贵，不能每帧做）
     bool renderAndRegisterFrame();   //渲染一帧并登记 alpha 图，失败返回 false
 
+    /*换一整组参数覆盖并（有画布时）立刻出一帧。
+      为什么整组替换、为什么立刻出帧：见 .cpp 里的说明（残留情绪 + 即时性）。*/
+    void applyMood(const QString &moodName);
+
     /*按模型名在两个候选目录里找模型，返回含可用 model3.json 的目录，找不到返回空*/
     QString resolveModelDir(const QString &modelName) const;
 
@@ -188,6 +219,14 @@ class Live2DCharacterWindow : public CharacterWindowBase
     /*reloadContent 在窗口还没映射时只记模型名，真正的首次布局推迟到 showEvent
       （那时 devicePixelRatioF() 才是真实值）。*/
     QString m_pendingModelName;
+
+    /*情绪预设与当前心情。
+      m_moodPreset 由 loadModel 按模型名装载（路径 = CharacterAssestPath + CharSelect + 模型名）；
+      装载失败时 isEnabled()==false，窗口不施加任何覆盖（功能自关，绝不崩）。
+      m_currentMoodName 的初值是 "default"（Tachie 里就是中立那张）：模型装载完成后
+      即使 AI 还没说话，也要有一份显式的 neutral 覆盖，而不是"表里什么都没有"。*/
+    Live2DMoodPreset m_moodPreset;
+    QString m_currentMoodName = QStringLiteral("default");
 };
 
 #endif // LIVE2DCHARACTERWINDOW_H

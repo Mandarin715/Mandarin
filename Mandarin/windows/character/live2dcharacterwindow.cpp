@@ -177,24 +177,27 @@ QString Live2DCharacterWindow::resolveModelDir(const QString &modelName) const
     return QString();
 }
 
-void Live2DCharacterWindow::reloadContent(const QString &contentName)
+/*装载模型：模型名 → 目录 → 入口文件 → 渲染器。
+
+  为什么与「应用心情」分成两个入口（本来的 bug 就在这）：`reloadContent(心情名)` 曾经被当成
+  模型名，AI 每句话发来的心情（`高兴`/`睡觉`…）在模型根目录与角色目录下都找不到同名模型，
+  于是这里 `dir.isEmpty()` 直接 return —— **心情变化被静默吃掉**，立绘永远一副表情。
+  现在 `reloadContent` 只负责换情绪预设（见下），模型名的解析只走这个函数。*/
+bool Live2DCharacterWindow::loadModel(const QString &modelName)
 {
-    const QString modelName = contentName.trimmed();
-    const QString dir = resolveModelDir(modelName);
+    const QString name = modelName.trimmed();
+    const QString dir = resolveModelDir(name);
     if (dir.isEmpty())
-    {
-        //保留已装载的模型：内容名可能是心情名，不该因为找不到就黑掉立绘。
-        return;
-    }
+        return false;
 
     applyRenderScaleFromConfig();
 
     //入口文件名以目录里的实际内容为准（可能不叫 <模型名>.model3.json）
-    const QString modelJsonName = resolveModelJsonName(dir, modelName);
+    const QString modelJsonName = resolveModelJsonName(dir, name);
     if (modelJsonName.isEmpty())
     {
         qWarning() << "Live2D 目录里没有 model3.json:" << dir;
-        return;
+        return false;
     }
 
     QString error;
@@ -202,7 +205,7 @@ void Live2DCharacterWindow::reloadContent(const QString &contentName)
     {
         qWarning() << "Live2D 模型装载失败:" << dir << error;
         //装载失败时上一版画布还留着，直接沿用（不置空，避免闪烁成空白窗口）。
-        return;
+        return false;
     }
 
     m_modelDir = dir;
@@ -212,13 +215,82 @@ void Live2DCharacterWindow::reloadContent(const QString &contentName)
     m_renderingFrame = false;
     qInfo() << "Live2D 模型已装载:" << modelJsonName << "于" << dir;
 
+    /*情绪预设：路径要靠模型名才推得出来（…/Live2D/<模型名>/presets/moods.json），
+      所以只能在这里装载。失败时功能整个自关 —— 不施加任何覆盖、也不残留上一种情绪。*/
+    m_moodPreset.load(name);
+
     // 窗口映射到屏幕之前 devicePixelRatioF() 给不出真实值（本机未映射时是 1.0，
     // 实际 1.25），此时用错 dpr 定画布/渲染分辨率会同时错两处（屏幕尺寸与像素密度）。
     // 所以未映射就先只记下模型名，真正的首次布局交给 showEvent —— 那时 dpr 才是真的。
     if (isVisible())
         relayoutContent();
     else
-        m_pendingModelName = modelName;
+        m_pendingModelName = name;
+
+    /*心情在**布局之后**才施加：画布的宽高比/人物占比是由探针量出来的，探针必须在
+      "默认状态"下跑，否则换一次模型得到的画布会随当前心情而变（同一套参数算出两种画布）。
+      重排已经出过一帧，这里再出一帧带上情绪，代价是一帧渲染。*/
+    applyMood(m_currentMoodName);
+    return true;
+}
+
+/*换一整组参数覆盖，有画布时立刻出一帧。
+
+  **整组替换**是关键：`setParameter` 只能增改单条，切回 neutral 时上一种情绪的条目仍在表里，
+  每帧继续施加 —— 于是"换成中立"看起来什么都没发生（残留情绪的成因）。
+  这里交给 setParameterOverrides 一次换掉整张表。
+
+  三条安全边界（都在旧实现上踩过或可能踩到）：
+  1. 预设不可用（两份 JSON 缺失/非法）→ 什么都不施加（功能自关），且**清空**覆盖表，
+     保证不会留下上一帧的残留情绪；
+  2. 还没装载模型 → 只记住心情名，覆盖表照写（渲染器侧会在装载后自然带上），
+     但绝不渲染 —— 那时窗口还没有画布，渲出来的帧是错尺寸的；
+  3. 窗口还没有画布（未映射/dpr 未定）→ 同样只记覆盖，等首次布局的那一帧自然带上。*/
+void Live2DCharacterWindow::applyMood(const QString &moodName)
+{
+    const QString trimmed = moodName.trimmed();
+    m_currentMoodName = trimmed.isEmpty() ? QStringLiteral("default") : trimmed;
+
+    if (!m_moodPreset.isEnabled())
+    {
+        // 预设不可用 = 情绪功能自关：清掉可能存在的覆盖，别把上一种情绪留在屏幕上
+        m_renderer.clearParameterOverrides();
+        return;
+    }
+
+    m_renderer.setParameterOverrides(m_moodPreset.parametersForMood(m_currentMoodName));
+
+    if (!m_modelLoaded || m_logicalCanvasSize.isEmpty())
+        return; //还没有画布：等下一帧/首次布局时自然带上，这里不能渲一个错尺寸的帧
+
+    /*立刻出一帧并请求重绘：AI 刚说完话，表情必须在同一拍就变，不能等下一次定时器；
+      交互区也顺手刷新 —— 表情会改变剪影（闭眼/低头），命中判定应当跟着变。*/
+    if (renderAndRegisterFrame())
+    {
+        refreshInteractiveRegion();
+        update();
+    }
+}
+
+void Live2DCharacterWindow::reloadContent(const QString &contentName)
+{
+    //基类契约：按内容名切换（PNG 路径按名换图，Live2D 路径按名换情绪）
+    applyMood(contentName);
+}
+
+float Live2DCharacterWindow::parameterValue(const QString &parameterId) const
+{
+    return m_renderer.parameterValue(parameterId);
+}
+
+float Live2DCharacterWindow::blinkValue() const
+{
+    return m_renderer.blinkValue();
+}
+
+void Live2DCharacterWindow::setEyeOpennessMultiplierForTest(const QHash<QString, float> &values)
+{
+    m_renderer.setEyeOpennessMultiplier(values);
 }
 
 /*画布尺寸启发式（v3）：

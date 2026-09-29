@@ -58,16 +58,38 @@
 - `Live2D/CubismNativeFramework`（GitHub，最新 tag `beta12`）**只有 `src`，不含 `Core`** —— 闭源的 `CubismNativeCore`（`Live2DCubismCore.h` + 预编译库）**只在官方 SDK 压缩包里**；
 - 落地：使用者下载 `CubismSdkForNative-5-r.x.zip` → 解压到 `Mandarin/3rdparty/Live2DCubismSDK/`；该目录进 `.gitignore`（**SDK 二进制不入库**）。分发前按 EULA 确认 Core 能否随包重分发，若不可则安装包只带框架源码、Core 由使用者自备。
 
-### 参数映射：以模型自带的 `vtube.json` 为准，不要手写
+### 参数映射：名字可以查 `vtube.json`，但**取值范围只能问 moc**（2026-09-29 更正）
 
-`miku.cdi3.json` 显示该模型共 **141 个参数**，且大量是数字名自定义参数（`Param125` 圈圈、`Param130` 脸红、`Param137` 水印…）。而 `miku.vtube.json` 的 `ParameterSettings` 段落**本身就是一张现成的「面捕输入 → Live2D 参数 + 输入/输出范围 + 平滑」映射表**。
+`miku.cdi3.json` 显示该模型共 **141 个参数**，且大量是数字名自定义参数（`Param125` 圈圈、`Param130` 脸红、`Param137` 水印…）。而 `miku.vtube.json` 的 `ParameterSettings` 段落**本身就是一张现成的「面捕输入 → Live2D 参数 + 输入/输出范围 + 平滑」映射表** —— 用它**找参数名**很好用。
 
-**结论**：`parameter-map.json` 的取值应**优先从模型自带的 `*.vtube.json` 生成**（没有才回退手写），比人工抄参数名可靠。核实后 `miku` 本版会用到的参数：
+⚠️ **但它的 `OutputRange` 不是模型的取值边界。** 那是「某个 VTube Studio 配置允许把参数推到多远」；真正生效的边界是 moc 自己声明的 min/max/default，由 Core 暴露：
+
+```cpp
+CubismModel::GetParameterMinimumValue(i) / GetParameterDefaultValue(i) / GetParameterMaximumValue(i)
+// 渲染器已封装：Live2DOffscreenRenderer::declaredParameterRanges()
+```
+
+**实测代价**（atri，2026-09-29）：`parameter-map.json` 的范围当初就是照 `atri_8.vtube.json` 抄的 ——
+
+| 参数 | vtube OutputRange（抄来的） | moc 声明（真值） | 后果 |
+|---|---|---|---|
+| `ParamMouthForm` | -2.5 ~ 2.5 → 写进 map `[-1, 1]`、neutral 0 | **[-1, 0]，默认 -0.5** | "笑"（+0.6~+0.9）被 Core 夹成 0，永远笑不出来；中立还被钉在 0（不是静息值） |
+| `ParamEyeLOpen/ROpen` | 0 ~ 2 → 写进 map `[0, 1.9]` | **[0, 1]，默认 1** | surprised 的 1.7 被夹成 1.0 |
+| `ParamMouthOpenY` | 0 ~ 2.1 → 写进 map `[0, 2.1]` | **[0, 1]，默认 0** | 幅度上限本来就到不了 2.1 |
+
+**结论（纪律）**：
+1. 参数**名/用途**可以查 `vtube.json` / `cdi3.json`；
+2. `parameter-map.json` 的 **min / max / neutral 必须逐条等于 moc 声明的 最小 / 最大 / 默认值**，
+   `neutral` 就是模型的**静息值**（≠ 0）；
+3. 由测试 `parameterMapRangesMatchModelDeclarations` 逐条核对并打印模型真值，
+   换模型/改数据时它会把差异全部报出来。
+
+核实后 `atri` 本版会用到的参数（名字仍来自 vtube/cdi3，范围见上）：
 
 | 用途 | 参数 | 出处 |
 |---|---|---|
-| 口型开合 | `ParamMouthOpenY` | vtube `MouthOpen`，输出 0~1 |
-| 笑容/嘴形 | `ParamMouthForm` | vtube `MouthSmile`，输出 -2.5~2.5 |
+| 口型开合 | `ParamMouthOpenY` | vtube `MouthOpen`（moc 范围 0~1） |
+| 笑容/嘴形 | `ParamMouthForm` | vtube `MouthSmile`（⚠️ moc 只允许 **-1~0**，正数写不进去） |
 | 眨眼 | `ParamEyeLOpen` / `ParamEyeROpen` | model3 `EyeBlink` 组 + vtube |
 | 眼球 | `ParamEyeBallX` / `ParamEyeBallY` | vtube |
 | 呼吸 | `ParamBreath` | vtube（`UseBreathing=True`） |
@@ -75,7 +97,7 @@
 | 身体 | `ParamBodyAngleX` / **`ParamBodyAngleY`** / **`ParamBodyAngleZ`** | vtube，±10 ← 原方案只列了 X |
 | 眉毛 | `ParamBrowLY`/`RY`/`LAngle`/`RAngle`/`LForm`/`RForm`/`LX`/`RX` | vtube ← **原方案遗漏** |
 | 头发摇动 | `ParamHairFront` / `ParamHairSide` / `ParamHairBack` | cdi3「摇动」← **原方案遗漏** |
-| 眯眼 | `EyeL_Squint` / `EyeR_Squint` | cdi3 ← **原方案遗漏** |
+| 眯眼 | `ParamEyeLSmile` / `ParamEyeRSmile` | cdi3 ← **原方案遗漏**（本模型的"笑"主要靠它） |
 | 嘴部杂项 | `ParamMouthShrug` | vtube ← **原方案遗漏** |
 
 > `absent` 的语义应修正为「本模型存在但**本版不使用**的参数**示例**」，**不是穷举** —— 141 个参数里绝大多数是物理/绑定内部参数，不需要逐个声明。
@@ -105,6 +127,39 @@
 
 > **教训**：这类"参数名听起来像什么、就以为它是什么"的假设，必须靠**渲染出来亲眼看**验证。
 > 参数值回读（`Param137=1/0` 都读对了）完全无法发现极性问题。
+
+### 情绪的睁闭眼：与眨眼**合成**，不能互相抢写（2026-09-29 实测）
+
+`CubismEyeBlink` 每帧在 `OnLateUpdate` 里对 `Groups[EyeBlink]` 声明的参数
+（`ParamEyeLOpen`/`ParamEyeROpen`）**绝对赋值**为本帧的眨眼进度（0~1）。
+
+如果情绪预设像其他参数一样在 `LoadParameters` 之后"写绝对值覆盖"，结果必然是：
+**眨眼后写、情绪被整个丢掉**。实测症状正是用户看到的 `mood-sleepy.png` 里**眼睛睁着** ——
+sleepy 帧与 neutral 帧逐像素相同，参数回读恒为 1.00。受影响的还有
+surprised / sad / cry / angry / excited 的睁闭眼。
+
+**正确做法**：情绪值当**乘数**，在 `OnLateUpdate` **之后**施加：`final = 情绪值 × 眨眼值`。
+- 情绪压到近乎闭合（0.05）→ 最终值也近乎 0，闭眼看得见；
+- 眨眼进度仍在变 → 最终值随时间变（**眨眼活着**，这是"她还活着"的唯一线索，
+  本模型的三个模型都没有身体待机动作，只有呼吸/眨眼/物理）；
+- 情绪不碰眼睛（值 = 1）→ 乘数恒等，眨眼行为一模一样；
+- 归眨眼管的参数由 **model3.json 的 `Groups[EyeBlink]`** 决定，不硬编码参数名。
+
+**其余覆盖（眉毛/嘴/腮红/头身角度）位置不变**：物理与呼吸必须看到情绪值
+（呼吸是**加性**的，预设值就是它围绕摆动的基准）——把它们也挪到眨眼之后会让它们看不到。
+
+**验收**（`moodEyeOpennessComposesWithBlink` / `moodIgnoringEyesLeavesBlinkUnchanged`，两条都在旧实现上失败）：
+
+| 观察量 | 旧实现（眨眼盖掉情绪） | 现在 |
+|---|---|---|
+| 相邻帧、只把眼睛乘数 1.0 → 0.05 的像素差 | **1 像素**（等于没变） | **1217~1219 像素**（0.21% 画布） |
+| 同一时刻 `ParamEyeLOpen` 读回 | 1.0（= 眨眼值） | 0.05 = 乘数 × 眨眼（差 0.0000） |
+| 闭眼心情下 13s 采样窗口里眨眼原始值 | — | 0.00~1.00（仍在眨） |
+| 不碰眼睛的心情（neutral/happy） | — | 最终值逐帧 == 眨眼值（零影响） |
+
+> ⚠️ 像素对照必须用**相邻帧**、且等眨眼处于**全睁**时再量：两次独立长采样之间
+> 呼吸/物理相位不同，末帧差 5 万像素里绝大多数与眼睛无关；而落在眨眼过程中量，
+> 读数会从 1219 掉到 353（实测到的偶发失败）。两条都是开发时踩过的坑。
 
 ### 中文文件名的路径风险（原方案遗漏）
 

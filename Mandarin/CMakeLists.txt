@@ -421,6 +421,7 @@ if(TARGET Framework)
         utils/Live2DCubismRuntime.h utils/Live2DCubismRuntime.cpp
         utils/Live2DOffscreenRenderer.h utils/Live2DOffscreenRenderer.cpp
         utils/Live2DModelInfo.h utils/Live2DModelInfo.cpp
+        utils/Live2DMoodPreset.h utils/Live2DMoodPreset.cpp
     )
     # Framework 已经 PUBLIC 带了 CSM_TARGET_WIN_GL / Core/include / GLEW，这里无需重复
     target_link_libraries(Mandarin PRIVATE Framework)
@@ -634,6 +635,7 @@ if(BUILD_TESTING)
             utils/Live2DOffscreenRenderer.cpp
             utils/Live2DCubismRuntime.cpp
             utils/Live2DModelInfo.cpp
+            utils/Live2DMoodPreset.cpp
         )
         target_include_directories(test_live2dwindow PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}

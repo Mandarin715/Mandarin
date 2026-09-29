@@ -1,6 +1,7 @@
 #ifndef LIVE2DOFFSCREENRENDERER_H
 #define LIVE2DOFFSCREENRENDERER_H
 
+#include <QHash>
 #include <QImage>
 #include <QSize>
 #include <QString>
@@ -35,9 +36,61 @@ class Live2DOffscreenRenderer
       传中文/自定义参数名均可（内部经 CubismIdManager 注册成 id）。*/
     void setParameter(const QString &parameterId, float value);
 
+    /***整组替换**参数覆盖（情绪预设走这条）。
+
+      为什么必须有它、而且必须是"整组"：`setParameter` 只能往里加/改单条，永远删不掉 ——
+      上一种情绪的条目会一直留在表里，每帧继续施加，于是"换成 neutral"看起来毫无变化
+      （这就是「一个人只有一副表情」的第二个成因）。整组替换让"这次心情的参数集"
+      成为表里唯一的内容，切回 neutral 时旧条目自然消失。
+
+      为什么不是"先清空再逐条加"：那中间会有一瞬间的空表，而这里换表是单条语句、
+      下一帧才被读取（tick 在主线程同一调用栈里跑，不存在半途被读的可能）。
+      key 为参数 ID（如 ParamEyeLSmile）。*/
+    void setParameterOverrides(const QHash<QString, float> &overrides);
+
+    /*清空整组覆盖：回到"每个参数完全由动作/驱动器决定"的状态。
+      情绪功能自关（预设文件缺失/非法）时用它，避免留下上一帧的残留情绪。*/
+    void clearParameterOverrides();
+
+    /***情绪睁闭眼乘数**（默认 1.0 = 眨眼自己说了算）。
+
+      语义：对模型声明的**眨眼参数**（model3.json 的 Groups[EyeBlink]），
+      最终值 = 乘数 × 眨眼本帧写下的值（见 .cpp 里 applyEyeOpennessMultiplier 的说明）。
+      不在眨眼组里的参数不受影响；乘数 ≤0 会被抬到一个小正数（不彻底闭合）。
+
+      `setParameterOverrides` 会自动把覆盖表里涉及眨眼参数的那几项挑出来喂给它 ——
+      所以正常路径（情绪预设）不需要手动调这个。它单独存在是为了：
+        1) 把"情绪对眨眼的干预"做成一个**可独立开关**的量：关掉（=1.0）就是
+           "这个心情不碰眼睛"的旧行为，用来量"闭眼到底改变了多少像素"；
+        2) 校准/实验时可以单独试某一个开度，不必伪造一整个心情。*/
+    void setEyeOpennessMultiplier(const QHash<QString, float> &moodValues);
+
     /*读取参数当前值。用于验证覆盖是否真的生效（比对比两帧像素可靠：
       两帧之间物理动画本来就会变，像素差异无法证明是参数造成的）。*/
     float parameterValue(const QString &parameterId) const;
+
+    /*眨眼驱动器本帧写下的**原始**开眼度（0 = 闭紧、1 = 全睁；模型没声明眨眼组时恒为 1）。
+
+      与 parameterValue 的区别：那是"情绪乘完之后的最终值"。判断"眨眼还活着，只是被情绪
+      压小了"还是"眨眼被情绪钉死了"，必须看这个原始值 —— 只看最终值会把两者混为一谈。*/
+    float blinkValue() const;
+
+    /*模型**自己声明**的参数取值域（moc 的真值）。
+
+      为什么必须有它：数据表（`parameter-map.json`）里的 [min,max]/中立值只能来自这里。
+      曾经那几个范围是从模型自带的 `*.vtube.json` 的 VTS OutputRange 手抄的 ——
+      那是"某个 VTube Studio 配置允许推多远"，与 moc 声明的取值域是两回事。
+      实测代价：`ParamMouthForm` 被抄成 [-1,+1]、中立 0.0，而 moc 是 [-1,0]、默认 -0.5，
+      于是"想笑"的 +0.9 被 Core 夹成 0.0（表情里写死一个到不了的值），
+      中立位还被钉在 0.0（不是作者的静息姿势）。范围核对测试拿这份数据去钉住这个错误类别。*/
+    struct DeclaredRange
+    {
+        float min = 0.0f;     // moc 声明的最小值
+        float neutral = 0.0f; // moc 声明的**默认值**（静息值，不是 0）
+        float max = 0.0f;     // moc 声明的最大值
+    };
+    /*参数 ID → 声明范围。未加载/该参数不存在时该项不出现（调用方据 contains 判定）。*/
+    QHash<QString, DeclaredRange> declaredParameterRanges() const;
 
     /*人物可见范围（全部在**绘制输出空间**，也叫 NDC：画布横竖都映射到 [-1, 1]，
       即"满画布"= 2）。

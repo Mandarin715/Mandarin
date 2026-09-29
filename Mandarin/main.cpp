@@ -147,8 +147,10 @@ int main(int argc, char *argv[])
     {
 #ifdef MANDARIN_HAS_LIVE2D
         auto *live2dWin = new Live2DCharacterWindow();
-        //重载内容会真正装载模型；失败必须能感知，否则用户会得到一个看不见的桌宠。
-        live2dWin->reloadContent(live2dModel);
+        //装载模型与「应用心情」是两个入口：模型只在启动期装载一次（失败必须能感知，
+        //否则用户会得到一个看不见的桌宠）；之后每次 AI 回复只经 requestSetCharTachie
+        //→ reloadContent(心情名) 换情绪预设。
+        live2dWin->loadModel(live2dModel);
         if (live2dWin->isModelLoaded())
         {
             characterWin = live2dWin;
