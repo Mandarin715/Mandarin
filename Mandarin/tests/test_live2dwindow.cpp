@@ -4,20 +4,25 @@
 #include "../windows/character/live2dcharacterwindow.h"
 
 #include <QBitmap>
+#include <QCryptographicHash>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QImage>
 #include <QMouseEvent>
+#include <QPainter>
 #include <QPixmap>
 #include <QRegion>
 #include <QSettings>
+#include <QStringList>
 #include <QTemporaryDir>
 #include <QTest>
 #include <QThread>
 
 #include <algorithm>
+#include <cmath>
+#include <vector>
 
 /*Live2D 立绘窗口的端到端验证：真正要证伪的是「窗口只是个空白矩形」——
   也就是渲染帧确实被登记进窗口层、确实被画出来、并且穿透/命中判定确实来自模型 alpha。
@@ -52,6 +57,10 @@ class TestLive2DWindow : public QObject
     void fillsFrameInBothAxes();
     void loadsModelByDirectoryName();
     void reportsFullPipelineFrameCost();
+    /*回归断言：1.0x 下「登记帧 → 上屏」必须是精确拷贝（画布设备像素对齐）。*/
+    void paintsRegisteredFrameWithoutResampling();
+    /*诊断用：量「清晰度」在渲染管线的哪一段被吃掉。**只测量、不断言阈值。**/
+    void reportsSharpnessAcrossScales();
 
   private:
     static QString modelDir();
@@ -79,6 +88,46 @@ class TestLive2DWindow : public QObject
     static constexpr int kSolidRadius = 2;
     static bool findSolidPoint(const QImage &frame, const QRect &figureBounds,
                                int alphaThreshold, QPoint *output);
+
+    /*==========================================================
+      清晰度诊断（reportsSharpnessAcrossScales 专用）
+      ==========================================================
+
+      为什么这些量要一起报：单看"某个像素"完全分不清模糊来自哪里。
+      - 渲染器帧（renderedImage）与最终抓图（grab）在同一像素尺寸下对比，
+        才能判定 paintEvent 那一步到底有没有重采样（边界 D）；
+      - "只量 alpha>=250"这个掩码本身也会被重采样改变：图被缩小（下采样）时
+        羽化边缘会被吃得更多，掩码随之缩小，指标读数就跟着变。所以 D 的对比必须
+        额外用「双方都完全不透明的固定矩形」再量一次，把"掩码差异"从"真的被模糊"里剥出来。*/
+    struct SharpnessStats
+    {
+        /*只统计 alpha >= maskAlpha 且 4 邻域也都达标的像素（透明背景/羽化边缘不参与）*/
+        double laplacianVariance = 0.0; // 4 邻域 Laplacian 的方差
+        double meanGradient = 0.0;      // 中心差分梯度幅值的均值
+        double luminanceStdDev = 0.0;   // 亮度标准差：对照量，说明"图像本身有多少内容"
+        qint64 measuredPixels = 0;      // 进入统计的像素数（= 掩码面积）
+        QRect opaqueBounds;             // alpha>=maskAlpha 的包围盒（不管邻域）
+        /*整图测量时（restrictTo 为空）顺手求出的"自身与四邻域都 alpha>=maskAlpha"
+           的像素并集。D 的对比用它当固定矩形，保证矩形里每个像素真的都完全不透明。*/
+        QRect solidFill;
+        QSize imageSize;
+    };
+
+    /*只统计**完全不透明**的像素：alpha >= 250。
+      半透明羽化边缘与透明背景都不参与，所以指标量的是人物身上的纹理锐度，
+      而不是"背景有多大片"。透明像素的 RGB 在未预乘 RGBA 里可能是 0，
+      混进统计会把读数彻底污染 —— 这是本函数存在的第一个理由。*/
+    static constexpr int kOpaqueMaskAlpha = 250;
+
+    /*量一张图的锐度。maskAlpha 之外还可以给一个固定矩形 rect（图像像素坐标）：
+       给了就只量那个矩形（用来把"掩码被平滑"这个变量从对比里去掉）。*/
+    static SharpnessStats measureSharpness(const QImage &image, int maskAlpha,
+                                          const QRect &restrictTo = QRect());
+
+    /*两张**同尺寸**图的逐通道最大绝对差、以及有多少像素至少有一个通道不同。
+       diffPixels 按"任一通道不同"计一次。maxChannelDiff<0 表示尺寸不一致、无法比较。*/
+    static qint64 comparePixels(const QImage &expected, const QImage &actual,
+                                int *maxChannelDiff);
 };
 
 QString TestLive2DWindow::modelDir()
@@ -273,6 +322,211 @@ bool TestLive2DWindow::findSolidPoint(const QImage &frame, const QRect &figureBo
         }
     }
     return false;
+}
+
+/*==================== 清晰度测量的实现 ====================*/
+
+/*亮度的定义写死在这里（BT.601 权重的整数近似，全 0~255 量纲）：
+   清晰度指标只用于**同类图之间的相对比较**，所以只要处处用同一个定义即可，
+   不需要（也不该）引入色彩管理那套。*/
+static inline double luminanceAt(const uchar *rgbaLine, int x)
+{
+    return 0.299 * rgbaLine[x * 4 + 0] + 0.587 * rgbaLine[x * 4 + 1] +
+           0.114 * rgbaLine[x * 4 + 2];
+}
+
+TestLive2DWindow::SharpnessStats TestLive2DWindow::measureSharpness(const QImage &image,
+                                                                   int maskAlpha,
+                                                                   const QRect &restrictTo)
+{
+    SharpnessStats stats;
+    if (image.isNull())
+        return stats;
+
+    const QImage rgba = image.convertToFormat(QImage::Format_RGBA8888);
+    stats.imageSize = rgba.size();
+
+    const QRect domain =
+        restrictTo.isEmpty() ? rgba.rect() : restrictTo.intersected(rgba.rect());
+    if (domain.width() < 3 || domain.height() < 3)
+        return stats;
+
+    const int w = rgba.width();
+    const int h = rgba.height();
+    std::vector<double> lum(static_cast<size_t>(w) * h, 0.0);
+
+    /*先把不透明包围盒量出来（整图 alpha>=maskAlpha），再在包围盒里量锐度。
+       包围盒本身是要报的观察量：它说明"人物占了多少像素"，
+       没有它就看不出"渲染分辨率变大"到底有没有落到内容上。*/
+    int minX = w, minY = h, maxX = -1, maxY = -1;
+    for (int y = 0; y < h; ++y)
+    {
+        const uchar *line = rgba.constScanLine(y);
+        for (int x = 0; x < w; ++x)
+        {
+            if (line[x * 4 + 3] < maskAlpha)
+                continue;
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+        }
+    }
+    if (maxX < minX || maxY < minY)
+        return stats;
+    const QRect bbox(QPoint(minX, minY), QPoint(maxX, maxY));
+    stats.opaqueBounds = bbox;
+
+    /*统计域 = 包围盒（若给了固定矩形就用它）。再各收 1 像素：
+       4 邻域 Laplacian 与中心差分都要读到左右/上下邻居，
+       不收缩就会把"邻域越界"的钳位值当成真实梯度，边缘一圈读数会虚高。*/
+    const QRect body = (restrictTo.isEmpty() ? bbox : domain).intersected(bbox);
+    if (body.width() < 3 || body.height() < 3)
+        return stats;
+
+    const int x0 = body.left() + 1;
+    const int x1 = body.right() - 1;
+    const int y0 = body.top() + 1;
+    const int y1 = body.bottom() - 1;
+    if (x1 < x0 || y1 < y0)
+        return stats;
+
+    const int sx0 = std::max(0, body.left() - 1);
+    const int sy0 = std::max(0, body.top() - 1);
+    const int sx1 = std::min(w - 1, body.right() + 1);
+    const int sy1 = std::min(h - 1, body.bottom() + 1);
+
+    /*亮度只算一次，候选域内的像素顺便在这里缓存好*/
+    for (int y = sy0; y <= sy1; ++y)
+    {
+        const uchar *line = rgba.constScanLine(y);
+        for (int x = sx0; x <= sx1; ++x)
+            lum[static_cast<size_t>(y) * w + x] = luminanceAt(line, x);
+    }
+
+    /*参与统计的像素：自身 alpha 够，且四邻域也都够。
+       为什么要连邻域一起要求：只要有一个邻居是透明的（例如人物剪影的边缘），
+       那个邻居的 RGB 就不代表人物纹理，插进去算梯度等于量"人物和背景的落差"
+       而不是量"人物有多清晰"。*/
+    QList<QRect> solidRuns;
+    solidRuns.reserve(y1 - y0 + 1);
+
+    double sumLum = 0.0;
+    double sumLumSq = 0.0;
+    double sumLap = 0.0;
+    double sumLapSq = 0.0;
+    double sumGrad = 0.0;
+
+    for (int y = y0; y <= y1; ++y)
+    {
+        const uchar *line = rgba.constScanLine(y);
+        const uchar *above = rgba.constScanLine(y - 1);
+        const uchar *below = rgba.constScanLine(y + 1);
+        int runStart = -1;
+        for (int x = x0; x <= x1 + 1; ++x)
+        {
+            bool solid = false;
+            if (x <= x1)
+            {
+                solid = line[x * 4 + 3] >= maskAlpha && line[(x - 1) * 4 + 3] >= maskAlpha &&
+                        line[(x + 1) * 4 + 3] >= maskAlpha && above[x * 4 + 3] >= maskAlpha &&
+                        below[x * 4 + 3] >= maskAlpha;
+            }
+            if (solid && runStart < 0)
+            {
+                runStart = x;
+            }
+            else if (!solid && runStart >= 0)
+            {
+                solidRuns.append(QRect(runStart, y, x - runStart, 1));
+                runStart = -1;
+            }
+
+            if (!solid)
+                continue;
+
+            const double center = lum[static_cast<size_t>(y) * w + x];
+            const double left = lum[static_cast<size_t>(y) * w + (x - 1)];
+            const double right = lum[static_cast<size_t>(y) * w + (x + 1)];
+            const double up = lum[static_cast<size_t>(y - 1) * w + x];
+            const double down = lum[static_cast<size_t>(y + 1) * w + x];
+
+            /*4 邻域 Laplacian（中心 -4、上下左右各 +1）。纯色区域 = 0，
+               有纹理/边缘的地方绝对值大 —— 它的方差就是经典的清晰度指标：
+               图被模糊后高频被压掉，方差随之显著下降。*/
+            const double lap = 4.0 * center - (left + right + up + down);
+            /*中心差分梯度幅值：比 Laplacian 更直观的"相邻像素变化有多陡"*/
+            const double gx = (right - left) * 0.5;
+            const double gy = (down - up) * 0.5;
+            const double grad = std::sqrt(gx * gx + gy * gy);
+
+            sumLum += center;
+            sumLumSq += center * center;
+            sumLap += lap;
+            sumLapSq += lap * lap;
+            sumGrad += grad;
+            ++stats.measuredPixels;
+        }
+    }
+
+    if (stats.measuredPixels <= 0)
+        return stats;
+
+    const double n = static_cast<double>(stats.measuredPixels);
+    const double meanLum = sumLum / n;
+    const double meanLap = sumLap / n;
+    stats.laplacianVariance = sumLapSq / n - meanLap * meanLap;
+    if (stats.laplacianVariance < 0.0)
+        stats.laplacianVariance = 0.0; //浮点抵消
+    stats.meanGradient = sumGrad / n;
+    stats.luminanceStdDev =
+        std::sqrt(std::max(0.0, sumLumSq / n - meanLum * meanLum));
+
+    /*顺手把"完全不透明"的实心区域求并集：D 的对比要在同一个固定矩形里重量一次，
+       用实心区域而不是整个包围盒，才能保证矩形里每个像素真的都 alpha>=250
+       （人物剪影形状不规则，包围盒的四个角通常是透明的）。*/
+    if (restrictTo.isEmpty())
+    {
+        for (const QRect &run : solidRuns)
+            stats.solidFill = stats.solidFill.isNull() ? run : stats.solidFill.united(run);
+    }
+    return stats;
+}
+
+qint64 TestLive2DWindow::comparePixels(const QImage &expected, const QImage &actual,
+                                       int *maxChannelDiff)
+{
+    if (maxChannelDiff)
+        *maxChannelDiff = -1;
+    if (expected.isNull() || actual.isNull() || expected.size() != actual.size())
+        return -1;
+
+    const QImage a = expected.convertToFormat(QImage::Format_RGBA8888);
+    const QImage b = actual.convertToFormat(QImage::Format_RGBA8888);
+    int maxDiff = 0;
+    qint64 differing = 0;
+    for (int y = 0; y < a.height(); ++y)
+    {
+        const uchar *la = a.constScanLine(y);
+        const uchar *lb = b.constScanLine(y);
+        for (int x = 0; x < a.width(); ++x)
+        {
+            bool thisPixelDiffers = false;
+            for (int c = 0; c < 4; ++c)
+            {
+                const int d = qAbs(int(la[x * 4 + c]) - int(lb[x * 4 + c]));
+                if (d > maxDiff)
+                    maxDiff = d;
+                if (d > 0)
+                    thisPixelDiffers = true;
+            }
+            if (thisPixelDiffers)
+                ++differing;
+        }
+    }
+    if (maxChannelDiff)
+        *maxChannelDiff = maxDiff;
+    return differing;
 }
 
 /*装载模型 → 窗口按渲染帧定尺寸 → 帧被画出来 → 形状/命中判定确实来自 alpha*/
@@ -843,9 +1097,11 @@ void TestLive2DWindow::loadsModelByDirectoryName()
   控件侧的开销（QImage 拷贝、updateRenderedImage）与周期性的 QBitmap mask
   完全可能反超渲染本身。这条测试是把「能不能上高帧率」变成数字的地方。
 
-  三种配置都量：用户实际在用的档位（120fps，缩放 1.0 与 1.5 各一档 —— 这是"8.33ms 帧预算
+  配置都量：用户实际在用的档位（120fps，缩放 1.0 与 1.5 各一档 —— 这是"8.33ms 帧预算
   到底够不够"的唯一依据）与**代码默认值** 60fps / 1.0x（「弱机器开箱行为」的真实成本）。
-  三种配置都写进**临时**配置文件（见 initTestCase），用户的 config.ini 全程只读。
+  每一档还要在**用户真正在用的模型**（preferredModelName，当前 atri）上再量一遍：
+  每帧成本不只随分辨率走，也随模型的 drawable 数走，拿别的模型当替身是在报别人的数字。
+  所有配置都写进**临时**配置文件（见 initTestCase），用户的 config.ini 全程只读。
   注：帧率档位只影响定时器间隔，不影响这里的每帧成本 —— 两条 1.0x 行本就该给出同一个数字，
   分列出来是为了让"1.0x 该是多少"在日志里直接可查，不必自己推。*/
 void TestLive2DWindow::reportsFullPipelineFrameCost()
@@ -855,19 +1111,36 @@ void TestLive2DWindow::reportsFullPipelineFrameCost()
     if (!QFileInfo::exists(dir + QLatin1Char('/') + modelJsonName))
         QSKIP("本机没有初音模型（禁二传，不入库），跳过全链路帧成本测量");
 
+    // 用户实际在用的模型（config.ini 的 character/live2dModel，当前 atri）；没有就只量 miku
+    const QString userModel = preferredModelName();
+
     const struct
     {
         const char *label;
+        const char *model;
         int fps;
         double scale;
     } configurations[] = {
-        {"用户档位 120fps/1.5x", 120, 1.5},
-        {"用户档位 120fps/1.0x", 120, 1.0},
-        {"代码默认值 60fps/1.0x", 60, 1.0},
+        {"用户档位 120fps/1.5x", "atri", 120, 1.5},
+        {"用户档位 120fps/1.0x", "atri", 120, 1.0},
+        {"用户档位 120fps/1.5x", "miku", 120, 1.5},
+        {"用户档位 120fps/1.0x", "miku", 120, 1.0},
+        {"代码默认值 60fps/1.0x", "miku", 60, 1.0},
     };
 
+    int measured = 0;
     for (const auto &config : configurations)
     {
+        const QString modelName = QString::fromUtf8(config.model);
+        /*模型不入库：本机没有该模型目录就跳过这一行，而不是把整条用例废掉
+           （另一台上可能只有 miku 或只有 atri）。一行都没跑成会在末尾报错。*/
+        if (!QFileInfo::exists(modelDirFor(modelName)))
+        {
+            qInfo("跳过帧成本档位 [%s/%s]（本机没有该模型目录）", config.label,
+                  config.model);
+            continue;
+        }
+
         /*只写临时配置；不需要 RAII —— 临时目录随测试进程一起消失，
           而且下一个用例会自己再写一次，用户真实配置从头到尾没参与。*/
         {
@@ -878,8 +1151,10 @@ void TestLive2DWindow::reportsFullPipelineFrameCost()
         }
 
         Live2DCharacterWindow window;
-        window.reloadContent(QStringLiteral("miku"));
-        QVERIFY2(window.isModelLoaded(), "模型装载失败，无法量帧成本");
+        window.reloadContent(modelName);
+        QVERIFY2(window.isModelLoaded(),
+                 qPrintable(QStringLiteral("[%1] 模型装载失败，无法量帧成本")
+                                .arg(QString::fromUtf8(config.model))));
 
         // 必须真的显示一次：首次画布布局在 showEvent 里做（那时 dpr 才是真实值）
         window.show();
@@ -902,8 +1177,9 @@ void TestLive2DWindow::reportsFullPipelineFrameCost()
         const double msPerFrame = static_cast<double>(timer.elapsed()) / kFrames;
         const double fps = msPerFrame > 0.0 ? 1000.0 / msPerFrame : 0.0;
 
-        qInfo("全链路帧成本[%s]：逻辑 %dx%d，渲染 %dx%d，平均 %.2f ms/帧（约 %.1f fps），节拍 %d ms",
-              config.label, logical.width(), logical.height(), physical.width(),
+        qInfo("全链路帧成本[%s/%s]：逻辑 %dx%d，渲染 %dx%d，平均 %.2f ms/帧（约 %.1f fps），"
+              "节拍 %d ms",
+              config.label, config.model, logical.width(), logical.height(), physical.width(),
               physical.height(), msPerFrame, fps, window.frameIntervalMs());
 
         // 只做宽松退步警戒：真实数字靠上面日志观察，不在测试里卡死阈值。
@@ -911,7 +1187,562 @@ void TestLive2DWindow::reportsFullPipelineFrameCost()
                  qPrintable(QStringLiteral("[%1] 全链路每帧 %2 ms，慢到不可用")
                                 .arg(QString::fromUtf8(config.label))
                                 .arg(msPerFrame)));
+        ++measured;
     }
+
+    QVERIFY2(measured > 0, "一个档位都没量到（模型目录都不在），帧成本没有数据");
+}
+
+/*「上屏那一步是不是精确拷贝」——本文件里唯一一条关于绘制质量的**断言**（其余是测量）。
+
+  钉住的机理（已由纯 Qt 对照实验 test_devicepixelblit 单独证实，不依赖 Live2D）：
+  paintEvent 用 drawImage(rect(), m_scaledImg, 满源矩形) 把整帧铺满窗口。**源矩形给的是图像
+  像素、目标矩形是逻辑坐标**，所以 Qt 铺的是"帧像素网格 → 窗口设备像素网格（rect() × dpr）"；
+  只有帧的像素尺寸恰好等于窗口设备矩形才是 1:1。登记帧尺寸是 lround(canvas × dpr)，
+  窗口设备矩形是 canvas × dpr —— canvas × dpr 不是整数时两者必然差零点几个像素：
+  本机 atri 画布 400x938、dpr 1.25 ⇒ 登记帧 lround(938×1.25) = 1173 行，窗口设备矩形 1172.5 行。
+  1173 行被压进 1172.5 行（纵向比例 0.99957），逐行相位从 0 漂到 0.5 ——
+  这就是实测「登记帧 vs grab() 差 17.31% 像素、清晰度 −11.9%」的全部原因。
+  纯 Qt 对照实验里的数字：像素尺寸对不上 ⇒ 99.6% 像素不同、Laplacian 方差 −49%；
+  对得上 ⇒ 逐位相同、方差 +0.000%。
+
+  所以画布必须**设备像素对齐**：canvas × dpr 是整数 ⇔ canvas 是 dpr 既约分母的整数倍
+  （1.25→4、1.5→2、1.75→4、2.0→1、1.0→1）。本用例直接把这条不变量也断言掉，
+  这样以后谁把尺寸算法改回去，报错会指向根因而不是"像素差了多少"。
+
+  为什么只在 1.0x 断言「逐位一致」：live2dScale > 1 时绘制**本来就该**平滑下采样 ——
+  那是超采样换来的清晰度，不是 bug（对齐之后 1.5x 的上下比例恰好是精确的 1.5，
+  采样相位不再漂移，这一点由 reportsSharpnessAcrossScales 的测量日志观察）。*/
+void TestLive2DWindow::paintsRegisteredFrameWithoutResampling()
+{
+    const QString modelName = preferredModelName();
+    const QString dir = modelDirFor(modelName);
+    if (!QFileInfo::exists(dir))
+        QSKIP("本机没有用户配置的模型（禁二传，不入库），跳过绘制一致性验证");
+
+    // 只写临时配置：1.0x 才是"应当精确 1:1"的那一档
+    {
+        QSettings settings(m_tempConfigPath, QSettings::IniFormat);
+        settings.setValue("character/live2dFps", 120);
+        settings.setValue("character/live2dScale", 1.0);
+        settings.sync();
+    }
+
+    Live2DCharacterWindow window;
+    window.reloadContent(modelName);
+    QVERIFY2(window.isModelLoaded(), "模型装载失败，无法验证绘制一致性");
+
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QCoreApplication::processEvents();
+
+    // 冻住帧循环再自己渲一帧：保证"登记的帧"就是"被画的帧"（否则姿势会漂）
+    window.hide();
+    QCoreApplication::processEvents();
+    QVERIFY2(window.renderFrameNow(), "渲染失败");
+    QCoreApplication::processEvents();
+
+    const QImage registered = window.renderedImage();
+    QVERIFY2(!registered.isNull(), "登记帧为空");
+
+    const QSize logical = window.size();
+    const qreal dpr = window.devicePixelRatioF() > 0.0 ? window.devicePixelRatioF() : 1.0;
+    const double deviceW = logical.width() * dpr;
+    const double deviceH = logical.height() * dpr;
+
+    /*先**量**再断言：把"画布 × dpr 是不是整数"这个根因量打出来（这是本用例的算术证据），
+     断言放在逐像素比较之后 —— 这样修复前跑一次就能同时拿到"算术不对"与"像素差多少"两笔证据，
+     而不是第一条断言就把人拦在门外。
+     "两者逻辑尺寸差"那一项：帧的 dpr 取窗口 dpr（见 renderAndRegisterFrame），
+     所以它等价于"帧像素尺寸 − 窗口设备矩形"，也就是绘制那一步的纵向/横向比例 −1。*/
+    const bool deviceAligned =
+        std::abs(deviceW - std::round(deviceW)) < 1e-6 && std::abs(deviceH - std::round(deviceH)) < 1e-6;
+    qInfo("画布算术：逻辑 %dx%d × dpr %.4f = %.1fx%.1f（设备矩形 %dx%d），登记帧 %dx%d，"
+          "两者逻辑尺寸差 %.4fx%.4f 行/列，设备像素对齐=%s",
+          logical.width(), logical.height(), double(dpr), deviceW, deviceH, qRound(deviceW),
+          qRound(deviceH), registered.width(), registered.height(),
+          registered.width() / dpr - logical.width(), registered.height() / dpr - logical.height(),
+          deviceAligned ? "YES" : "NO");
+
+    // 登记帧自己的比例必须是窗口 dpr（paintEvent 的映射正是按它折算逻辑尺寸的）
+    QVERIFY2(qAbs(registered.devicePixelRatio() - dpr) < 1e-9,
+             "登记帧的 devicePixelRatio 不等于窗口 dpr，绘制映射的前提不成立");
+
+    const QPixmap grabbed = window.grab();
+    QVERIFY2(!grabbed.isNull(), "window.grab() 失败");
+
+    /*像素尺寸必须**完全一致**：精确拷贝不可能改变像素网格。
+      这一条不满足时后面的逐像素比较根本无从谈起（尺寸不同 = 一定发生了重采样）。*/
+    QCOMPARE(registered.size(), QSize(qRound(deviceW), qRound(deviceH)));
+    QCOMPARE(grabbed.toImage().size(), registered.size());
+
+    /*在哪个**色彩空间**比，是这条用例最容易搞错的地方，所以写清楚：
+
+      真正被屏幕合成的是**预乘** RGBA。登记帧给的是非预乘 RGBA8888，grab() 回来的是预乘格式，
+      于是有两种比法：
+        (1) 双方都折回非预乘 RGBA8888 再比 —— 直观，但 un-premultiply 在 alpha 很小时会把
+            舍入放大（alpha=3、预乘值差 1 级 ⇒ 非预乘差可达 ~85 级）。这样量到的是"报告格式的
+            舍入"，不是"画错了"；
+        (2) 双方都折到预乘 ARGB32_Premultiplied 再比 —— 与光栅引擎实际写入的数值同域，
+            这才是"上屏是不是精确拷贝"的正确判据。
+
+      两种都量、都打进日志，**断言用 (2)**；(1) 的数字留着当参照。实测（atri、dpr 1.25）：
+      (2) 预乘域 0/585000 个像素不同、maxChannelDiff=0 —— 绘制一个预乘字节都没动；
+      (1) 非预乘域有 9468 个像素不同（其中 3718 个差 >1，maxChannelDiff=10）——
+      把登记帧自己走一遍"预乘 → 非预乘"的往返（roundTrip），它在非预乘域与画出来的图**逐位相同**，
+      所以 (1) 的全部残差就是这条往返自身的舍入，跟绘制无关：登记帧是非预乘 RGBA8888，
+      而任何东西要上屏都必须经过预乘缓冲，低 alpha 像素的非预乘 RGB 在那里本来就存不下。
+
+      容差 1 级的理由：预乘转换用 (x·a+127)/255 取整，源侧与画侧各做一次，最坏差 1 级；
+      实测预乘域是逐位相同的（日志 premultMaxDiff=0），1 级只是留给别的 Qt 版本的余量。*/
+    constexpr int kPaintBlitTolerance = 1;
+    const QImage source = registered.convertToFormat(QImage::Format_RGBA8888);
+    const QImage painted = grabbed.toImage().convertToFormat(QImage::Format_RGBA8888);
+    const QImage premultSource =
+        registered.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    const QImage premultPainted =
+        grabbed.toImage().convertToFormat(QImage::Format_ARGB32_Premultiplied);
+
+    int rawMaxDiff = 0;
+    qint64 rawDiffering = 0;     // 非预乘空间：逐位不同的像素（修复前这一项占 17.31%）
+    qint64 rawOverTolerance = 0; // 非预乘空间：差 > 容差的像素
+    qint64 invisibleSkipped = 0; // 双方都全透明：非预乘 RGB 不可观察，跳过
+    int premultMaxDiff = 0;
+    qint64 premultDiffering = 0;
+    qint64 premultOverTolerance = 0;
+
+    for (int y = 0; y < source.height(); ++y)
+    {
+        const uchar *a = source.constScanLine(y);
+        const uchar *b = painted.constScanLine(y);
+        const uchar *pa = premultSource.constScanLine(y);
+        const uchar *pb = premultPainted.constScanLine(y);
+        for (int x = 0; x < source.width(); ++x)
+        {
+            if (a[x * 4 + 3] == 0 && b[x * 4 + 3] == 0)
+            {
+                ++invisibleSkipped;
+            }
+            else
+            {
+                int pixelMax = 0;
+                for (int c = 0; c < 4; ++c)
+                    pixelMax = std::max(pixelMax, qAbs(int(a[x * 4 + c]) - int(b[x * 4 + c])));
+                rawMaxDiff = std::max(rawMaxDiff, pixelMax);
+                if (pixelMax > 0)
+                    ++rawDiffering;
+                if (pixelMax > kPaintBlitTolerance)
+                    ++rawOverTolerance;
+            }
+
+            int premultPixelMax = 0;
+            for (int c = 0; c < 4; ++c)
+                premultPixelMax =
+                    std::max(premultPixelMax, qAbs(int(pa[x * 4 + c]) - int(pb[x * 4 + c])));
+            premultMaxDiff = std::max(premultMaxDiff, premultPixelMax);
+            if (premultPixelMax > 0)
+                ++premultDiffering;
+            if (premultPixelMax > kPaintBlitTolerance)
+                ++premultOverTolerance;
+        }
+    }
+
+    const qint64 total = static_cast<qint64>(painted.width()) * painted.height();
+
+    /*残差归因（免得把"报告格式的往返舍入"误当成"画错了"）：
+      让登记帧自己走一遍"预乘 → 非预乘"的往返，再与画出来的图在非预乘域比。
+      若两者逐位相同，就证明非预乘域的全部残差都来自 un-premultiply 的舍入放大，
+      绘制本身一个预乘字节都没动过。*/
+    const QImage roundTrip = premultSource.convertToFormat(QImage::Format_RGBA8888);
+    int roundTripMaxDiff = -1;
+    const qint64 roundTripDiff = comparePixels(roundTrip, painted, &roundTripMaxDiff);
+
+    qInfo("绘制一致性[%s]：画布 %dx%d × dpr %.3f = %dx%d（整数），登记帧 %dx%d、dpr %.3f，"
+          "抓图 %dx%d（帧格式 %d / 抓图格式 %d）| 预乘域：逐通道差 >%d 的像素 = %lld/%lld"
+          "（%.4f%%），maxChannelDiff=%d，逐位不同 %lld | 非预乘域：差 >%d 的像素 = %lld"
+          "（maxChannelDiff=%d，逐位不同 %lld）| 归因：un-premultiply 往返自身就造成 %lld 个"
+          "像素不同（maxChannelDiff=%d），全透明跳过 %lld",
+          qPrintable(modelName), logical.width(), logical.height(), double(dpr), qRound(deviceW),
+          qRound(deviceH), registered.width(), registered.height(),
+          double(registered.devicePixelRatio()), grabbed.width(), grabbed.height(),
+          int(registered.format()), int(grabbed.toImage().format()), kPaintBlitTolerance,
+          premultOverTolerance, total, premultOverTolerance * 100.0 / static_cast<double>(total),
+          premultMaxDiff, premultDiffering, kPaintBlitTolerance, rawOverTolerance, rawMaxDiff,
+          rawDiffering, roundTripDiff, roundTripMaxDiff, invisibleSkipped);
+
+    QVERIFY2(premultOverTolerance == 0,
+             qPrintable(QStringLiteral("上屏不是精确拷贝（预乘域）：%1/%2 像素的通道差超过 %3 级，"
+                                       "maxChannelDiff=%4。画布 %5x%6、登记帧 %7x%8，"
+                                       "逐通道差很小的残差只可能来自预乘舍入，而这里超了 %3 级")
+                            .arg(premultOverTolerance)
+                            .arg(total)
+                            .arg(kPaintBlitTolerance)
+                            .arg(premultMaxDiff)
+                            .arg(logical.width())
+                            .arg(logical.height())
+                            .arg(registered.width())
+                            .arg(registered.height())));
+
+    /*根因不变量（放在最后，见上面的说明）：画布必须设备像素对齐。
+      它保证"精确拷贝"不是碰巧成立，而是尺寸算法本身就排除了重采样。*/
+    QVERIFY2(deviceAligned,
+             qPrintable(QStringLiteral("画布 %1x%2 × dpr %3 = %4x%5 不是整数："
+                                       "登记帧的逻辑尺寸必然与窗口不等，上屏那一步只能重采样")
+                            .arg(logical.width())
+                            .arg(logical.height())
+                            .arg(double(dpr))
+                            .arg(deviceW)
+                            .arg(deviceH)));
+}
+
+/*「桌宠在屏幕上看着不清晰」——这条用例**只测量，不作断言**。
+
+  为什么不做成断言：清晰度没有客观的"及格线"。不同模型、不同姿势、不同时刻的读数
+  本来就会浮动，卡一个阈值只会变成偶发失败。这里把每个边界的数字打成日志、把可比对的图
+  存成 PNG，由人来看数字决定要不要改。（**"上屏是不是精确拷贝"那条是断言**，
+  在 paintsRegisteredFrameWithoutResampling 里，因为它有一条客观判据。）
+
+  管线与可能丢清晰度的位置：
+    [A] Cubism moc3 + 4096 宽贴图 → GL 渲染进离屏 FBO（分辨率 = 逻辑×dpr×live2dScale）
+    [B] glReadPixels → QImage（renderSize 那么大）
+    [C] 登记进窗口（m_scaledImg），其 devicePixelRatio 被设成**窗口自己的 dpr**
+    [D] paintEvent: drawImage(rect(), img) —— 不是精确 1:1 时 Qt 会重采样
+    [E] 上屏，屏幕 dpr 1.25（画布 936 逻辑 → 1170 设备像素，整数，所以 D 是精确拷贝）
+
+  本用例量四件事：
+    1) 缩放扫描 1.0 / 1.25 / 1.5 / 2.0，量**抓图**（= 真正上屏的东西）的锐度。
+       抓图在所有缩放下都是同一个设备像素尺寸，所以数字可以直接横着比。
+       （>1.0 的档位是超采样：绘制本来就要平滑下采样，掉一点方差是收益的代价。）
+    2) 边界 D：1.0x 下把"登记帧"与"画出来的抓图"在同一像素尺寸下逐像素比，
+       再用**同一个完全不透明矩形**重量一次，把"掩码被重采样"从"像素值被改"里剥出来。
+    3) 边界 E：把尺寸/dpr/rect 的算术原样打出来（画布 × dpr 是否整数，一眼可查）。
+    4) 存 1:1 裁切（不放大）与整张抓图到 build2/tests/live2d-probe/，供人眼像素级比对；
+       1.0x 那一轮额外存一张"登记帧"的同位置裁切，两图可以并排看。
+
+  配置隔离：缩放只写进 initTestCase 建好的**临时** ini（MANDARIN_CONFIG_INI），
+  用户的真实 config.ini 全程只读。（窗口侧读的是 settingsPath()，
+  applyFrameRateFromConfig 里那一处读 IniSettingPath 是帧率、本用例不碰。）*/
+void TestLive2DWindow::reportsSharpnessAcrossScales()
+{
+    const QString modelName = preferredModelName();
+    const QString dir = modelDirFor(modelName);
+    if (!QFileInfo::exists(dir))
+        QSKIP("本机没有用户配置的模型（禁二传，不入库），跳过清晰度测量");
+
+    const QDir appDir(QCoreApplication::applicationDirPath());
+    const QString outDir = appDir.absoluteFilePath(QStringLiteral("../live2d-probe"));
+    QVERIFY2(QDir().mkpath(outDir), qPrintable(QStringLiteral("建不出输出目录 %1").arg(outDir)));
+
+    /*ROI 比例固定：横取包围盒中间 45%、纵取上部 22%（脸/头发区）。
+       因为包围盒高度在所有缩放下都是同一个设备像素数（抓图尺寸恒定），
+       算出来的 ROI 尺寸也就恒定 —— 这正是"可以像素级横着比"的前提。*/
+    constexpr double kRoiWidthFraction = 0.45;
+    constexpr double kRoiHeightFraction = 0.22;
+
+    const auto regionOfInterest = [](const QRect &bbox) {
+        const int rw = std::max(8, static_cast<int>(bbox.width() * kRoiWidthFraction));
+        const int rh = std::max(8, static_cast<int>(bbox.height() * kRoiHeightFraction));
+        const int rx = bbox.x() + (bbox.width() - rw) / 2;
+        const int ry = bbox.y();
+        return QRect(rx, ry, rw, rh);
+    };
+
+    QStringList log;
+    const auto emitLog = [&log]() { qInfo().noquote() << log.join(QLatin1Char('\n')); };
+    /*内容指纹：用来回答"我对比的两张图，到底是不是同一帧"。
+       只报统计量（像素数/包围盒）分不出"改了姿势"和"改了像素值"，哈希能。*/
+    const auto contentHash = [](const QImage &img) {
+        const QImage rgba = img.convertToFormat(QImage::Format_RGBA8888);
+        return QString::fromLatin1(QCryptographicHash::hash(
+                                       QByteArray(reinterpret_cast<const char *>(rgba.constBits()),
+                                                  static_cast<int>(rgba.sizeInBytes())),
+                                       QCryptographicHash::Md5)
+                                       .toHex());
+    };
+
+    const double scales[] = {1.0, 1.25, 1.5, 2.0};
+    QSize roiSize;
+    bool roiSizeKnown = false;
+    QSize grabSizeAtScale1;
+    bool grabSizeAtScale1Known = false;
+
+    for (double scale : scales)
+    {
+        /*只写临时配置。窗口在 reloadContent() 里读它（applyRenderScaleFromConfig）。*/
+        {
+            QSettings settings(m_tempConfigPath, QSettings::IniFormat);
+            settings.setValue("character/live2dFps", 60);
+            settings.setValue("character/live2dScale", scale);
+            settings.sync();
+        }
+
+        log << QStringLiteral("SHARPNESS scale=%1 --------").arg(scale);
+
+        Live2DCharacterWindow window;
+        window.reloadContent(modelName);
+        QVERIFY2(window.isModelLoaded(),
+                 qPrintable(QStringLiteral("scale %1：模型装载失败").arg(scale)));
+
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        QCoreApplication::processEvents();
+
+        /*冻住帧循环（hideEvent 停表），再自己渲一帧：
+           这样"登记的帧"与"抓到的图"之间姿势不会自己漂移，D 的逐像素对比才成立。*/
+        window.hide();
+        QCoreApplication::processEvents();
+        QVERIFY2(window.renderFrameNow(), "渲染失败，无法量清晰度");
+        QCoreApplication::processEvents();
+
+        const QImage registered = window.renderedImage();
+        QVERIFY2(!registered.isNull(), "登记帧为空");
+        /*登记帧的内容指纹。抓图之后再取一次：两次一致 ⇒ 我比的是同一帧，
+           不一致 ⇒ 说明抓图过程本身让窗口换了一帧，D 的逐像素对比必须先排除这一项。*/
+        const QString registeredHashBefore = contentHash(registered);
+        /*抓图前后各读一次 dpr：抓图本身有可能改变窗口的 dpr（跨屏/重绘），
+           只读一次会分不清"登记时用的 dpr"和"抓图时用的 dpr"。*/
+        const qreal dprBeforeGrab = window.devicePixelRatioF();
+        const QPixmap grabbed = window.grab();
+        QVERIFY2(!grabbed.isNull(), "window.grab() 失败");
+        const qreal dprAfterGrab = window.devicePixelRatioF();
+        const QImage painted = grabbed.toImage().convertToFormat(QImage::Format_RGBA8888);
+        const QString registeredHashAfter = contentHash(registered);
+        log << QStringLiteral("  [3a] dpr before grab=%1 after grab=%2 (dpr used to compute "
+                              "renderSize = %3)")
+                   .arg(dprBeforeGrab)
+                   .arg(dprAfterGrab)
+                   .arg(dprBeforeGrab);
+        log << QStringLiteral("  [3b] registered content hash before grab=%1 after grab=%2 same=%3")
+                   .arg(registeredHashBefore)
+                   .arg(registeredHashAfter)
+                   .arg(registeredHashBefore == registeredHashAfter ? QStringLiteral("YES")
+                                                                    : QStringLiteral("NO"));
+
+        /*---- 实验 3：边界 E 的算术（每个缩放都打一遍，数字本身就是要报的量）----*/
+        const QSize logical = window.size();
+        const qreal dpr = window.devicePixelRatioF();
+        const QSize renderSize = window.renderSize();
+        const qreal logicalW = logical.width() * dpr;
+        const qreal logicalH = logical.height() * dpr;
+        const int roundedW = int(std::lround(logicalW));
+        const int roundedH = int(std::lround(logicalH));
+        const int truncatedW = int(logicalW);
+        const int truncatedH = int(logicalH);
+
+        log << QStringLiteral(
+                   "  [3] widget logical=%1x%2 dpr=%3 logical*dpr=%4x%5 (rounded %6x%7 / "
+                   "truncated %8x%9)")
+                   .arg(logical.width())
+                   .arg(logical.height())
+                   .arg(dpr)
+                   .arg(logicalW)
+                   .arg(logicalH)
+                   .arg(roundedW)
+                   .arg(roundedH)
+                   .arg(truncatedW)
+                   .arg(truncatedH);
+        log << QStringLiteral("      renderSize(registered image)=%1x%2  registered image dpr=%3 "
+                              " rect()=%4,%5 %6x%7")
+                   .arg(renderSize.width())
+                   .arg(renderSize.height())
+                   .arg(registered.devicePixelRatio())
+                   .arg(window.rect().x())
+                   .arg(window.rect().y())
+                   .arg(window.rect().width())
+                   .arg(window.rect().height());
+        const bool imageDprMatchesWindow = (qAbs(registered.devicePixelRatio() - dpr) < 1e-9);
+        const bool renderMatchesWindowDevicePixels = (renderSize == QSize(roundedW, roundedH));
+        QString dprMatch = imageDprMatchesWindow ? QStringLiteral("YES") : QStringLiteral("NO");
+        QString sizeMatch = renderMatchesWindowDevicePixels ? QStringLiteral("YES") : QStringLiteral("NO");
+        QString line3;
+        line3 = QStringLiteral("      grab painted image =%1x%2  grab pixmap dpr=%3")
+                    .arg(painted.width())
+                    .arg(painted.height())
+                    .arg(grabbed.devicePixelRatio());
+        line3 += QStringLiteral("  registered==window*dpr? %1 (diff %2x%3)")
+                     .arg(sizeMatch)
+                     .arg(renderSize.width() - roundedW)
+                     .arg(renderSize.height() - roundedH);
+        line3 += QStringLiteral("  registered image dpr==window dpr? %1").arg(dprMatch);
+        log << line3;
+
+        /*---- 实验 1：在抓图上量锐度（= 真正上屏的东西）----*/
+        const SharpnessStats paintedStats = measureSharpness(painted, kOpaqueMaskAlpha);
+
+        if (!roiSizeKnown)
+            roiSize = regionOfInterest(paintedStats.opaqueBounds).size();
+
+        QString line1 = QStringLiteral("  [1] grab  laplacianVariance=%1 meanGradient=%2 "
+                                       "lumStdDev=%3 opaquePixels=%4 bbox=%5,%6 %7x%8 "
+                                       "image=%9x%10")
+                            .arg(paintedStats.laplacianVariance, 0, 'f', 4)
+                            .arg(paintedStats.meanGradient, 0, 'f', 4)
+                            .arg(paintedStats.luminanceStdDev, 0, 'f', 4)
+                            .arg(paintedStats.measuredPixels)
+                            .arg(paintedStats.opaqueBounds.x())
+                            .arg(paintedStats.opaqueBounds.y())
+                            .arg(paintedStats.opaqueBounds.width())
+                            .arg(paintedStats.opaqueBounds.height())
+                            .arg(painted.width())
+                            .arg(painted.height());
+        line1 += QStringLiteral("  [roi probe %1x%2 from 1.0x]")
+                     .arg(roiSize.width())
+                     .arg(roiSize.height());
+        log << line1;
+
+        /*---- 实验 4：1:1 裁切（不放大）。裁切区一律从抓图的包围盒推出。----*/
+        const QRect roi = regionOfInterest(paintedStats.opaqueBounds);
+        if (!roiSizeKnown)
+        {
+            roiSize = roi.size();
+            roiSizeKnown = true;
+        }
+        else
+        {
+            /*ROI 尺寸跨缩放要基本一致（差几像素只是 alpha 阈值上的包围盒抖动，
+               它在"人物占 970 行、取上部 22%"下只影响裁切窗口在垂直方向 1~2 像素）。
+               这里用容差而不是严格相等：严格相等会变成偶发失败，
+               而这条用例的定位是**测量**，不该因为 1 像素抖动就中断整轮扫描。*/
+            const int tol = 4;
+            if (qAbs(roi.width() - roiSize.width()) > tol ||
+                qAbs(roi.height() - roiSize.height()) > tol)
+            {
+                log << QStringLiteral("  [4] WARNING roi size %1x%2 differs from %3x%4 by more than "
+                                      "%5 px - cross-scale crop comparison is not 1:1")
+                           .arg(roi.width())
+                           .arg(roi.height())
+                           .arg(roiSize.width())
+                           .arg(roiSize.height())
+                           .arg(tol);
+            }
+        }
+
+        const QString cropPath =
+            QDir(outDir).absoluteFilePath(QStringLiteral("sharpness-crop-scale%1.png").arg(scale));
+        const QString fullPath =
+            QDir(outDir).absoluteFilePath(QStringLiteral("sharpness-full-scale%1.png").arg(scale));
+        QVERIFY2(painted.copy(roi).save(cropPath),
+                 qPrintable(QStringLiteral("写不出 %1").arg(cropPath)));
+        QVERIFY2(grabbed.save(fullPath), qPrintable(QStringLiteral("写不出 %1").arg(fullPath)));
+        log << QStringLiteral("  [4] crop roi=%1,%2 %3x%4 -> %5")
+                   .arg(roi.x())
+                   .arg(roi.y())
+                   .arg(roi.width())
+                   .arg(roi.height())
+                   .arg(cropPath);
+        log << QStringLiteral("      full grab -> %1").arg(fullPath);
+
+        /*---- 实验 2：只在 1.0x 上做边界 D 的逐像素对比 ----*/
+        if (qFuzzyCompare(scale, 1.0))
+        {
+            grabSizeAtScale1 = painted.size();
+            grabSizeAtScale1Known = true;
+
+            /*登记帧自己也量一份（同一套指标），用来回答"损失是在 B/C 就发生了，
+               还是 D 又补了一刀"。*/
+            const SharpnessStats registeredStats =
+                measureSharpness(registered, kOpaqueMaskAlpha);
+            log << QStringLiteral("  [1'] registered (pre-paint) lapVar=%1 grad=%2 lumStdDev=%3 "
+                                  "opaquePixels=%4 bbox=%5,%6 %7x%8")
+                       .arg(registeredStats.laplacianVariance, 0, 'f', 4)
+                       .arg(registeredStats.meanGradient, 0, 'f', 4)
+                       .arg(registeredStats.luminanceStdDev, 0, 'f', 4)
+                       .arg(registeredStats.measuredPixels)
+                       .arg(registeredStats.opaqueBounds.x())
+                       .arg(registeredStats.opaqueBounds.y())
+                       .arg(registeredStats.opaqueBounds.width())
+                       .arg(registeredStats.opaqueBounds.height());
+
+            log << QStringLiteral("  [2] boundary D @1.0x: registered=%1x%2 painted=%3x%4")
+                       .arg(registered.width())
+                       .arg(registered.height())
+                       .arg(painted.width())
+                       .arg(painted.height());
+
+            if (registered.size() == painted.size())
+            {
+                int maxDiff = 0;
+                const qint64 differing = comparePixels(registered, painted, &maxDiff);
+                const qint64 total = static_cast<qint64>(painted.width()) * painted.height();
+                log << QStringLiteral(
+                           "      registered vs painted: maxChannelDiff=%1 differingPixels=%2/%3 "
+                           "(%4%)")
+                           .arg(maxDiff)
+                           .arg(differing)
+                           .arg(total)
+                           .arg(differing * 100.0 / static_cast<double>(total), 0, 'f', 5);
+
+                /*固定矩形对照：矩形取"登记帧里自身与四邻域都完全不透明"的区域，
+                   两张图用**同一个**矩形重量一次。这样差异只可能来自"像素值被改"
+                   （重采样），而不是"掩码边界被重采样改变"——整图口径会把这两者混在一起。*/
+                const QRect solidRoi = regionOfInterest(registeredStats.solidFill);
+                if (!solidRoi.isEmpty() && registeredStats.solidFill.contains(solidRoi))
+                {
+                    const SharpnessStats regInRoi =
+                        measureSharpness(registered, kOpaqueMaskAlpha, solidRoi);
+                    const SharpnessStats paintInRoi =
+                        measureSharpness(painted, kOpaqueMaskAlpha, solidRoi);
+                    log << QStringLiteral(
+                               "      fixed ROI=%1,%2 %3x%4 (all alpha>=250): registered "
+                               "lapVar=%5 grad=%6 px=%7 | painted lapVar=%8 grad=%9 px=%10 "
+                               "(%11%)")
+                               .arg(solidRoi.x())
+                               .arg(solidRoi.y())
+                               .arg(solidRoi.width())
+                               .arg(solidRoi.height())
+                               .arg(regInRoi.laplacianVariance, 0, 'f', 4)
+                               .arg(regInRoi.meanGradient, 0, 'f', 4)
+                               .arg(regInRoi.measuredPixels)
+                               .arg(paintInRoi.laplacianVariance, 0, 'f', 4)
+                               .arg(paintInRoi.meanGradient, 0, 'f', 4)
+                               .arg(paintInRoi.measuredPixels)
+                               .arg((paintInRoi.laplacianVariance - regInRoi.laplacianVariance) *
+                                        100.0 / std::max(1e-9, regInRoi.laplacianVariance),
+                                    0, 'f', 3);
+                }
+                else
+                {
+                    log << QStringLiteral("      fixed ROI skipped: solidFill=%1,%2 %3x%4")
+                               .arg(registeredStats.solidFill.x())
+                               .arg(registeredStats.solidFill.y())
+                               .arg(registeredStats.solidFill.width())
+                               .arg(registeredStats.solidFill.height());
+                }
+            }
+            else
+            {
+                /*尺寸不同 = 绘制改变了像素网格，逐像素比较无从谈起。
+                   对齐修复之后这条分支不该再出现；真出现了，先看 [3] 那行的
+                   "logical*dpr" 与"registered image"对不对得上。*/
+                log << QStringLiteral("      sizes differ (%1x%2 vs %3x%4) -> no 1:1 blit at 1.0x; "
+                                      "per-pixel compare skipped")
+                           .arg(registered.width())
+                           .arg(registered.height())
+                           .arg(painted.width())
+                           .arg(painted.height());
+            }
+
+            const QString regCropPath = QDir(outDir).absoluteFilePath(
+                QStringLiteral("sharpness-crop-scale1.0-registered.png"));
+            QVERIFY2(registered.copy(roi).save(regCropPath),
+                     qPrintable(QStringLiteral("写不出 %1").arg(regCropPath)));
+            log << QStringLiteral("  [4] registered crop -> %1").arg(regCropPath);
+        }
+
+        emitLog();
+        log.clear();
+    }
+
+    QVERIFY2(grabSizeAtScale1Known, "1.0x 那一轮没跑到，实验 2 没数据");
+    log << QStringLiteral("SHARPNESS summary: ROI size=%1x%2 (constant across scales), "
+                          "grab size @1.0x=%3x%4")
+               .arg(roiSize.width())
+               .arg(roiSize.height())
+               .arg(grabSizeAtScale1.width())
+               .arg(grabSizeAtScale1.height());
+    log << QStringLiteral("SHARPNESS note: this is a MEASUREMENT, not an assertion - "
+                          "no sharpness threshold is enforced.");
+    emitLog();
 }
 
 QTEST_MAIN(TestLive2DWindow)

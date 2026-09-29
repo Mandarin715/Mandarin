@@ -2,6 +2,8 @@
 
 #include "../../GlobalConstants.h"
 
+#include "../../utils/DevicePixelAlign.h"
+
 #include <QDebug>
 #include <QDir>
 #include <QFileInfo>
@@ -78,10 +80,13 @@ Live2DCharacterWindow::~Live2DCharacterWindow()
         m_frameTimer->stop();
 }
 
-/*帧率：character/live2dFps，默认 60，夹取 [5,240]*/
+/*帧率：character/live2dFps，默认 60，夹取 [5,240]
+  经 settingsPath() 读取（不是 IniSettingPath）：测试要把配置重定向到临时文件，
+  漏掉这一处会让"测试写进临时文件的帧率"被静默忽略、实际读的是用户真实配置 ——
+  那样跟帧率有关的断言就是在依赖用户本机的值。*/
 void Live2DCharacterWindow::applyFrameRateFromConfig()
 {
-    QSettings settings(IniSettingPath, QSettings::IniFormat);
+    QSettings settings(settingsPath(), QSettings::IniFormat);
     const int fps =
         clampInt(settings.value("character/live2dFps", kDefaultFps).toInt(),
                  kMinFps, kMaxFps);
@@ -293,7 +298,26 @@ void Live2DCharacterWindow::relayoutContent()
         }
     }
 
-    const QSize canvasSize(canvasWidth, canvasHeight);
+    /*设备像素对齐（"上屏发糊"的根因修复，别删）：
+
+      paintEvent 这样铺满窗口：drawImage(rect(), m_scaledImg, 满源矩形)。**源矩形给的是图像
+      像素，目标矩形是逻辑坐标**，所以 Qt 是把 img 的像素网格铺到窗口的**设备**像素网格
+      （rect() × dpr）上 —— 只有 img 的像素尺寸恰好等于 rect() × dpr 才是 1:1 拷贝。
+      登记帧尺寸是 lround(canvas × dpr)，窗口设备矩形是 canvas × dpr，于是 canvas × dpr
+      不是整数时两者必然差着零点几个像素：本机 atri 画布 400x938、dpr 1.25 ⇒ 登记帧 1173 行、
+      窗口设备矩形 1172.5 行，1173 行被压进 1172.5 行（纵向比例 0.99957），逐行相位从 0 漂到 0.5。
+
+      实测代价：登记帧 vs grab() 有 17.31% 的像素不同、清晰度（4 邻域 Laplacian 方差）−11.9%。
+      纯 Qt 对照实验（test_devicepixelblit）把因果钉死：同样的绘制代码、同样的 dpr，
+      **像素尺寸对不上** ⇒ 99.6% 像素不同、方差 −49%；**对得上** ⇒ 逐位相同、方差 +0.000%。
+      回归断言：test_live2dwindow::paintsRegisteredFrameWithoutResampling。
+
+      步长按 dpr 推（1.25→4、1.5→2、1.75→4、2.0→1、1.0→1），不写死 4。
+      宽度偏差直接等于人物被拉伸的比例，已由 utils/DevicePixelAlign.h 压到 <0.3%，实际数字见下面的日志。*/
+    const int alignStep = devicePixelAlignStep(devicePixelRatioF());
+    const QSize idealCanvas(canvasWidth, canvasHeight);
+    const QSize canvasSize = devicePixelAlignedCanvasSize(
+        idealCanvas, m_figureAspect, alignStep, idealCanvas, kMinCanvasSide, kMaxCanvasSide);
 
     /*目标占比：横竖同一个值。分轴摆放让"目标占比"变成精确值（fit = 2*占比/跨度，
       而跨度来自同一把尺子的探针），所以这里不再需要解析式给初值 ——
@@ -305,10 +329,17 @@ void Live2DCharacterWindow::relayoutContent()
 
     resize(canvasSize);
     m_logicalCanvasSize = canvasSize;
+    // 记下这次布局用的 dpr：画布尺寸是"按这个 dpr 对齐"定的，dpr 一变对齐就失效
+    m_layoutDpr = devicePixelRatioF();
 
     qInfo() << "Live2D 画布:" << canvasSize << " 目标人物高" << targetFigureHeight
-            << " 目标占比" << kTargetFigureRatio << " | 人物真实宽高比" << m_figureAspect
-            << " 探针跨度" << m_figureSpanX << "x" << m_figureSpanY;
+            << " 目标占比" << kTargetFigureRatio << " | 设备像素对齐步长" << alignStep
+            << "（未对齐的理想尺寸" << idealCanvas << "，宽高比偏差"
+            << (static_cast<double>(canvasSize.width()) / canvasSize.height() - m_figureAspect) /
+                   std::max(1e-6, m_figureAspect) * 100.0
+            << "%）"
+            << " | 人物真实宽高比" << m_figureAspect << " 探针跨度" << m_figureSpanX << "x"
+            << m_figureSpanY;
 
     if (!renderAndRegisterFrame())
     {
@@ -636,14 +667,20 @@ void Live2DCharacterWindow::paintEvent(QPaintEvent *event)
     painter.drawImage(rect(), m_scaledImg,
                       QRectF(0, 0, m_scaledImg.width(), m_scaledImg.height()));
 
-    // 画布尺寸与窗口不一致时按当前 dpr 重排重渲，然后交给下一帧绘制。
+    // 画布尺寸与窗口不一致、或 dpr 变了时按当前 dpr 重排重渲，然后交给下一帧绘制。
     // 为什么需要：窗口未映射到屏幕前 devicePixelRatioF() 给不出真实值（本机 1.0 vs 实际 1.25），
     // 首帧画布是按错 dpr 定的；映射后尺寸/分辨率都不会自己变好，必须在真实的 dpr 下再排一次。
     // （顺带也覆盖了用户改窗口尺寸、跨屏 dpr 变化等情况。）
-    if (!m_renderingFrame && !m_logicalCanvasSize.isEmpty() && m_logicalCanvasSize != size())
+    // 为什么要单独看 dpr：画布尺寸是按"canvas × dpr 为整数"对齐定下来的，dpr 一变对齐就失效。
+    // 跨屏/改缩放时 dpr 与逻辑尺寸**通常**一起变（物理尺寸不变 ⇒ 逻辑尺寸 = 物理 ÷ dpr 也变），
+    // 但两者并不等价（系统只改缩放比例、窗口不挪的情况就只变 dpr），所以两个条件都看：
+    // 多存一个 dpr 的代价可以忽略，漏掉一次重排的代价是"整帧被重采样、看不清"。
+    const qreal currentDpr = devicePixelRatioF();
+    if (!m_renderingFrame && !m_logicalCanvasSize.isEmpty() &&
+        (m_logicalCanvasSize != size() || qAbs(m_layoutDpr - currentDpr) > 1e-9))
     {
-        qInfo() << "Live2D 画布" << m_logicalCanvasSize << "与窗口" << size()
-                << "不一致，按 dpr" << devicePixelRatioF() << "重排";
+        qInfo() << "Live2D 画布" << m_logicalCanvasSize << "与窗口" << size() << "不一致，或 dpr 由"
+                << m_layoutDpr << "变为" << currentDpr << "：按 dpr" << currentDpr << "重排";
         relayoutContent();
     }
 }

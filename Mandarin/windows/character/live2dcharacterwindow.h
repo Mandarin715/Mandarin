@@ -179,6 +179,12 @@ class Live2DCharacterWindow : public CharacterWindowBase
       导致 contentSize() 与 size() 打架。直接把布局时定下来的尺寸记下来最可靠。*/
     QSize m_logicalCanvasSize;
 
+    /*最近一次布局时窗口的 dpr。画布尺寸是按「canvas × dpr 为整数」对齐定下来的
+      （见 relayoutContent 的说明与 utils/DevicePixelAlign.h），所以 dpr 一变对齐就失效、必须重排。
+      为什么不只比 m_logicalCanvasSize 与 size()：dpr 与逻辑尺寸通常一起变，但并不等价
+      （系统只改缩放比例、窗口不挪时只变 dpr），多存一个 dpr 是廉价保险。*/
+    qreal m_layoutDpr = 0.0;
+
     /*reloadContent 在窗口还没映射时只记模型名，真正的首次布局推迟到 showEvent
       （那时 devicePixelRatioF() 才是真实值）。*/
     QString m_pendingModelName;

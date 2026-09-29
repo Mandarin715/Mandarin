@@ -524,6 +524,38 @@ if(BUILD_TESTING)
     )
     add_test(NAME test_tachiegeometry COMMAND test_tachiegeometry)
 
+    # 绘制步的几何验证：drawImage(rect(), img) 只有在 img 的**逻辑**尺寸等于控件逻辑尺寸时
+    # 才是 1:1 拷贝（否则 Qt 会重采样）。纯 Qt Widgets，不需要模型、不需要 GL。
+    add_executable(test_devicepixelblit
+        tests/test_devicepixelblit.cpp
+    )
+    target_link_libraries(test_devicepixelblit PRIVATE
+        Qt${QT_VERSION_MAJOR}::Test
+        Qt${QT_VERSION_MAJOR}::Gui
+        Qt${QT_VERSION_MAJOR}::Widgets
+    )
+    set_target_properties(test_devicepixelblit PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    # 与其它测试同样的运行时依赖：QApplication 需要一个平台插件才能建窗口
+    add_custom_command(TARGET test_devicepixelblit POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "$<TARGET_FILE_DIR:Qt${QT_VERSION_MAJOR}::Core>/../plugins/platforms"
+            "$<TARGET_FILE_DIR:test_devicepixelblit>/platforms"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Test>"
+            "$<TARGET_FILE_DIR:test_devicepixelblit>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Core>"
+            "$<TARGET_FILE_DIR:test_devicepixelblit>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Gui>"
+            "$<TARGET_FILE_DIR:test_devicepixelblit>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Widgets>"
+            "$<TARGET_FILE_DIR:test_devicepixelblit>"
+    )
+    add_test(NAME test_devicepixelblit COMMAND test_devicepixelblit)
+
     # Cubism Core 编译/链接冒烟（不依赖 Qt；用静态库，无需拷贝 DLL）
     if(WIN32 AND CUBISM_CORE_LIB)
         add_executable(test_cubismcore tests/test_cubismcore.cpp)
