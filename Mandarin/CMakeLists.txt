@@ -653,6 +653,7 @@ if(BUILD_TESTING)
             utils/Live2DOffscreenRenderer.cpp
             utils/Live2DCubismRuntime.cpp
             utils/Live2DModelInfo.cpp
+            utils/Live2DMoodPreset.cpp
             utils/AudioEnvelope.cpp
         )
         target_include_directories(test_live2doffscreen PRIVATE

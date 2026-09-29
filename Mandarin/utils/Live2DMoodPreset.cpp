@@ -4,12 +4,14 @@
 
 #include <QDir>
 #include <QFile>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
 #include <QJsonValue>
 
 #include <algorithm>
+#include <cmath>
 
 namespace
 {
@@ -51,6 +53,13 @@ bool isUpdaterOwnedSemanticName(const QString &semanticName)
     return semanticName == QStringLiteral("breath") || semanticName == QStringLiteral("hairFront") ||
            semanticName == QStringLiteral("hairSide") || semanticName == QStringLiteral("hairBack");
 }
+/*待机摆动的幅度"体量"警戒线：占参数**声明量程**的比例。
+
+  为什么要有这条且只告警、不阻止：摆动是**加**在心情值上的，幅度一旦接近量程的一半，
+  波峰就会被夹到上下限上削平 —— 屏幕上从"换重心"变成"抽搐"。但"多大算合适"终究是审美，
+  数据作者可能故意要一个夸张的效果，所以这里只在他可能没意识到的时候提醒一句，
+  不替他做决定（与 mood 数据的"越界会被夹取"告警同一种态度）。*/
+constexpr float kIdleSwayAmplitudeWarnRatio = 0.2f;
 } // namespace
 
 bool Live2DMoodPreset::isUpdaterOwnedParameter(const QString &parameterId)
@@ -97,6 +106,26 @@ void Live2DMoodPreset::clearAll()
     m_unknownSemanticNames.clear();
     m_clampedDeltas.clear();
     m_warnedUnknownMoods.clear();
+    /*摆动状态也要清：load() 会重新推导模型目录，上一份摆动数据（可能来自另一个模型）
+       留在表里就会继续往新模型上写参数 —— 那是最难查的一类错。*/
+    clearIdle();
+}
+
+void Live2DMoodPreset::clearIdle()
+{
+    m_idleSwayEnabled = false;
+    m_idleSwayEntries.clear();
+    m_idleOversizedAmplitudes.clear();
+    m_idleOddPhases.clear();
+}
+
+bool Live2DMoodPreset::failIdle(const QString &reason)
+{
+    clearIdle();
+    /*⚠️ 只关摆动：**绝不碰 m_enabled**。idle.json 是可选的（用户数据区里可能根本没有），
+       把它并进情绪功能的失败路径会让"还没配摆动"变成"她连表情都没了"。*/
+    qWarning() << "[Live2D idle] disabled:" << reason;
+    return false;
 }
 
 bool Live2DMoodPreset::fail(const QString &reason)
@@ -242,6 +271,166 @@ bool Live2DMoodPreset::load(const QString &modelName)
             << m_archetypeDeltas.size() << "moodAliases" << m_moodAliases.size() << "dir"
             << m_modelDir;
     return true;
+}
+
+/*装载待机摆动数据（presets/idle.json）。见头文件：与情绪预设**分开**装载，缺了它只是
+   不做摆动，情绪功能照常。
+
+  两个细节值得说明：
+
+  1. **语义名 → 真实参数 ID 的解析在这里做**（而不是留给渲染器）：渲染器只认参数 ID、
+     只认模型自己声明的范围，让它去理解"bodyZ 是什么意思"就是把数据 schema 漏进渲染层。
+     解析放在数据层还带来一个好处：错字/换模型导致的无效条目在**装载时**就能汇总报出来，
+     而不是每帧静默扔掉。
+  2. **驱动器/物理占用的参数一律剔除**（breath / hairFront / hairSide / hairBack）：
+     与情绪预设同一条纪律（见 isUpdaterOwnedParameter）。数据里写了就跳过并告警 ——
+     那种"我明明配了它却不动"的现象必须有人告诉作者。*/
+bool Live2DMoodPreset::loadIdle(const QString &pathOverride)
+{
+    clearIdle();
+
+    if (m_modelDir.isEmpty() && pathOverride.isEmpty())
+        return failIdle(QStringLiteral("模型目录未知（情绪预设还没装载成功？）"));
+
+    const QString path = pathOverride.isEmpty()
+                             ? QDir(m_modelDir).filePath(QStringLiteral("presets/idle.json"))
+                             : pathOverride;
+
+    QJsonObject root;
+    QString error;
+    if (!readJsonObject(path, &root, &error))
+        return failIdle(error);
+
+    const QJsonArray sway = root.value(QStringLiteral("sway")).toArray();
+    if (sway.isEmpty())
+        return failIdle(QStringLiteral("%1 里没有非空的 sway 列表").arg(path));
+
+    QStringList skippedUnknown;  //语义名在 parameter-map 里没有（错字/换了模型）
+    QStringList skippedUpdater;  //驱动器/物理占用的参数（写了也不会生效）
+    QStringList badEntries;      //缺字段或数值非法
+    int index = -1;
+    for (const QJsonValue &value : sway)
+    {
+        ++index;
+        const QJsonObject item = value.toObject();
+        const QString semanticName =
+            item.value(QStringLiteral("parameter")).toString().trimmed();
+        const QJsonValue amplitudeValue = item.value(QStringLiteral("amplitude"));
+        const QJsonValue periodValue = item.value(QStringLiteral("period"));
+        const QJsonValue phaseValue = item.value(QStringLiteral("phase"));
+        /*缺 amplitude/period 的条目直接丢掉：它们没有"合理默认值"可言（0 幅度 = 不摆动，
+           1 秒周期 = 抖动）。phase 例外：缺省按 0（= 与其它轴同相，虽然不理想，但不危险）。*/
+        if (semanticName.isEmpty() || !amplitudeValue.isDouble() || !periodValue.isDouble())
+        {
+            badEntries.append(QStringLiteral("#%1(%2) 缺 parameter/amplitude/period")
+                                  .arg(index)
+                                  .arg(semanticName));
+            continue;
+        }
+
+        const float amplitude = static_cast<float>(amplitudeValue.toDouble());
+        const float period = static_cast<float>(periodValue.toDouble());
+        const float phase =
+            phaseValue.isDouble() ? static_cast<float>(phaseValue.toDouble()) : 0.0f;
+        if (!std::isfinite(amplitude) || !std::isfinite(period) || !std::isfinite(phase) ||
+            amplitude <= 0.0f || period <= 0.0f)
+        {
+            badEntries.append(QStringLiteral("#%1(%2) 幅度/周期非正或非有限数")
+                                  .arg(index)
+                                  .arg(semanticName));
+            continue;
+        }
+
+        const ParameterRange range = m_parameters.value(semanticName);
+        if (range.id.isEmpty())
+        {
+            skippedUnknown.append(semanticName);
+            continue;
+        }
+        if (isUpdaterOwnedParameter(range.id) || isUpdaterOwnedSemanticName(semanticName))
+        {
+            skippedUpdater.append(range.id);
+            continue;
+        }
+
+        const float span = range.max - range.min;
+        if (span > 0.0f && amplitude > span * kIdleSwayAmplitudeWarnRatio)
+        {
+            m_idleOversizedAmplitudes.append(
+                QStringLiteral("%1=%2（量程 %3 的 %4%）")
+                    .arg(range.id)
+                    .arg(double(amplitude))
+                    .arg(double(span))
+                    .arg(double(amplitude / span * 100.0)));
+        }
+        if (phase < 0.0f || phase >= 1.0f)
+        {
+            /*相位是周期分数：写在 [0,1) 之外**不影响结果**（sin 是周期函数），
+               但它通常意味着作者用的是弧度/角度 —— 那条线迟早要踩，所以报一句。*/
+            m_idleOddPhases.append(QStringLiteral("%1=%2").arg(range.id).arg(double(phase)));
+        }
+
+        IdleSwayEntry entry;
+        entry.semanticName = semanticName;
+        entry.parameterId = range.id;
+        entry.amplitude = amplitude;
+        entry.periodSeconds = period;
+        entry.phase = phase;
+        m_idleSwayEntries.append(entry);
+    }
+
+    auditIdleSway();
+    if (!skippedUnknown.isEmpty())
+    {
+        skippedUnknown.sort();
+        qWarning() << "[Live2D idle] parameter-map has no such semantic name, entries ignored:"
+                   << skippedUnknown;
+    }
+    if (!skippedUpdater.isEmpty())
+    {
+        skippedUpdater.sort();
+        qWarning() << "[Live2D idle] never sway updater/physics-owned parameters, skipped:"
+                   << skippedUpdater;
+    }
+    if (!badEntries.isEmpty())
+        qWarning() << "[Live2D idle] malformed entries ignored:" << badEntries;
+
+    if (m_idleSwayEntries.isEmpty())
+        return failIdle(QStringLiteral("%1 里没有一条可用条目（见上面的告警）").arg(path));
+
+    m_idleSwayEnabled = true;
+    QStringList axes;
+    for (const IdleSwayEntry &entry : m_idleSwayEntries)
+    {
+        axes.append(QStringLiteral("%1(amp %2/period %3s/phase %4)")
+                        .arg(entry.parameterId)
+                        .arg(double(entry.amplitude))
+                        .arg(double(entry.periodSeconds))
+                        .arg(double(entry.phase)));
+    }
+    qInfo() << "[Live2D idle] ready:" << m_idleSwayEntries.size() << "axes" << axes << "dir"
+            << m_modelDir;
+    return true;
+}
+
+/*摆动数据的体检（不改数据、只报告）：幅度超过量程警戒线、相位写在 [0,1) 之外。
+   与 auditArchetypeDeltas 同一种态度 —— 数据问题在装载时报一次，不要每帧刷屏。*/
+void Live2DMoodPreset::auditIdleSway()
+{
+    if (!m_idleOversizedAmplitudes.isEmpty())
+    {
+        m_idleOversizedAmplitudes.sort();
+        qWarning() << "[Live2D idle] amplitude above" << kIdleSwayAmplitudeWarnRatio * 100.0f
+                   << "% of the declared range (可能会顶到上下限被削平):"
+                   << m_idleOversizedAmplitudes;
+    }
+    if (!m_idleOddPhases.isEmpty())
+    {
+        m_idleOddPhases.sort();
+        qWarning() << "[Live2D idle] phase is a cycle fraction in [0,1), these look like "
+                      "radians/degrees (sin 是周期函数，结果一样，但请按约定写):"
+                   << m_idleOddPhases;
+    }
 }
 
 /*装载后对**原始数据**做一遍体检（不改数据，只报告）：

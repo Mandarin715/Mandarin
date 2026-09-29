@@ -1,10 +1,13 @@
 #ifndef LIVE2DOFFSCREENRENDERER_H
 #define LIVE2DOFFSCREENRENDERER_H
 
+#include "Live2DMoodPreset.h"
+
 #include <QHash>
 #include <QImage>
 #include <QSize>
 #include <QString>
+#include <QVector>
 
 #include <memory>
 
@@ -262,6 +265,43 @@ class Live2DOffscreenRenderer
       解冻后的第一帧）。*/
     void setNextFrameDeltaSeconds(float seconds);
     void clearNextFrameDelta();
+
+    /***待机摆动（idle sway）**：让角色"站着、重心在动"，而不是只有呼吸。
+
+      数据来自 `<模型目录>/presets/idle.json`（由 Live2DMoodPreset::loadIdle 装载，并已完成
+      "语义名 → 参数 ID"的解析与"驱动器占用的参数要剔除"的体检）；这里只负责**按累计虚拟
+      时间**把它施加出去：`参数 += amplitude × sin(2π(t/period + phase))`。
+
+      五条约定（都是可观察行为，见 test_live2doffscreen 的 IDLE 系列）：
+        - **加在心情值之上**：心情覆盖（applyMoodBlend）先写绝对基准，摆动是加法。
+          于是"生气地站着"仍然是生气的，只是身体在重心上来回移 —— 这是需求的原话；
+        - 施加位置在 `SaveParameters()` **之后**（与呼吸/物理同一段）：驱动器这一帧写下的值
+          不进"本帧保存值"，下一帧 LoadParameters 就不会把上一次的摆动当成新基准再叠一遍；
+        - 结果**夹取到模型声明的范围**（declaredParameterRanges），绝不硬编码；
+        - 呼吸/头发（ParamBreath / ParamHair*）与 ParamMouthForm **永远不写**：前两个由呼吸
+          驱动器与物理每帧写入，后者是嘴形、属于心情。**即使条目里写了也跳过** ——
+          数据写错时驱动器自己也要守纪律，不能只靠数据表自觉；
+        - **空表 = 关掉**（参数不再被这个驱动器碰）：idle.json 缺失/非法时就是这条路径。
+
+      时间基准是渲染器自己累计的帧步长（renderFrame 的 deltaSeconds，含 0.1s 夹取），
+      所以注入虚拟时间（setNextFrameDeltaSeconds）能让相位完全可复现。*/
+    void setIdleSway(const QVector<Live2DMoodPreset::IdleSwayEntry> &entries);
+
+    /*待机摆动**本帧真正施加的偏移量**（参数单位；该参数不在条目里、或被跳过、或摆动已关时
+      是**精确的 0**）。
+
+      为什么需要它（而不只是读 parameterValue）：ParamAngleZ / ParamBodyAngleX 每帧还被
+      呼吸驱动器**加**一个摆动，读回值是"心情 + 呼吸 + 摆动"的合成值，从中量不出摆动自己的
+      幅度/周期/相位。这个通道就是"这个驱动器这一帧贡献了多少"，校准与测试按它判读。*/
+    float idleSwayOffset(const QString &parameterId) const;
+
+    /*待机摆动的**累计虚拟时间**（秒）—— 相位与周期的唯一时基。
+      调用方（出对照图/测试）按它对齐采样：注入固定步长后 t 只由帧序号决定，与机器负载无关。*/
+    float idleSwayElapsedSeconds() const;
+
+    /*摆动是否真的在施加 = 至少有一条条目**能落地**（数值合法、不是呼吸/头发/嘴形这类
+       "别人的"参数，而且模型确实声明了那个参数）。空表、或整张表都是非法条目时都是 false。*/
+    bool isIdleSwayActive() const;
 
     bool isLoaded() const;
 

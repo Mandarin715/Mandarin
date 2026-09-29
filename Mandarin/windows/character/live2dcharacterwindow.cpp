@@ -253,6 +253,13 @@ bool Live2DCharacterWindow::loadModel(const QString &modelName)
       所以只能在这里装载。失败时功能整个自关 —— 不施加任何覆盖、也不残留上一种情绪。*/
     m_moodPreset.load(name);
 
+    /*待机摆动数据（…/presets/idle.json）与情绪预设**分开**装载：它是可选的，缺了只是不做
+       摆动（角色照样呼吸/眨眼/跟着心情变表情），见 Live2DMoodPreset::loadIdle。
+       整组交给渲染器（空表 = 关掉），于是"没配数据"与"配了数据"走同一条路径。
+       ⚠️ 放在这一句之后：它依赖上面 load() 解析出来的 parameter-map（语义名 → 参数 ID）。*/
+    m_moodPreset.loadIdle();
+    m_renderer.setIdleSway(m_moodPreset.idleSwayEntries());
+
     // 窗口映射到屏幕之前 devicePixelRatioF() 给不出真实值（本机未映射时是 1.0，
     // 实际 1.25），此时用错 dpr 定画布/渲染分辨率会同时错两处（屏幕尺寸与像素密度）。
     // 所以未映射就先只记下模型名，真正的首次布局交给 showEvent —— 那时 dpr 才是真的。

@@ -2,6 +2,7 @@
 
 #include "../GlobalConstants.h"
 #include "../utils/AudioEnvelope.h"
+#include "../utils/Live2DMoodPreset.h"
 #include "../utils/Live2DOffscreenRenderer.h"
 #include "SyntheticWav.h"
 
@@ -16,6 +17,60 @@
 
 #include <algorithm>
 #include <cmath>
+
+namespace
+{
+/*这些参数每帧被**别的写入者**占用：呼吸驱动器写 ParamAngleX/Y/Z + ParamBodyAngleX +
+  ParamBreath（见 Live2DOffscreenRenderer::setupBreath），物理写头发（ParamHair*）。
+
+  为什么待机摆动用例需要这份名单：那几条轴的读回值 = 心情 + 呼吸/物理 + 摆动，
+  从中量不出摆动自己的贡献。凡是"逐帧读参数值做恒等式"的断言都只能放在**不在**这份名单里的
+  轴上（本模型是 ParamBodyAngleZ）—— 那不是取巧，是测量边界（见文件开头关于姿势参数的说明）。*/
+bool isUpdaterDrivenParameterId(const QString &parameterId)
+{
+    static const QStringList kIds = {
+        QStringLiteral("ParamAngleX"),    QStringLiteral("ParamAngleY"),
+        QStringLiteral("ParamAngleZ"),    QStringLiteral("ParamBodyAngleX"),
+        QStringLiteral("ParamBreath"),    QStringLiteral("ParamHairFront"),
+        QStringLiteral("ParamHairSide"),  QStringLiteral("ParamHairBack")};
+    return kIds.contains(parameterId);
+}
+
+/*两个"周期分数"之间的**环形**距离（周期 1，所以结果落在 [0, 0.5]）。
+   相位 0.95 与 0.05 相差 0.1 周期而不是 0.9 —— 用的就是它。*/
+float circularPhaseDistance(float a, float b)
+{
+    const float raw = std::fmod(std::fabs(a - b), 1.0f);
+    return std::min(raw, 1.0f - raw);
+}
+
+/*从条目表里取某条轴的**配置幅度**（找不到返回 0）。*/
+float idleAmplitudeOf(const QVector<Live2DMoodPreset::IdleSwayEntry> &entries,
+                      const QString &parameterId)
+{
+    for (const Live2DMoodPreset::IdleSwayEntry &entry : entries)
+    {
+        if (entry.parameterId == parameterId)
+            return entry.amplitude;
+    }
+    return 0.0f;
+}
+
+/*手搓一条摆动条目：给"敌意数据"用例构造输入（正常路径上条目全部由 idle.json 装载，
+   驱动器**只**从数据里拿东西 —— 这个构造器正是为了证明它自己也守纪律）。*/
+Live2DMoodPreset::IdleSwayEntry makeIdleEntry(const QString &semanticName,
+                                              const QString &parameterId, float amplitude,
+                                              float periodSeconds, float phase)
+{
+    Live2DMoodPreset::IdleSwayEntry entry;
+    entry.semanticName = semanticName;
+    entry.parameterId = parameterId;
+    entry.amplitude = amplitude;
+    entry.periodSeconds = periodSeconds;
+    entry.phase = phase;
+    return entry;
+}
+} // namespace
 
 /*Live2D 离屏渲染的端到端验证。
 
@@ -59,6 +114,25 @@ class TestLive2DOffscreen : public QObject
     void nextUtteranceWithoutEnvelopeFallsBackToBlindFlap();
     /*停止说话 + 电平清零 → 嘴回落到心情值*/
     void stoppingSpeechWithClearedLevelReturnsToMood();
+
+    /*---------- 待机摆动（IDLE 系列：让角色"站着、重心在动"） ----------
+      数据来自模型目录下的 presets/idle.json（语义参数名 + 幅度 + 周期 + 相位）。
+      这一组全部按**注入的**固定帧步长采样：摆动相位由累计虚拟时间决定，用墙钟就会随
+      机器负载漂移（帧步长有 0.1s 夹取上限，见 setNextFrameDeltaSeconds）。*/
+    /*每一配置轴都按配置的幅度在动，且参数值始终落在模型声明的范围里*/
+    void idleSwayMovesConfiguredParameters();
+    /*周期必须等于配置值（过零法从注入时间上量，不依赖墙钟）*/
+    void idleSwayPeriodMatchesConfiguration();
+    /*叠加而不是覆盖：参数围绕**心情值**摆，不是围绕中立值*/
+    void idleSwayAddsToMoodInsteadOfReplacingIt();
+    /*idle.json 不存在 → 摆动自关、参数保持平坦、不崩（且情绪功能不受影响）*/
+    void idleSwayIsOffWithoutDataFile();
+    /*绝不写 breath / hair*，也绝不写 ParamMouthForm */
+    void idleSwayNeverTouchesBreathHairOrMouthForm();
+    /*两条轴的相位必须按配置错开（不锁步）*/
+    void idleSwayPhasesAreOffset();
+    /*出**全身**对照图：一个周期内均匀 6 帧，供人眼判断"她真的在动"*/
+    void rendersIdleSwayPhaseFrames();
 
   private:
     static QString modelDir();
@@ -139,6 +213,58 @@ class TestLive2DOffscreen : public QObject
        返回 false = 有一帧渲染失败（调用方断言）。*/
     static bool playEnvelope(Live2DOffscreenRenderer *renderer, const AudioEnvelope &envelope,
                              int frames, float deltaSeconds, QVector<EnvelopeSample> *samples);
+
+    /*---------- 待机摆动（IDLE 系列）的公共设施 ---------- */
+
+    /*待机摆动用例的公共前提：本机模型 + 该模型的 presets/idle.json。
+
+      两个目录在本机是**分开**的（与 test_live2dwindow::openConfiguredModel 的说明一致）：
+        模型文件  Documents/Mandarin/Live2D/<模型名>/
+        摆动数据  Documents/Mandarin/Character/Assets/<角色>/Live2D/<模型名>/presets/idle.json
+      所以模型走 availableModelDir()，数据走 Live2DMoodPreset（它按**真实** config.ini 的
+      CharSelect + 模型名推路径）。装不上（本机没模型/没这份数据）返回 false，调用方 QSKIP。*/
+    static bool loadConfiguredIdleSway(Live2DOffscreenRenderer *renderer,
+                                       Live2DMoodPreset *preset, QString *detail);
+
+    /*待机摆动的一帧采样，三个量各答一个问题：
+        elapsedSeconds → 这一帧在周期里的哪一点（相位/周期的唯一时基）；
+        offsets        → 摆动这一帧**真正施加**了多少（幅度，不受呼吸/物理干扰）；
+        values         → 参数最终值（有没有越界、有没有把心情盖掉）。*/
+    struct IdleSample
+    {
+        float elapsedSeconds = 0.0f;
+        QHash<QString, float> offsets;
+        QHash<QString, float> values;
+    };
+
+    /*按**注入的**固定步长跑 frames 帧，逐帧记下上面三个量。
+       deltaSeconds 必须 ≤ 0.1s（渲染器的单帧夹取上限），否则"注入的时间"与"实际推进的
+       时间"就不再相等，相位会与预期错开。parameterIds 是这次要观察的参数 ID 列表。*/
+    static bool sampleIdleSway(Live2DOffscreenRenderer *renderer, const QStringList &parameterIds,
+                               int frames, float deltaSeconds, QVector<IdleSample> *samples);
+
+    /*过零法量出来的振荡（周期/相位/幅度）。*/
+    struct Oscillation
+    {
+        float amplitude = 0.0f;   // max|offset|（幅度）
+        float periodSeconds = 0.0f; // 相邻**上升**过零时刻之差的平均
+        float phase = 0.0f;       // 周期分数 [0,1)
+        int crossings = 0;        // 上升过零次数
+    };
+
+    /*从采样序列里量出某条轴的**参数值**极差（max−min）。"平坦"就用它判：没有摆动、
+       也没有别的写入者时它必须是 0（或只差浮点噪声）。*/
+    static float valueSwingOf(const QVector<IdleSample> &samples, const QString &parameterId);
+
+    /*从采样序列里量出某条轴的振荡。
+
+      为什么用"上升过零"而不是"峰值"：正弦在过零点最陡，线性插值的误差是 dt² 量级
+      （峰值附近是平的，插值反而量不准）；而且上升过零的时刻有解析式 t = T(k − φ)，
+      于是**相位**可以顺带量出来：φ = (−t/T) mod 1（整数 k 自动消失）。
+
+      量不到上升过零（crossings==0）时只有 amplitude 有意义；一条完整的周期需要 ≥2 次。*/
+    static Oscillation measureOscillation(const QVector<IdleSample> &samples,
+                                          const QString &parameterId);
 };
 
 QString TestLive2DOffscreen::modelDir()
@@ -1404,6 +1530,873 @@ void TestLive2DOffscreen::stoppingSpeechWithClearedLevelReturnsToMood()
                             .arg(double(tailMin))
                             .arg(double(tailMax))
                             .arg(double(kMoodMouthOpen))));
+}
+
+/*==================== 待机摆动（IDLE 系列） ====================
+
+  用户要的观感是一句很朴素的话："她应该是**站着、重心在动**"，而不是只有呼吸。
+
+  数据在**用户数据区**（<模型目录>/presets/idle.json，不在仓库里）：每条只写**语义**参数名
+  + 幅度（参数自己的单位）+ 周期（秒）+ 相位（周期分数）。换模型（miku）时只改这份数据、
+  不改 C++ —— 这正是"数据驱动"的全部含义，也是这组用例为什么**不写死参数 ID**：
+  它们从 preset.idleSwayEntries() 拿配置，再用模型自己的声明范围做判据。
+
+  四条契约（每条对应一个具体的错误行为）：
+    1. 真的在动，且**按配置的幅度**在动（幅度写错一半、写成别的量级都要被抓住）；
+    2. **周期**必须等于配置值 —— 从注入的虚拟时间上过零量出来，与机器负载无关；
+    3. **加在心情值之上**（不是覆盖）：否则"生气地站着"会变回中立表情；
+    4. 绝不碰呼吸/头发（ParamBreath / ParamHair*，它们每帧由别的驱动器写）与
+       ParamMouthForm（嘴形属于心情）。
+
+  ⚠️ 采样一律注入固定帧步长：摆动的相位由**累计虚拟时间**决定，而真实帧步长来自墙钟、
+  还会被 0.1s 夹取 —— 靠墙钟就等于把"这一帧落在周期里的哪一点"交给机器负载决定。*/
+bool TestLive2DOffscreen::loadConfiguredIdleSway(Live2DOffscreenRenderer *renderer,
+                                                 Live2DMoodPreset *preset, QString *detail)
+{
+    if (renderer == nullptr || preset == nullptr)
+        return false;
+    const QString dir = availableModelDir();
+    if (dir.isEmpty())
+    {
+        if (detail != nullptr)
+            *detail = QStringLiteral("本机没有 Live2D 模型（禁二传，不入库）");
+        return false;
+    }
+    QString error;
+    if (!loadAnyModel(renderer, &error))
+    {
+        if (detail != nullptr)
+            *detail = QStringLiteral("模型装载失败：%1").arg(error);
+        return false;
+    }
+
+    /*模型名 = 模型目录名（本机 Documents/Mandarin/Live2D/atri → "atri"）。
+       摆动数据按它去 Character/Assets/<角色>/Live2D/<模型名>/presets/ 找 —— 两个目录
+       在本机确实是分开的（与 test_live2dwindow::openConfiguredModel 的说明一致）。*/
+    const QString modelName = QFileInfo(dir).fileName();
+    const bool moodOk = preset->load(modelName);
+    const bool idleOk = moodOk && preset->loadIdle();
+    if (!moodOk || !idleOk)
+    {
+        if (detail != nullptr)
+            *detail = QStringLiteral("%1：情绪预设=%2、待机摆动数据=%3（都在 Documents 下，不入库）")
+                          .arg(modelName)
+                          .arg(moodOk ? QStringLiteral("可用") : QStringLiteral("缺失"))
+                          .arg(idleOk ? QStringLiteral("可用") : QStringLiteral("缺失"));
+        return false;
+    }
+
+    renderer->setIdleSway(preset->idleSwayEntries());
+    return true;
+}
+
+bool TestLive2DOffscreen::sampleIdleSway(Live2DOffscreenRenderer *renderer,
+                                         const QStringList &parameterIds, int frames,
+                                         float deltaSeconds, QVector<IdleSample> *samples)
+{
+    if (renderer == nullptr || samples == nullptr || frames <= 0)
+        return false;
+    /*注入的步长必须 ≤ 渲染器的单帧夹取上限（0.1s）：否则"注入的时间"与"实际推进的时间"
+       不再相等，相位就会与预期错开 —— 这组用例的相位判据全靠这条等式。*/
+    if (!(deltaSeconds > 0.0f) || deltaSeconds > 0.1f)
+        return false;
+
+    const QSize targetSize(kBlendProbeWidth, kBlendProbeHeight);
+    for (int index = 0; index < frames; ++index)
+    {
+        renderer->setNextFrameDeltaSeconds(deltaSeconds);
+        if (renderer->renderFrame(targetSize).isNull())
+            return false;
+
+        IdleSample sample;
+        sample.elapsedSeconds = renderer->idleSwayElapsedSeconds();
+        for (const QString &parameterId : parameterIds)
+        {
+            sample.offsets.insert(parameterId, renderer->idleSwayOffset(parameterId));
+            sample.values.insert(parameterId, renderer->parameterValue(parameterId));
+        }
+        samples->append(sample);
+    }
+    return true;
+}
+
+float TestLive2DOffscreen::valueSwingOf(const QVector<IdleSample> &samples,
+                                        const QString &parameterId)
+{
+    if (samples.isEmpty())
+        return 0.0f;
+    float minValue = samples.first().values.value(parameterId);
+    float maxValue = minValue;
+    for (const IdleSample &sample : samples)
+    {
+        const float value = sample.values.value(parameterId);
+        minValue = std::min(minValue, value);
+        maxValue = std::max(maxValue, value);
+    }
+    return maxValue - minValue;
+}
+
+TestLive2DOffscreen::Oscillation TestLive2DOffscreen::measureOscillation(
+    const QVector<IdleSample> &samples, const QString &parameterId)
+{
+    Oscillation result;
+    if (samples.size() < 3 || parameterId.isEmpty())
+        return result;
+
+    QVector<float> times;
+    QVector<float> offsets;
+    times.reserve(samples.size());
+    offsets.reserve(samples.size());
+    for (const IdleSample &sample : samples)
+    {
+        if (!sample.offsets.contains(parameterId))
+            return Oscillation(); //没采到这条轴（调用方负责传对参数 ID）
+        const float value = sample.offsets.value(parameterId);
+        times.append(sample.elapsedSeconds);
+        offsets.append(value);
+        result.amplitude = std::max(result.amplitude, std::fabs(value));
+    }
+
+    /*上升过零（− → +）。为什么不用峰值：正弦在零点最陡，线性插值的误差是 dt² 量级；
+       峰值附近是平的，插值反而量不准（差一个采样点就差出百分之几的幅度）。*/
+    QVector<float> crossingTimes;
+    for (int index = 1; index < offsets.size(); ++index)
+    {
+        if (!(offsets[index - 1] <= 0.0f && offsets[index] > 0.0f))
+            continue;
+        const float delta = offsets[index] - offsets[index - 1];
+        const float fraction = (std::fabs(delta) > 1e-12f) ? (-offsets[index - 1] / delta) : 0.0f;
+        crossingTimes.append(times[index - 1] + (times[index] - times[index - 1]) * fraction);
+    }
+    result.crossings = crossingTimes.size();
+    if (crossingTimes.isEmpty())
+        return result;
+
+    if (crossingTimes.size() >= 2)
+    {
+        float sum = 0.0f;
+        for (int index = 1; index < crossingTimes.size(); ++index)
+            sum += crossingTimes[index] - crossingTimes[index - 1];
+        result.periodSeconds = sum / float(crossingTimes.size() - 1);
+
+        /*相位（周期分数）：上升过零发生在 t = T(k − φ)，于是 φ = (−t/T) mod 1 ——
+           整数 k 被 mod 吃掉，所以不需要知道这是第几次过零。*/
+        if (result.periodSeconds > 0.0f)
+        {
+            const float raw = -crossingTimes.first() / result.periodSeconds;
+            result.phase = raw - std::floor(raw);
+        }
+    }
+    return result;
+}
+
+/*每一配置轴都按配置的幅度在动，且参数值始终落在模型**声明**的范围里。
+
+  为什么"幅度"要卡上下两侧：只有下界（"至少动了 90%"）会放过"幅度被放大成两倍"，
+  只有上界会放过"幅度被砍半"。两侧都卡住，任何"把 amplitude 用错"的写法都过不去。*/
+void TestLive2DOffscreen::idleSwayMovesConfiguredParameters()
+{
+    Live2DOffscreenRenderer renderer;
+    Live2DMoodPreset preset;
+    QString detail;
+    if (!loadConfiguredIdleSway(&renderer, &preset, &detail))
+        QSKIP("本机没有可用的待机摆动数据（presets/idle.json），跳过");
+
+    const QVector<Live2DMoodPreset::IdleSwayEntry> entries = preset.idleSwayEntries();
+    QVERIFY2(!entries.isEmpty(), "idle.json 装载成功却一条轴都没有");
+    QVERIFY2(renderer.isIdleSwayActive(), "把条目交给渲染器之后摆动却没生效");
+
+    const QHash<QString, Live2DOffscreenRenderer::DeclaredRange> ranges =
+        renderer.declaredParameterRanges();
+
+    QStringList ids;
+    for (const Live2DMoodPreset::IdleSwayEntry &entry : entries)
+        ids << entry.parameterId;
+
+    /*8s 虚拟时间（最短的轴 4.2s 走了近两轮；最长的 6.5s 也必然覆盖波峰与波谷 ——
+       两者相距半个周期 = 3.25s，8s 的窗口一定取到）。0.05s 步长下峰值的幅度误差
+       是 1−cos(π·dt/T) < 0.1%，可以忽略。*/
+    QVector<IdleSample> samples;
+    QVERIFY2(sampleIdleSway(&renderer, ids, 160, 0.05f, &samples), "采样时渲染失败");
+
+    for (const Live2DMoodPreset::IdleSwayEntry &entry : entries)
+    {
+        QVERIFY2(ranges.contains(entry.parameterId),
+                 qPrintable(QStringLiteral("模型没有声明 %1（语义名 %2）—— parameter-map 与模型对不上")
+                                .arg(entry.parameterId, entry.semanticName)));
+        const Live2DOffscreenRenderer::DeclaredRange range = ranges.value(entry.parameterId);
+
+        const Oscillation measured = measureOscillation(samples, entry.parameterId);
+        float minOffset = samples.first().offsets.value(entry.parameterId);
+        float maxOffset = minOffset;
+        float minValue = samples.first().values.value(entry.parameterId);
+        float maxValue = minValue;
+        float worstValue = minValue;
+        bool outOfRange = false;
+        for (const IdleSample &sample : samples)
+        {
+            const float offset = sample.offsets.value(entry.parameterId);
+            minOffset = std::min(minOffset, offset);
+            maxOffset = std::max(maxOffset, offset);
+            const float value = sample.values.value(entry.parameterId);
+            minValue = std::min(minValue, value);
+            maxValue = std::max(maxValue, value);
+            if (value < range.min - 1e-4f || value > range.max + 1e-4f)
+            {
+                outOfRange = true;
+                worstValue = value;
+            }
+        }
+
+        qInfo("IDLE move[%s]: configured amp=%.3f period=%.2fs phase=%.2f | measured amp=%.3f "
+              "offset=%.3f~%.3f value=%.3f~%.3f declared=[%.3f,%.3f]",
+              qPrintable(entry.parameterId), double(entry.amplitude), double(entry.periodSeconds),
+              double(entry.phase), double(measured.amplitude), double(minOffset),
+              double(maxOffset), double(minValue), double(maxValue), double(range.min),
+              double(range.max));
+
+        QVERIFY2(maxOffset >= entry.amplitude * 0.97f && maxOffset <= entry.amplitude * 1.01f,
+                 qPrintable(QStringLiteral("%1 的正向摆幅实测 %2，配置 %3 —— 幅度没有按配置落地")
+                                .arg(entry.parameterId)
+                                .arg(double(maxOffset))
+                                .arg(double(entry.amplitude))));
+        QVERIFY2(minOffset <= -entry.amplitude * 0.97f && minOffset >= -entry.amplitude * 1.01f,
+                 qPrintable(QStringLiteral("%1 的负向摆幅实测 %2，配置 %3")
+                                .arg(entry.parameterId)
+                                .arg(double(minOffset))
+                                .arg(double(entry.amplitude))));
+        QVERIFY2(maxOffset - minOffset >= entry.amplitude * 1.94f,
+                 qPrintable(QStringLiteral("%1 的摆动极差只有 %2（配置幅度 %3）—— 没有走完一个周期")
+                                .arg(entry.parameterId)
+                                .arg(double(maxOffset - minOffset))
+                                .arg(double(entry.amplitude))));
+        QVERIFY2(!outOfRange,
+                 qPrintable(QStringLiteral("%1 的最终值落到了 [%2,%3] 之外（实测 %4）—— 越界会被 "
+                                           "Core 夹回去，屏幕上就是卡在上下限")
+                                .arg(entry.parameterId)
+                                .arg(double(range.min))
+                                .arg(double(range.max))
+                                .arg(double(worstValue))));
+    }
+}
+
+/*周期必须等于配置值：用**注入的**虚拟时间过零量出来，不依赖墙钟。*/
+void TestLive2DOffscreen::idleSwayPeriodMatchesConfiguration()
+{
+    Live2DOffscreenRenderer renderer;
+    Live2DMoodPreset preset;
+    QString detail;
+    if (!loadConfiguredIdleSway(&renderer, &preset, &detail))
+        QSKIP("本机没有可用的待机摆动数据（presets/idle.json），跳过");
+
+    const QVector<Live2DMoodPreset::IdleSwayEntry> entries = preset.idleSwayEntries();
+    QStringList ids;
+    for (const Live2DMoodPreset::IdleSwayEntry &entry : entries)
+        ids << entry.parameterId;
+
+    /*15.5s 虚拟时间、0.05s 步长：最长的那条轴（6.5s）也能量到 3 次上升过零 ⇒
+       至少两段完整的"过零间隔"可比。周期是**时刻之差**，而时刻全是注入的 ⇒ 与负载无关。*/
+    QVector<IdleSample> samples;
+    QVERIFY2(sampleIdleSway(&renderer, ids, 310, 0.05f, &samples), "采样时渲染失败");
+
+    for (const Live2DMoodPreset::IdleSwayEntry &entry : entries)
+    {
+        const Oscillation measured = measureOscillation(samples, entry.parameterId);
+        QVERIFY2(measured.crossings >= 2,
+                 qPrintable(QStringLiteral("%1 在采样窗里只量到 %2 次上升过零，周期无从谈起"
+                                           "（周期被改大了？采样窗不够长？）")
+                                .arg(entry.parameterId)
+                                .arg(measured.crossings)));
+        const float relativeError =
+            std::fabs(measured.periodSeconds - entry.periodSeconds) / entry.periodSeconds;
+        qInfo("IDLE period[%s]: configured=%.2fs measured=%.3fs (rel err %.3f%%) crossings=%d",
+              qPrintable(entry.parameterId), double(entry.periodSeconds),
+              double(measured.periodSeconds), double(relativeError * 100.0), measured.crossings);
+
+        /*3% 容差：过零时刻的插值误差是 dt² 量级（dt=0.05s、T≥4.2s ⇒ 远小于 0.1%），
+           余量留给浮点累加。周期写成别的量级（例如误按毫秒）。必然远大于 3%。*/
+        QVERIFY2(relativeError <= 0.03f,
+                 qPrintable(QStringLiteral("%1 的实测周期 %2s 与配置 %3s 差 %4%%")
+                                .arg(entry.parameterId)
+                                .arg(double(measured.periodSeconds))
+                                .arg(double(entry.periodSeconds))
+                                .arg(double(relativeError * 100.0))));
+    }
+}
+
+/*叠加而不是覆盖：参数**围绕心情值**摆，不是围绕中立值。
+
+  ⚠️ 逐帧恒等式（最终值 − 摆动偏移 == 心情值）只能放在**不被呼吸/物理驱动**的轴上：
+  其余轴的读回值里还混着呼吸每帧加上去的量（见文件里 isUpdaterDrivenParameterId 的说明）。
+  本模型上这条轴是 ParamBodyAngleZ（sleepy 给它 +3.0）。*/
+void TestLive2DOffscreen::idleSwayAddsToMoodInsteadOfReplacingIt()
+{
+    Live2DOffscreenRenderer renderer;
+    Live2DMoodPreset preset;
+    QString detail;
+    if (!loadConfiguredIdleSway(&renderer, &preset, &detail))
+        QSKIP("本机没有可用的待机摆动数据（presets/idle.json），跳过");
+
+    const QVector<Live2DMoodPreset::IdleSwayEntry> entries = preset.idleSwayEntries();
+    const QHash<QString, Live2DMoodPreset::ParameterRange> parameters = preset.parameters();
+
+    /*找一个能证明"叠加"的对照：轴不被驱动器管 + 某个原型给它一个明显偏离中立的值。
+       两步都从数据里推（不写死参数 ID 与原型名）：本模型上会选中 sleepy 的 bodyZ = +3.0。
+       找不到就说明这份数据证明不了这条契约 —— 报错而不是静悄悄地过。*/
+    QString chosenArchetype;
+    QString chosenId;
+    float moodValue = 0.0f;
+    float neutralValue = 0.0f;
+    for (const QString &archetype : preset.archetypeNames())
+    {
+        const QHash<QString, float> values = preset.parametersForArchetype(archetype);
+        for (const Live2DMoodPreset::IdleSwayEntry &entry : entries)
+        {
+            if (isUpdaterDrivenParameterId(entry.parameterId))
+                continue;
+            const float neutral = parameters.value(entry.semanticName).neutral;
+            const float value = values.value(entry.parameterId, neutral);
+            if (std::fabs(value - neutral) <= 1.0f)
+                continue;
+            chosenArchetype = archetype;
+            chosenId = entry.parameterId;
+            moodValue = value;
+            neutralValue = neutral;
+            break;
+        }
+        if (!chosenId.isEmpty())
+            break;
+    }
+    QVERIFY2(!chosenId.isEmpty(),
+             "没有任何原型给「不被驱动器管」的轴一个明显非中立的值 —— 本用例构造不出对照");
+
+    /*不插值（0ms）：这条用例量的是"摆动加在什么之上"，不需要过渡，直接从目标值开始。*/
+    renderer.setMoodBlendDurationMs(0);
+    renderer.setParameterOverrides(preset.parametersForArchetype(chosenArchetype));
+
+    QVector<IdleSample> samples;
+    QVERIFY2(sampleIdleSway(&renderer, QStringList{chosenId}, 160, 0.05f, &samples),
+             "采样时渲染失败");
+
+    float minValue = samples.first().values.value(chosenId);
+    float maxValue = minValue;
+    float maxValueOffset = 0.0f;
+    float baseSum = 0.0f;
+    float worstResidual = 0.0f;
+    for (const IdleSample &sample : samples)
+    {
+        const float value = sample.values.value(chosenId);
+        const float offset = sample.offsets.value(chosenId);
+        /*本帧的"基准" = 最终值 − 摆动偏移。在一条没有别的写入者的轴上它必须**逐帧**等于
+           心情值 —— 这比"平均值接近"强得多：覆盖式实现（摆动直接写绝对值）会让基准变成 0，
+           一帧都躲不过去。*/
+        const float base = value - offset;
+        baseSum += base;
+        worstResidual = std::max(worstResidual, std::fabs(base - moodValue));
+        minValue = std::min(minValue, value);
+        maxValue = std::max(maxValue, value);
+        maxValueOffset = std::max(maxValueOffset, offset);
+    }
+    const float meanBase = baseSum / float(samples.size());
+
+    qInfo("IDLE additive[%s @ %s]: mood=%.3f neutral=%.3f | value=%.3f~%.3f base(mean)=%.3f "
+          "worst residual=%.5f",
+          qPrintable(chosenId), qPrintable(chosenArchetype), double(moodValue),
+          double(neutralValue), double(minValue), double(maxValue), double(meanBase),
+          double(worstResidual));
+
+    QVERIFY2(worstResidual <= 0.01f,
+             qPrintable(QStringLiteral("摆动不是**加**在心情值 %1 上：逐帧基准最大偏差 %2")
+                            .arg(double(moodValue))
+                            .arg(double(worstResidual))));
+    QVERIFY2(std::fabs(meanBase - neutralValue) > 0.5f,
+             qPrintable(QStringLiteral("摆动围绕的基准（%1）还停在中立值（%2）附近 —— "
+                                       "叠加变成了覆盖，心情被抹掉了")
+                            .arg(double(meanBase))
+                            .arg(double(neutralValue))));
+    /*摆动要真的把值推离心情值（否则"围绕心情摆"这句话没有可观察的内容）。*/
+    QVERIFY2(maxValueOffset >= 0.9f * idleAmplitudeOf(entries, chosenId),
+             "摆动的正向幅度没到配置值，本条恒等式验证不到东西");
+}
+
+/*idle.json 不存在 → 摆动自关、姿势参数保持平坦、不崩；情绪功能不受影响。
+
+  "平坦"必须放在**不被呼吸/物理驱动**的轴上量（本模型 ParamBodyAngleZ）：
+  呼吸每帧都往 ParamAngleZ / ParamBodyAngleX 上加东西，那两条轴本来就一直在动。*/
+void TestLive2DOffscreen::idleSwayIsOffWithoutDataFile()
+{
+    Live2DMoodPreset preset;
+    const QString dir = availableModelDir();
+    if (dir.isEmpty())
+        QSKIP("本机没有 Live2D 模型（禁二传，不入库），跳过");
+
+    const QString modelName = QFileInfo(dir).fileName();
+    if (!preset.load(modelName))
+        QSKIP("本机没有当前角色/模型的心情预设数据（Documents 下，不入库），跳过");
+
+    /*指到一个**确定不存在**的文件：模拟"用户还没给摆动数据 / 删了 / 改坏了"。
+       给绝对路径而不是动真实数据目录：用例不许依赖（更不许改）用户数据的现状。*/
+    const QString missingPath = QDir(QDir::tempPath())
+                                    .absoluteFilePath(QStringLiteral(
+                                        "mandarin-idle-sway-does-not-exist.json"));
+    QVERIFY2(!QFileInfo::exists(missingPath), "临时目录里居然有这个文件，用例前提被破坏");
+
+    QVERIFY2(!preset.loadIdle(missingPath), "文件不存在，loadIdle 却报告成功");
+    QVERIFY2(!preset.isIdleSwayEnabled(), "文件不存在，摆动却是开启状态");
+    QVERIFY2(preset.idleSwayEntries().isEmpty(), "文件不存在，却装载出了条目");
+    /*关键：摆动数据缺失**不许**把情绪功能一起关掉 —— 两者是正交的
+       （moods.json 缺失 = 情绪自关；idle.json 缺失 = 只是不做摆动）。*/
+    QVERIFY2(preset.isEnabled(), "idle.json 缺失把情绪功能也关掉了：两个功能被绑死了");
+    qInfo("IDLE missing-file: loadIdle=false entries=0 moodEnabled=%d", preset.isEnabled() ? 1 : 0);
+
+    Live2DOffscreenRenderer renderer;
+    QString error;
+    QVERIFY2(renderer.load(dir, availableModelJson(dir), &error), qPrintable(error));
+    renderer.setIdleSway(preset.idleSwayEntries()); //空表 = 关掉
+    QVERIFY2(!renderer.isIdleSwayActive(), "喂了空表，摆动却是激活状态");
+
+    /*施加**中立心情**（生产里默认就是这个状态）：姿势类参数被绝对写成立值，于是"没有摆动"
+       在屏幕上的表现就是它们完全平坦。不施加心情的话待机动作/物理自己在动，平坦与否量不出来。*/
+    renderer.setMoodBlendDurationMs(0);
+    renderer.setParameterOverrides(preset.parametersForMood(QStringLiteral("default")));
+
+    /*候选参数 = 参数表里的**全部**参数。哪几个归呼吸/物理/眨眼管是**模型声明**的事
+       （呼吸写 ParamAngleX/Y/Z 与 ParamBodyAngleX，物理输出 ParamBodyAngleY，眨眼写眼睛），
+       不由测试手抄 —— 下面用"装上真实数据之后谁真的动了"这个**实验**来定哪几条是要看的轴。*/
+    QStringList candidates;
+    for (auto it = preset.parameters().constBegin(); it != preset.parameters().constEnd(); ++it)
+        candidates.append(it.value().id);
+    QVERIFY2(!candidates.isEmpty(), "参数表是空的，量不出任何东西");
+
+    QVector<IdleSample> withoutData;
+    QVERIFY2(sampleIdleSway(&renderer, candidates, 60, 0.05f, &withoutData),
+             "没有摆动数据时渲染失败（不该崩）");
+
+    QStringList offsetLeaks;
+    for (const IdleSample &sample : withoutData)
+    {
+        for (const QString &id : candidates)
+        {
+            if (sample.offsets.value(id) != 0.0f)
+                offsetLeaks.append(
+                    QStringLiteral("%1=%2").arg(id).arg(double(sample.offsets.value(id))));
+        }
+    }
+    qInfo("IDLE missing-file sweep: candidates=%d offsetLeaks=%d", candidates.size(),
+          offsetLeaks.size());
+    QVERIFY2(offsetLeaks.isEmpty(),
+             qPrintable(QStringLiteral("没有摆动数据，驱动器却写出了偏移：%1")
+                            .arg(offsetLeaks.mid(0, 6).join(QStringLiteral(", ")))));
+
+    /*敏感性对照 + 平坦判据（两件事同一个实验）：
+         · 接上真实摆动数据后，哪些轴的**参数值**明显在动（本模型是 bodyZ 那条）；
+         · 对那些轴，**没有数据**时它们必须是完全平坦的（极差 ≤ 1e-4）。
+       两个条件缺一不可：只看"平坦"可能是量错了地方（呼吸一直在动的轴本来就平坦不了），
+       只看"装上数据会动"则证明不了"没有数据就不动"。*/
+    Live2DMoodPreset withData;
+    if (withData.load(modelName) && withData.loadIdle() && !withData.idleSwayEntries().isEmpty())
+    {
+        renderer.setIdleSway(withData.idleSwayEntries());
+        QVERIFY2(renderer.isIdleSwayActive(), "装上真实数据后摆动没激活");
+        QVector<IdleSample> withRealData;
+        QVERIFY2(sampleIdleSway(&renderer, candidates, 160, 0.05f, &withRealData),
+                 "装上真实数据后渲染失败");
+
+        QStringList swungAxes;
+        QStringList flatAxes;
+        for (const QString &id : candidates)
+        {
+            const float swingWith = valueSwingOf(withRealData, id);
+            if (swingWith < 1.0f)
+                continue;
+            const float swingWithout = valueSwingOf(withoutData, id);
+            swungAxes.append(QStringLiteral("%1(moves %2, flat-when-missing %3)")
+                                 .arg(id)
+                                 .arg(double(swingWith), 0, 'f', 3)
+                                 .arg(double(swingWithout), 0, 'f', 5));
+            if (swingWithout <= 1e-4f)
+                flatAxes.append(id);
+        }
+        qInfo("IDLE missing-file control: swung=%d %s | flat-when-missing=%d %s", swungAxes.size(),
+              qPrintable(swungAxes.join(QStringLiteral("; "))), flatAxes.size(),
+              qPrintable(flatAxes.join(QStringLiteral(", "))));
+        QVERIFY2(!swungAxes.isEmpty(),
+                 "接上真实摆动数据后没有任何参数明显在动 —— 这条用例量不到东西");
+        QVERIFY2(!flatAxes.isEmpty(),
+                 "被摆动的轴在「没有数据」时都不平坦（说明它们还被别的驱动器写着）—— "
+                 "「平坦」这条判据在这里量不出东西");
+    }
+    else
+    {
+        qInfo("IDLE missing-file control: skipped (本机没有真实摆动数据)");
+    }
+}
+
+/*绝不写 breath / hair*（每帧由呼吸驱动器与物理写），也绝不写 ParamMouthForm（嘴形属于心情）。
+
+  分两层：
+    (a) **数据层**：装载出来的每条都不许落在这几个参数上；
+    (b) **驱动层**：**故意**喂一份"敌意"条目（呼吸 + 头发 + 嘴形 + 一条合法身体轴）。
+        数据写错时驱动器也必须自己跳过 —— 这是防御性契约，不能只靠数据表自觉。
+        合法轴是**阳性对照**：它必须真的动，否则"那几条通道恒为 0"可能只是整个驱动器
+        根本没跑（那样这条用例就是空的）。*/
+void TestLive2DOffscreen::idleSwayNeverTouchesBreathHairOrMouthForm()
+{
+    Live2DOffscreenRenderer renderer;
+    Live2DMoodPreset preset;
+    QString detail;
+    if (!loadConfiguredIdleSway(&renderer, &preset, &detail))
+        QSKIP("本机没有可用的待机摆动数据（presets/idle.json），跳过");
+
+    const QVector<Live2DMoodPreset::IdleSwayEntry> entries = preset.idleSwayEntries();
+
+    //(a) 数据层
+    QStringList violations;
+    for (const Live2DMoodPreset::IdleSwayEntry &entry : entries)
+    {
+        if (Live2DMoodPreset::isUpdaterOwnedParameter(entry.parameterId))
+            violations << QStringLiteral("%1(驱动器/物理占用)").arg(entry.parameterId);
+        if (entry.parameterId == kMouthFormParameter)
+            violations << QStringLiteral("%1(嘴形属于心情)").arg(entry.parameterId);
+    }
+    QVERIFY2(violations.isEmpty(),
+             qPrintable(QStringLiteral("idle.json 写了不该写的参数：%1")
+                            .arg(violations.join(QStringLiteral(", ")))));
+
+    //(b) 驱动层：喂"敌意"条目
+    const Live2DMoodPreset::IdleSwayEntry control = entries.first();
+    QVector<Live2DMoodPreset::IdleSwayEntry> hostile;
+    hostile.append(makeIdleEntry(control.semanticName, control.parameterId, control.amplitude,
+                                 control.periodSeconds, control.phase));
+    hostile.append(makeIdleEntry(QStringLiteral("breath"), QStringLiteral("ParamBreath"), 0.4f,
+                                 2.0f, 0.0f));
+    hostile.append(makeIdleEntry(QStringLiteral("hairFront"), QStringLiteral("ParamHairFront"),
+                                 0.5f, 3.0f, 0.3f));
+    hostile.append(makeIdleEntry(QStringLiteral("mouthForm"), kMouthFormParameter, 0.25f, 4.0f,
+                                 0.1f));
+
+    const QHash<QString, Live2DOffscreenRenderer::DeclaredRange> ranges =
+        renderer.declaredParameterRanges();
+    for (const Live2DMoodPreset::IdleSwayEntry &entry : hostile)
+    {
+        QVERIFY2(ranges.contains(entry.parameterId),
+                 qPrintable(QStringLiteral("本机模型没有声明 %1，这条用例量不出东西")
+                                .arg(entry.parameterId)));
+    }
+
+    /*嘴形给一个明确的心情值（-0.7，不是它自己的中立值 -0.5）：摆动要是写了它，
+       读回值必然偏离这个数 —— 这是**模型层**的直接证据（不只是"偏移通道说是 0"）。*/
+    const float moodMouthForm = -0.7f;
+    QHash<QString, float> mood = preset.parametersForArchetype(QStringLiteral("neutral"));
+    mood.insert(kMouthFormParameter, moodMouthForm);
+    renderer.setMoodBlendDurationMs(0);
+    renderer.setParameterOverrides(mood);
+    renderer.setIdleSway(hostile);
+
+    QStringList ids;
+    for (const Live2DMoodPreset::IdleSwayEntry &entry : hostile)
+        ids << entry.parameterId;
+
+    QVector<IdleSample> samples;
+    QVERIFY2(sampleIdleSway(&renderer, ids, 120, 0.05f, &samples), "采样时渲染失败"); //6s
+
+    //阳性对照：合法的那条身体轴必须真的在动
+    float controlMin = samples.first().offsets.value(control.parameterId);
+    float controlMax = controlMin;
+    float worstMouthForm = 0.0f;
+    QStringList leaks;
+    for (const IdleSample &sample : samples)
+    {
+        controlMin = std::min(controlMin, sample.offsets.value(control.parameterId));
+        controlMax = std::max(controlMax, sample.offsets.value(control.parameterId));
+        for (const QString &forbidden : {QStringLiteral("ParamBreath"),
+                                         QStringLiteral("ParamHairFront"), kMouthFormParameter})
+        {
+            if (sample.offsets.value(forbidden) != 0.0f)
+                leaks << QStringLiteral("%1=%2").arg(forbidden).arg(
+                    double(sample.offsets.value(forbidden)));
+        }
+        worstMouthForm = std::max(
+            worstMouthForm,
+            std::fabs(sample.values.value(kMouthFormParameter) - moodMouthForm));
+    }
+
+    qInfo("IDLE forbidden[control=%s]: control offset=%.3f~%.3f | leaks=%d | worst mouthForm "
+          "deviation=%.6f (mood=%.3f)",
+          qPrintable(control.parameterId), double(controlMin), double(controlMax), leaks.size(),
+          double(worstMouthForm), double(moodMouthForm));
+
+    QVERIFY2(controlMax - controlMin >= control.amplitude * 0.9f,
+             qPrintable(QStringLiteral("阳性对照（%1）没动 —— 下面的「0」不能说明任何事")
+                            .arg(control.parameterId)));
+    QVERIFY2(leaks.isEmpty(),
+             qPrintable(QStringLiteral("摆动写进了不该写的参数：%1")
+                            .arg(leaks.mid(0, 6).join(QStringLiteral(", ")))));
+    QVERIFY2(worstMouthForm <= 1e-4f,
+             qPrintable(QStringLiteral("ParamMouthForm 偏离心情值 %1（最大偏差 %2）—— 摆动碰了嘴形")
+                            .arg(double(moodMouthForm))
+                            .arg(double(worstMouthForm))));
+}
+
+/*两条轴的相位必须按配置错开：动作才不像一整块刚体在摇。*/
+void TestLive2DOffscreen::idleSwayPhasesAreOffset()
+{
+    Live2DOffscreenRenderer renderer;
+    Live2DMoodPreset preset;
+    QString detail;
+    if (!loadConfiguredIdleSway(&renderer, &preset, &detail))
+        QSKIP("本机没有可用的待机摆动数据（presets/idle.json），跳过");
+
+    const QVector<Live2DMoodPreset::IdleSwayEntry> entries = preset.idleSwayEntries();
+    QVERIFY2(entries.size() >= 2, "待机摆动只有一条轴 —— 数据本身就不满足「相位错开」的设计要求");
+
+    QStringList ids;
+    for (const Live2DMoodPreset::IdleSwayEntry &entry : entries)
+        ids << entry.parameterId;
+
+    QVector<IdleSample> samples;
+    QVERIFY2(sampleIdleSway(&renderer, ids, 310, 0.05f, &samples), "采样时渲染失败"); //15.5s
+
+    QVector<Oscillation> measured;
+    for (const Live2DMoodPreset::IdleSwayEntry &entry : entries)
+    {
+        const Oscillation one = measureOscillation(samples, entry.parameterId);
+        measured.append(one);
+        QVERIFY2(one.crossings >= 2,
+                 qPrintable(QStringLiteral("%1 的上升过零不足（%2 次），量不出相位")
+                                .arg(entry.parameterId)
+                                .arg(one.crossings)));
+        const float error = circularPhaseDistance(one.phase, entry.phase);
+        qInfo("IDLE phase[%s]: configured=%.3f measured=%.3f (cycle err %.4f) crossings=%d",
+              qPrintable(entry.parameterId), double(entry.phase), double(one.phase),
+              double(error), one.crossings);
+        QVERIFY2(error <= 0.05f,
+                 qPrintable(QStringLiteral("%1 的实测相位 %2 与配置 %3 差了 %4 个周期")
+                                .arg(entry.parameterId)
+                                .arg(double(one.phase))
+                                .arg(double(entry.phase))
+                                .arg(double(error))));
+    }
+
+    /*取"配置相位差最大"的一对做判据（数据驱动：哪两条最错开由数据决定）。*/
+    int firstIndex = 0;
+    int secondIndex = 1;
+    float configuredGap = circularPhaseDistance(entries[0].phase, entries[1].phase);
+    for (int i = 0; i < entries.size(); ++i)
+    {
+        for (int j = i + 1; j < entries.size(); ++j)
+        {
+            const float gap = circularPhaseDistance(entries[i].phase, entries[j].phase);
+            if (gap > configuredGap)
+            {
+                configuredGap = gap;
+                firstIndex = i;
+                secondIndex = j;
+            }
+        }
+    }
+    QVERIFY2(configuredGap >= 0.1f,
+             qPrintable(QStringLiteral("配置里最错开的两条轴也只差 %1 个周期 —— 动作会像一整块刚体")
+                            .arg(double(configuredGap))));
+
+    const float measuredGap =
+        circularPhaseDistance(measured[firstIndex].phase, measured[secondIndex].phase);
+    qInfo("IDLE phase-pair[%s vs %s]: configured gap=%.3f cycle measured gap=%.3f cycle",
+          qPrintable(entries[firstIndex].parameterId), qPrintable(entries[secondIndex].parameterId),
+          double(configuredGap), double(measuredGap));
+    QVERIFY2(circularPhaseDistance(measuredGap, configuredGap) <= 0.05f,
+             qPrintable(QStringLiteral("两条轴的实测相位差 %1 与配置 %2 对不上")
+                            .arg(double(measuredGap))
+                            .arg(double(configuredGap))));
+
+    /*不锁步的**直接**证据：归一化波形（偏移 ÷ 幅度）在某一帧明显分开。
+       锁步 = 两条归一化曲线处处相等，这个差恒为 0。
+       理论上两条同频不同相的正弦最大能差到 2·sin(π·gap)；本用例里两条轴的**周期也不同**，
+       相对相位还会随时间漂移，所以实际只会更大 —— 用理论下界的 90% 当门槛，两侧都卡住。*/
+    float worstShapeGap = 0.0f;
+    for (const IdleSample &sample : samples)
+    {
+        const float a = sample.offsets.value(entries[firstIndex].parameterId) /
+                        entries[firstIndex].amplitude;
+        const float b = sample.offsets.value(entries[secondIndex].parameterId) /
+                        entries[secondIndex].amplitude;
+        worstShapeGap = std::max(worstShapeGap, std::fabs(a - b));
+    }
+    const float theoreticalFloor =
+        2.0f * std::sin(static_cast<float>(M_PI) * configuredGap * 0.5f) * 0.9f;
+    qInfo("IDLE phase-pair shape gap: worst normalized gap=%.3f (floor %.3f)",
+          double(worstShapeGap), double(theoreticalFloor));
+    QVERIFY2(worstShapeGap >= theoreticalFloor,
+             qPrintable(QStringLiteral("两条轴的归一化波形几乎重合（最大差 %1，理论下界 %2）—— "
+                                       "相位错开没有生效，在锁步")
+                            .arg(double(worstShapeGap))
+                            .arg(double(theoreticalFloor))));
+}
+
+/*出**全身**对照图：一个周期内均匀 6 帧，供人眼判断"她真的在动"。
+
+  为什么必须全身：待机摆动是**整体**的重心移动，脸部裁切图会把它藏起来（那正是这条用例
+  与 mood-*.png 的区别）。6 帧严格等距（周期 ÷ 6），尺寸完全一致，落盘到
+  build2/tests/live2d-probe/idle-phase0..5.png。
+
+  **这里只出图与测量、不判断好坏**：动作看着像不像"站着"由人判读（与渲染情绪校准图同一条
+  纪律）。判据只有"尺寸一致 + 文件真的写出来了"。*/
+void TestLive2DOffscreen::rendersIdleSwayPhaseFrames()
+{
+    Live2DOffscreenRenderer renderer;
+    Live2DMoodPreset preset;
+    QString detail;
+    if (!loadConfiguredIdleSway(&renderer, &preset, &detail))
+        QSKIP("本机没有可用的待机摆动数据（presets/idle.json），跳过");
+
+    const QVector<Live2DMoodPreset::IdleSwayEntry> entries = preset.idleSwayEntries();
+    const float periodSeconds = entries.first().periodSeconds;
+    QVERIFY2(periodSeconds > 0.0f, "第一条轴的周期不是正数，没法在「一个周期」内取相位");
+
+    /*① 先用探针量人物几何，再据此定画布 —— 与 Live2DCharacterWindow::relayoutContent
+       同一套推导（基准高 900、目标占比 0.84、画布宽 = 高 × 人物真实宽高比），
+       只是去掉了屏幕夹取：判读图要的是**完整的人**，不是"和用户屏幕一样大"。
+       探针在测量模式下按虚拟时间取样求并集（与生产同一条路径），所以并集里也包含摆动
+       自己摆出去的那部分范围。*/
+    renderer.clearFigureSpan();
+    renderer.setMeasureMode(true);
+    bool probeOk = true;
+    for (int index = 0; index < 20; ++index)
+    {
+        if (index > 0)
+            renderer.setNextFrameDeltaSeconds(0.15f);
+        const QImage probe = renderer.renderFrame(QSize(512, 512));
+        if (probe.isNull())
+        {
+            probeOk = false;
+            break;
+        }
+        (void)renderer.probeFigureMetrics(probe);
+    }
+    renderer.setMeasureMode(false);
+    const Live2DOffscreenRenderer::FigureMetrics metrics = renderer.figureMetrics();
+    QVERIFY2(probeOk && metrics.valid && metrics.boundsAspect > 0.05f,
+             "探针没量到人物，出不了全身对照图");
+
+    constexpr int kSheetBaseHeight = 900;       //= Live2DCharacterWindow::kBaseCanvasHeight
+    constexpr float kSheetFigureRatio = 0.84f;  //= Live2DCharacterWindow::kTargetFigureRatio
+    const int canvasHeight = static_cast<int>(std::lround(kSheetBaseHeight / kSheetFigureRatio));
+    const int canvasWidth =
+        std::max(1, static_cast<int>(std::lround(canvasHeight * metrics.boundsAspect)));
+    const QSize sheetSize(canvasWidth, canvasHeight);
+    renderer.setDisplayRatios(kSheetFigureRatio, kSheetFigureRatio);
+    renderer.setIdleSway(entries);
+    /*心情用生产里的默认（中立那张）：出的是"她站着"的对照图，不是某个情绪。*/
+    renderer.setMoodBlendDurationMs(0);
+    renderer.setParameterOverrides(preset.parametersForMood(QStringLiteral("default")));
+    QVERIFY2(renderer.isIdleSwayActive(), "摆动没生效，这组图会是一串相同的帧");
+
+    const QString outDir = outputDir();
+    QVERIFY2(QDir().mkpath(outDir), qPrintable(QStringLiteral("建不出输出目录 %1").arg(outDir)));
+
+    qInfo("IDLE sheet: model=%s canvas=%dx%d (aspect %.3f) period=%.2fs outDir=%s",
+          qPrintable(preset.modelName()), sheetSize.width(), sheetSize.height(),
+          double(metrics.boundsAspect), double(periodSeconds), qPrintable(outDir));
+
+    /*② 一个周期内均匀取 6 个相位。基准时刻 = 当前累计虚拟时间，第 k 帧的目标时刻是
+       base + k×T/6 ⇒ 6 张图的相位**严格等距**，与"渲染花了多久"无关。*/
+    constexpr int kPhaseCount = 6;
+    const float baseSeconds = renderer.idleSwayElapsedSeconds();
+    QVector<QImage> frames;
+    QStringList savedPaths;
+    QSize expectedSize;
+    for (int phaseIndex = 0; phaseIndex < kPhaseCount; ++phaseIndex)
+    {
+        const float targetSeconds =
+            baseSeconds + periodSeconds * static_cast<float>(phaseIndex) / float(kPhaseCount);
+        int guard = 0;
+        while (renderer.idleSwayElapsedSeconds() < targetSeconds - 1e-4f && guard++ < 64)
+        {
+            /*一次最多推进 0.1s：那是渲染器单帧步长的夹取上限，超过就不是"一帧"了。*/
+            const float step =
+                std::min(targetSeconds - renderer.idleSwayElapsedSeconds(), 0.1f);
+            renderer.setNextFrameDeltaSeconds(step);
+            QVERIFY2(!renderer.renderFrame(sheetSize).isNull(), "推进虚拟时间时渲染失败");
+        }
+        /*再渲一帧、**不推进时间**：保证这一帧正好落在目标时刻（帧步长置 0 是渲染器既有的
+           一条路径：动作/呼吸/物理都停在原地，只有累计时间之前的量在起作用）。*/
+        renderer.setNextFrameDeltaSeconds(0.0f);
+        const QImage frame = renderer.renderFrame(sheetSize);
+        QVERIFY2(!frame.isNull(), "出图时渲染失败");
+        QCOMPARE(frame.size(), sheetSize); //6 张图必须同尺寸，否则并排看没有意义
+        if (expectedSize.isEmpty())
+            expectedSize = frame.size();
+        QCOMPARE(frame.size(), expectedSize);
+        frames.append(frame);
+
+        const QString path =
+            QDir(outDir).absoluteFilePath(QStringLiteral("idle-phase%1.png").arg(phaseIndex));
+        QVERIFY2(frame.save(path), qPrintable(QStringLiteral("写不出 %1").arg(path)));
+        savedPaths.append(path);
+
+        /*把这一帧三条轴的**实际偏移**与"按配置算出来的期望值"一起打出来：
+           万一并排看觉得"没动/动得不对"，这行日志能直接指出是数据、相位还是实现的问题。*/
+        const float elapsed = renderer.idleSwayElapsedSeconds();
+        QStringList applied;
+        QStringList expected;
+        for (const Live2DMoodPreset::IdleSwayEntry &entry : entries)
+        {
+            applied << QStringLiteral("%1=%2").arg(entry.parameterId).arg(
+                double(renderer.idleSwayOffset(entry.parameterId)), 0, 'f', 3);
+            const double wanted =
+                double(entry.amplitude) * std::sin(2.0 * M_PI *
+                                                   (double(elapsed) / double(entry.periodSeconds) +
+                                                    double(entry.phase)));
+            expected << QStringLiteral("%1=%2").arg(entry.parameterId).arg(wanted, 0, 'f', 3);
+        }
+        qInfo("IDLE sheet phase %d/%d: t=%.3fs (%.3f of period) applied[%s] expected[%s]",
+              phaseIndex, kPhaseCount, double(elapsed), double(elapsed / periodSeconds),
+              qPrintable(applied.join(QStringLiteral(","))),
+              qPrintable(expected.join(QStringLiteral(","))));
+
+        /*交叉核对：这一帧**实际**施加的偏移必须等于按配置算出来的期望值。
+           少了这一条，出图用例对"驱动器到底跑没跑"是瞎的（一串相同的帧也能过）。*/
+        for (const Live2DMoodPreset::IdleSwayEntry &entry : entries)
+        {
+            const float actual = renderer.idleSwayOffset(entry.parameterId);
+            const float wanted = static_cast<float>(
+                double(entry.amplitude) * std::sin(2.0 * M_PI *
+                                                    (double(elapsed) / double(entry.periodSeconds) +
+                                                     double(entry.phase))));
+            QVERIFY2(std::fabs(actual - wanted) <= 0.01f,
+                     qPrintable(QStringLiteral("相位 %1：%2 实际偏移 %3 与期望 %4 不符 —— "
+                                               "这一帧不在它标称的相位上")
+                                    .arg(phaseIndex)
+                                    .arg(entry.parameterId)
+                                    .arg(double(actual))
+                                    .arg(double(wanted))));
+        }
+    }
+
+    /*只测量、不判断：给出"第 k 帧与第 0 帧差多少像素"，并排看的时候心里有数。*/
+    const QImage first = frames.first();
+    for (int index = 1; index < frames.size(); ++index)
+    {
+        const QImage &other = frames[index];
+        int differingPixels = 0;
+        for (int y = 0; y < first.height(); ++y)
+        {
+            const uchar *left = first.constScanLine(y);
+            const uchar *right = other.constScanLine(y);
+            for (int x = 0; x < first.width(); ++x)
+            {
+                const int offset = x * 4;
+                if (left[offset] != right[offset] || left[offset + 1] != right[offset + 1] ||
+                    left[offset + 2] != right[offset + 2] || left[offset + 3] != right[offset + 3])
+                    ++differingPixels;
+            }
+        }
+        qInfo("IDLE sheet diff(phase%d vs phase0): %d/%d pixels (%.2f%%)", index, differingPixels,
+              first.width() * first.height(),
+              100.0 * double(differingPixels) / double(first.width() * first.height()));
+    }
+    qInfo("IDLE sheet: %d frames %dx%d saved: %s", savedPaths.size(), expectedSize.width(),
+          expectedSize.height(), qPrintable(savedPaths.join(QStringLiteral(" "))));
 }
 
 QTEST_MAIN(TestLive2DOffscreen)

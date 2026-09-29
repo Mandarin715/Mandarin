@@ -1046,40 +1046,64 @@ void TestLive2DWindow::shapesWindowFromRenderedModel()
                             .arg(window.width())
                             .arg(window.height())));
 
-    // 与绘制结果里的人物包围盒对照（允许一个采样格的误差）。
-    // 注意换算：painted 是设备像素，接受区是逻辑坐标，要按 painted/窗口 的实际比例折回来。
-    QRegion paintedRegion(QBitmap::fromImage(
-        painted.convertToFormat(QImage::Format_ARGB32).createAlphaMask()));
-    QVERIFY2(!paintedRegion.isEmpty(), "窗口绘制结果全透明，等于什么都没画");
-    const QRect paintedBounds = paintedRegion.boundingRect();
+    // 与绘制结果里的人物区对照。注意换算：painted 是设备像素，接受区是逻辑坐标，
+    // 要按 painted/窗口 的实际比例折回来。
+    //
+    // ⚠️ 口径为什么从"两个包围盒大致相等"改成"包含 + 跨度"（待机摆动上线后暴露的）：
+    // 接受区是**粗网格**（stride 8）采样出来的，人物区是逐像素精确量出来的。亚托莉头顶有
+    // 一根细长的呆毛 —— 网格完全可以整根跳过它，于是两个包围盒的上边界能差 20+ 像素。
+    // 那不是"命中判定坏了"，而是"拿采样值去比精确值"这个量法本身不成立：以前姿势几乎不动
+    // （只有呼吸），呆毛恰好被某个采样点打到，差值小到能过容差；现在待机摆动让身体一直在动
+    // （重心 ±3.5°、头 ±2.5°），呆毛位置一变，20 像素的差就顶破容差，且每跑必现。
+    // （"painted 与 m_scaledImg 逐位相同"由 paintsRegisteredFrameWithoutResampling 单独钉住，
+    //  所以这里不存在"画的和登记的不是同一帧"这种解释。）
+    //
+    // 两条对采样不敏感的判据，守的仍是原来那件事 —— 接受区必须**贴着人物**：
+    //   ① 接受区必须落在人物区内部（每边放一个采样格的余量）：不许"人物之外还能点"；
+    //   ② 接受区在横竖两个方向都要覆盖人物跨度的 80% 以上：不许"只有胸口一小块能点"。
+    QRect paintedOpaqueDeviceBounds;
+    QVERIFY2(opaqueBounds(painted, 9, &paintedOpaqueDeviceBounds),
+             "窗口绘制结果里没有 alpha ≥ 10 的像素（命中判定会认为整窗都不可点）");
     const double deviceToLogical =
         window.width() > 0 ? static_cast<double>(window.width()) / painted.width() : 1.0;
     const QRect figureBounds(
-        static_cast<int>(std::lround(paintedBounds.x() * deviceToLogical)),
-        static_cast<int>(std::lround(paintedBounds.y() * deviceToLogical)),
-        static_cast<int>(std::lround(paintedBounds.width() * deviceToLogical)),
-        static_cast<int>(std::lround(paintedBounds.height() * deviceToLogical)));
-    const int tolerance = kStride * 2;
-    QVERIFY2(qAbs(acceptedBounds.x() - figureBounds.x()) <= tolerance &&
-                 qAbs(acceptedBounds.y() - figureBounds.y()) <= tolerance &&
-                 qAbs(acceptedBounds.width() - figureBounds.width()) <= tolerance * 2 &&
-                 qAbs(acceptedBounds.height() - figureBounds.height()) <= tolerance * 2,
-             qPrintable(QStringLiteral("可交互区(%1,%2 %3x%4)与人物绘制区(%5,%6 %7x%8)对不上")
+        static_cast<int>(std::lround(paintedOpaqueDeviceBounds.x() * deviceToLogical)),
+        static_cast<int>(std::lround(paintedOpaqueDeviceBounds.y() * deviceToLogical)),
+        static_cast<int>(std::lround(paintedOpaqueDeviceBounds.width() * deviceToLogical)),
+        static_cast<int>(std::lround(paintedOpaqueDeviceBounds.height() * deviceToLogical)));
+    const QRect acceptedWithGridSlack =
+        figureBounds.adjusted(-kStride, -kStride, kStride, kStride);
+    const double acceptedWidthRatio =
+        figureBounds.width() > 0 ? double(acceptedBounds.width()) / figureBounds.width() : 0.0;
+    const double acceptedHeightRatio =
+        figureBounds.height() > 0 ? double(acceptedBounds.height()) / figureBounds.height() : 0.0;
+
+    qInfo("Windows：断言 clearMask + alpha 命中判定（Tachie 同款），逻辑画布=%dx%d，"
+          "渲染帧=%dx%d，绘制实心像素=%d，可交互区=%d,%d %dx%d（采样 %d/%d），"
+          "人物区(alpha≥10)=%d,%d %dx%d，跨度比=%.3f/%.3f",
+          content.width(), content.height(), frame.width(), frame.height(), paintedOpaque,
+          acceptedBounds.x(), acceptedBounds.y(), acceptedBounds.width(), acceptedBounds.height(),
+          acceptedCount, sampledCount, figureBounds.x(), figureBounds.y(), figureBounds.width(),
+          figureBounds.height(), acceptedWidthRatio, acceptedHeightRatio);
+
+    //① 包含：人物之外不许有可交互区（允许一个采样格的边界余量）
+    QVERIFY2(acceptedWithGridSlack.contains(acceptedBounds),
+             qPrintable(QStringLiteral("可交互区(%1,%2 %3x%4)超出了人物区(%5,%6 %7x%8)一个采样格"
+                                       "以上 —— 人物之外还有能点的区域")
                             .arg(acceptedBounds.x())
                             .arg(acceptedBounds.y())
                             .arg(acceptedBounds.width())
                             .arg(acceptedBounds.height())
-                            .arg(figureBounds.x())
-                            .arg(figureBounds.y())
-                            .arg(figureBounds.width())
-                            .arg(figureBounds.height())));
-
-    qInfo("Windows：断言 clearMask + alpha 命中判定（Tachie 同款），逻辑画布=%dx%d，"
-          "渲染帧=%dx%d，绘制不透明像素=%d，可交互区=%d,%d %dx%d，人物绘制区=%d,%d %dx%d",
-          content.width(), content.height(), frame.width(), frame.height(), paintedOpaque,
-          acceptedBounds.x(), acceptedBounds.y(), acceptedBounds.width(),
-          acceptedBounds.height(), figureBounds.x(), figureBounds.y(), figureBounds.width(),
-          figureBounds.height());
+                            .arg(acceptedWithGridSlack.x())
+                            .arg(acceptedWithGridSlack.y())
+                            .arg(acceptedWithGridSlack.width())
+                            .arg(acceptedWithGridSlack.height())));
+    //② 跨度：接受区必须覆盖人物的大部分（粗网格采样会漏掉呆毛那种细结构，所以不要求相等）
+    QVERIFY2(acceptedWidthRatio >= 0.8 && acceptedHeightRatio >= 0.8,
+             qPrintable(QStringLiteral("可交互区只覆盖了人物的 %1%（宽）/ %2%（高）—— "
+                                       "命中判定退化成了一小块")
+                            .arg(acceptedWidthRatio * 100.0, 0, 'f', 1)
+                            .arg(acceptedHeightRatio * 100.0, 0, 'f', 1)));
 #endif
 }
 

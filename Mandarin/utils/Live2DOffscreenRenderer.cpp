@@ -38,6 +38,8 @@
 
 #include <GL/glew.h>
 
+#include <cmath>
+
 namespace Csm = Live2D::Cubism::Framework;
 
 namespace
@@ -91,6 +93,10 @@ constexpr float kMaxFrameDeltaSeconds = 0.1f;
   节奏取 3~5 次/秒：与正常语速同量级（每秒约 4~6 个音节，每个音节一开一合）。需求明确要求"不规则"，所以每次过零都重新摇频率与振幅 ——
   干净正弦读起来像缝纫机。*/
 const QString kSpeakingMouthParameter = QStringLiteral("ParamMouthOpenY");
+/*嘴**形**参数：它属于**心情**（本模型 moc 声明 [-1,0]），不是身体的任何动作。
+   待机摆动与说话扑动都必须跳过它 —— 写了它就会与情绪预设互相打架
+   （用户看到的是"说话/呼吸时表情被抹掉"）。它是这里的第二条禁用通道。*/
+const QString kSpeakingMouthFormParameter = QStringLiteral("ParamMouthForm");
 /*开合频率：**3~5 次/秒**。最初写的是 8~10，实机一看像在快速嘀嗒 —— 正常语速约每秒 4~6 个
   音节，9Hz 的开合远快于任何人说话时的嘴。3~5 与语速同量级，看着像"在说话"而不是"在抖"。*/
 constexpr float kSpeakingFlapMinHz = 3.0f;
@@ -329,6 +335,11 @@ class OffscreenUserModel : public Csm::CubismUserModel
 
         // 眨眼 / 呼吸 / 物理统一由调度器驱动（这里**不能**再单独调 _physics->Evaluate）
         _updateScheduler.OnLateUpdate(_model, deltaSeconds);
+
+        /*待机摆动（"站着、重心在动"）与呼吸同一段：**加法**，基准是本帧参数当前的值
+           （即心情覆盖刚写下的绝对基准）。放在 SaveParameters() 之后是必须的 ——
+           否则这一次摆动的结果会被存成下一帧的基准、再叠一遍（见 applyIdleSway）。*/
+        applyIdleSway(deltaSeconds);
 
         /*情绪的睁闭眼乘数必须在 OnLateUpdate **之后**：眨眼刚把 ParamEyeLOpen/ROpen
           绝对赋值成本帧的眨眼进度，这里再乘上情绪给的系数 —— 顺序反了就什么都看不见
@@ -795,12 +806,119 @@ class OffscreenUserModel : public Csm::CubismUserModel
         m_eyeOpennessMultiplier.clear();
     }
 
+    /*待机摆动的一帧：把 `amplitude × sin(2π(t/period + phase))` **加到**参数上。
+       （数据 schema 与"语义名 → 参数 ID"的解析都在 Live2DMoodPreset::loadIdle 里，
+        这里只认参数 ID 与模型自己声明的范围。）
+
+      位置在 tick() 里 `SaveParameters()` **之后**、与呼吸/物理同一段，理由见头文件：
+      驱动器这一帧写下的值不进"本帧保存值"，下一帧 LoadParameters 就不会把上一次的摆动
+      当成新基准再叠一遍（否则它会发散）。与呼吸的"加法"是同一种语义。
+
+      t 是**累计虚拟时间**（帧步长累加、含 0.1s 夹取），不是墙钟：相位因此可以按注入的
+      时间完全复现，机器被抢占也不会让"这一帧落在周期里的哪一点"漂移。*/
+    void applyIdleSway(float deltaSeconds)
+    {
+        m_idleSwayOffsets.clear();
+        if (_model == nullptr || m_idleSwayEntries.isEmpty())
+            return;
+
+        m_idleSwayElapsedSeconds += deltaSeconds;
+
+        /*声明范围**一帧取一次**（而不是每条轴取一次）：declaredParameterRanges() 会遍历模型
+           全部 88 个参数建表，放在逐条循环里就是每帧 3 倍的浪费。*/
+        const QHash<QString, Live2DOffscreenRenderer::DeclaredRange> ranges =
+            declaredParameterRanges();
+
+        for (const Live2DMoodPreset::IdleSwayEntry &entry : m_idleSwayEntries)
+        {
+            /*三道防御，每一道都对应"数据写错时屏幕上会出现什么"：
+                1) 参数 ID 为空 / 周期非正 / 幅度或相位不是有限数 → 跳过
+                   （除零与 NaN 会顺着参数表污染整个模型）；
+                2) 驱动器/物理占用的参数（breath / hair*）→ **即使数据里写了也跳过**。
+                   Live2DMoodPreset 装载时已经剔除并告警过，这里再挡一层：这个入口是公开的，
+                   谁都能喂条目进来，"永不写坏别人的动作"必须是驱动器自己的纪律；
+                3) 嘴形（ParamMouthForm）同理 —— 它是心情的，不是身体的。
+               （第 2、3 条与 isIdleSwayActive() 共用同一个判定，
+                 免得"报激活"与"真的写了什么"各说各话）*/
+            if (!isApplicableIdleSwayEntry(entry))
+                continue;
+
+            const Live2DOffscreenRenderer::DeclaredRange range =
+                ranges.value(entry.parameterId);
+            /*span ≤ 0 = 模型没有这个参数（或声明退化）：夹取会把值钉死在 0，
+               不如整条跳过 —— 那正是"数据表与模型对不上"的形态。*/
+            if (!(range.max > range.min))
+                continue;
+
+            const float angle = 2.0f * static_cast<float>(M_PI) *
+                                (m_idleSwayElapsedSeconds / entry.periodSeconds + entry.phase);
+            const float wanted = entry.amplitude * std::sin(angle);
+
+            const Csm::csmString id(entry.parameterId.toUtf8().constData());
+            const Csm::CubismIdHandle handle =
+                Csm::CubismFramework::GetIdManager()->RegisterId(id);
+            /*基准取参数**当前**值（= 动作/心情刚写下的绝对基准，见 tick 的顺序），
+               所以摆动是加在它上面，不是盖掉它。*/
+            const float base = _model->GetParameterValue(handle);
+            const float applied = std::min(range.max, std::max(range.min, base + wanted));
+            _model->SetParameterValue(handle, applied);
+            /*记下**真正施加**的偏移（夹取之后）而不是"想要的偏移"：
+               校准与测试要看的必须是模型实际发生了什么。*/
+            m_idleSwayOffsets.insert(entry.parameterId, applied - base);
+        }
+    }
+
     float parameterValue(const QString &parameterId) const
     {
         if (_model == nullptr || parameterId.isEmpty())
             return 0.0f;
         const Csm::csmString id(parameterId.toUtf8().constData());
         return _model->GetParameterValue(Csm::CubismFramework::GetIdManager()->RegisterId(id));
+    }
+
+    /*待机摆动的条目表（**整组替换**，与情绪覆盖表同一个理由：换了数据之后上一条轴必须
+       真的消失，否则它会一直往参数上加东西）。累计时间**不重置**：换表不该让相位跳一下
+       （相位跳变在屏幕上是可见的抽动）。*/
+    void setIdleSwayEntries(const QVector<Live2DMoodPreset::IdleSwayEntry> &entries)
+    {
+        m_idleSwayEntries = entries;
+        m_idleSwayOffsets.clear(); // 上一帧的偏移属于上一张表，不能留
+    }
+
+    /*这条条目能不能落到参数上：数值/周期合法，且不是"别人的"参数（呼吸/头发/嘴形）。
+       与 applyIdleSway 共用同一个判定 —— 否则 isIdleSwayActive() 会与"真的写了什么"各说各话。*/
+    static bool isApplicableIdleSwayEntry(const Live2DMoodPreset::IdleSwayEntry &entry)
+    {
+        if (entry.parameterId.isEmpty() || !(entry.periodSeconds > 0.0f) ||
+            !std::isfinite(entry.amplitude) || !std::isfinite(entry.phase))
+            return false;
+        return !Live2DMoodPreset::isUpdaterOwnedParameter(entry.parameterId) &&
+               entry.parameterId != kSpeakingMouthFormParameter;
+    }
+
+    /*"摆动真的在施加" = 至少有一条**能落地**的轴（而且模型确实声明了这个参数）。
+       只数"条目表非空"是不够的：一份全是非法条目的表（错字/换了模型）会让调用方以为它在动。*/
+    bool isIdleSwayActive() const
+    {
+        if (_model == nullptr)
+            return false;
+        for (const Live2DMoodPreset::IdleSwayEntry &entry : m_idleSwayEntries)
+        {
+            if (!isApplicableIdleSwayEntry(entry))
+                continue;
+            const Live2DOffscreenRenderer::DeclaredRange range =
+                declaredRangeOf(entry.parameterId);
+            if (range.max > range.min)
+                return true;
+        }
+        return false;
+    }
+
+    float idleSwayElapsedSeconds() const { return m_idleSwayElapsedSeconds; }
+
+    float idleSwayOffset(const QString &parameterId) const
+    {
+        return m_idleSwayOffsets.value(parameterId, 0.0f);
     }
 
     /*眨眼驱动器**本帧写下的原始值**（0 = 闭紧、1 = 全睁）。
@@ -1287,6 +1405,12 @@ class OffscreenUserModel : public Csm::CubismUserModel
     bool m_eyeMultiplierExplicit = false;
 
     Csm::ACubismMotion *m_idleMotion = nullptr; // 待机动作；所有权在 _motionManager
+    /*待机摆动（见 applyIdleSway）：条目表由 setIdleSway 喂进来（语义名已在数据层解析成
+       参数 ID），每个参数 ID 在**本帧**真正施加的偏移存一份给"读回"用，累计时间则是相位的
+       唯一时基。三者都是"这一帧发生了什么"的可观察面，校准与测试全靠它们。*/
+    QVector<Live2DMoodPreset::IdleSwayEntry> m_idleSwayEntries;
+    QHash<QString, float> m_idleSwayOffsets;
+    float m_idleSwayElapsedSeconds = 0.0f;
     /*眨眼 Updater 拿的是这个标志的**引用**：动作没更新参数的那些帧才让眨眼生效。
       成员不能挪位置/不能是临时量，否则引用悬空。*/
     Csm::csmBool _motionUpdated = false;
@@ -1846,6 +1970,34 @@ void Live2DOffscreenRenderer::setDisplayRatios(float widthRatio, float heightRat
     const float height = std::min(1.0f, std::max(0.05f, heightRatio));
     if (m_impl->model != nullptr)
         m_impl->model->setDisplayRatios(width, height);
+}
+
+void Live2DOffscreenRenderer::setIdleSway(const QVector<Live2DMoodPreset::IdleSwayEntry> &entries)
+{
+    if (m_impl->model == nullptr)
+        return;
+    m_impl->model->setIdleSwayEntries(entries);
+}
+
+float Live2DOffscreenRenderer::idleSwayOffset(const QString &parameterId) const
+{
+    if (m_impl->model == nullptr || parameterId.isEmpty())
+        return 0.0f;
+    return m_impl->model->idleSwayOffset(parameterId);
+}
+
+float Live2DOffscreenRenderer::idleSwayElapsedSeconds() const
+{
+    if (m_impl->model == nullptr)
+        return 0.0f;
+    return m_impl->model->idleSwayElapsedSeconds();
+}
+
+bool Live2DOffscreenRenderer::isIdleSwayActive() const
+{
+    if (m_impl->model == nullptr)
+        return false;
+    return m_impl->model->isIdleSwayActive();
 }
 
 void Live2DOffscreenRenderer::setMeasureMode(bool on)
