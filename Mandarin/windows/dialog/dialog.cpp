@@ -596,6 +596,13 @@ void Dialog::initServices()
     connect(m_vitsPlayer, &QMediaPlayer::playbackStateChanged, this,
             [this](QMediaPlayer::PlaybackState state)
             {
+                /*说话状态（嘴巴开合的唯一来源）。
+                   位置就在这条**既有**连接里，不另加一条：播放器的状态只有一个，
+                   两处各听一次既多余又可能给出不一致的时序。
+                   playing → true；stopped/error 归为 false ——
+                   出错时嘴必须停下来（否则一个坏文件会让她的嘴一直动）。*/
+                emit requestSpeakState(state == QMediaPlayer::PlayingState);
+
                 if (state == QMediaPlayer::StoppedState)
                 {
                     if (m_vitsTempFile)

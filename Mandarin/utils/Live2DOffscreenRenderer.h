@@ -52,6 +52,39 @@ class Live2DOffscreenRenderer
       情绪功能自关（预设文件缺失/非法）时用它，避免留下上一帧的残留情绪。*/
     void clearParameterOverrides();
 
+    /***心情过渡时长**（毫秒；0 = 不插值，立刻跳到目标）。
+
+      为什么需要它：`setParameterOverrides` 是**整组原子替换**，于是换心情时参数在一帧里
+      从 0.9 直接落到 0（用户看到的就是"顿一下"）。现在覆盖值按**时间**逐帧逼近目标，
+      一帧只走"帧时间 / 过渡时长"那么大的一步。
+
+      时长由 `character/live2dMoodBlendMs` 提供（窗口层从 config.ini 读，默认 200ms）：
+      fps 与渲染倍数都是可调的，过渡手感当然也要可调 —— 硬编码一个常数等于把用户
+      已经能调的两件事之一锁死。
+
+      实现约定（三条都是可观察行为，见 test_live2doffscreen 的 BLEND 系列）：
+        - 时间制：每帧位移 = 总差值 × (帧时间 / 时长)，所以 60fps 与 120fps 手感一致；
+        - **必须收敛**：剩余差值小于 kBlendSnapEpsilon 时直接落到目标值。
+          纯指数逼近（value += (target-value) × k × dt）永远到不了目标，
+          读回值会一直是"接近但不等于" —— 那样参数永远停在过渡态，测试也读不到精确值；
+        - 同一个目标重复施加是**幂等**的（不重启过渡）：值不会被打回起点。*/
+    void setMoodBlendDurationMs(int milliseconds);
+
+    /***说话状态**：打开后渲染器给嘴加一层"纸片人开合"（不是音素口型、也不是音量驱动）。
+
+      为什么要有它：TTS 在播的时候脸上什么都不会动，看着像"她在放录音"。
+
+      实现约定（都是可观察行为，见 test_live2doffscreen 的 SPEAK 系列）：
+        - 只驱动 **`ParamMouthOpenY`**（嘴的开口量），**绝不动 `ParamMouthForm`**：
+          模型声明的 LipSync 组里两者都有，但 MouthForm 是嘴的**形状**，属于心情 ——
+          两个东西都去写就是互相打架；
+        - 振荡不规则（每次过零换一个目标频率与振幅），干净正弦读起来像机器；
+        - 叠加方式是 `clamp(心情值 + 扑动量, min, max)`，上限/下限取模型**声明**的范围
+          （`declaredParameterRanges()`），绝不硬编码：所以"说话时刚好很惊讶"仍然是张大嘴；
+        - 停止说话后扑动幅度按与心情过渡**同一套机制**衰减回 0（不是啪一下闭嘴）；
+        - 不在说话时扑动量恒为 0（对渲染结果零影响）。*/
+    void setSpeaking(bool speaking);
+
     /***情绪睁闭眼乘数**（默认 1.0 = 眨眼自己说了算）。
 
       语义：对模型声明的**眨眼参数**（model3.json 的 Groups[EyeBlink]），
@@ -64,6 +97,14 @@ class Live2DOffscreenRenderer
            "这个心情不碰眼睛"的旧行为，用来量"闭眼到底改变了多少像素"；
         2) 校准/实验时可以单独试某一个开度，不必伪造一整个心情。*/
     void setEyeOpennessMultiplier(const QHash<QString, float> &moodValues);
+
+    /*解除上面那份**显式**乘数，让眼睛重新跟随当前覆盖表（心情）。
+
+       为什么要这个"解除"：显式乘数在过渡逻辑里优先于覆盖表（否则校准用的乘数会被
+       每帧重推回心情值，实测画面差 0 像素）。所以校准/实验用完必须显式放手 ——
+       否则那份乘数会把之后所有心情的眼睛都钉住。换心情（setParameterOverrides）
+       会自动解除。*/
+    void clearEyeOpennessMultiplierOverride();
 
     /*读取参数当前值。用于验证覆盖是否真的生效（比对比两帧像素可靠：
       两帧之间物理动画本来就会变，像素差异无法证明是参数造成的）。*/
@@ -170,8 +211,33 @@ class Live2DOffscreenRenderer
        → 默认状态设为隐藏水印，不要照字面把"关闭水印"实现成置 0。*/
     void setWatermarkVisible(bool visible);
 
-    /*水印参数 ID（由模型目录里的 *水印*.exp3.json 推出，如 Param137）。置 0 才能关掉水印。*/
+    /*水印参数 ID（由模型目录里的 *水印.exp3.json 推出，如 Param137）。置 0 才能关掉水印。*/
     QString watermarkParamId() const;
+
+    /***仅测试用：指定**下一帧**的时间步长**（秒），只生效一帧。
+
+      为什么要它（这是本阶段唯一一处测试专用的注入钩子，理由必须写清楚）：
+      `renderFrame` 的帧步长来自**墙钟**，并且被夹在 kMaxFrameDeltaSeconds = 0.1s 以内。
+      于是"连续渲两帧"在没有抢占时是几毫秒的虚拟时间，在被抢占时却会**每一步都吃满 100ms**
+      —— 而这个夹取让"墙钟间隔"与"虚拟时间"彻底脱钩：100ms 的墙钟间隔与 150ms 的
+      墙钟间隔给出的是**同一个** 100ms 步长。
+      实测后果（2026-09-29，26 个 CPU 燃烧线程把 24 逻辑核压到 100%）：
+      test_live2dwindow 的 moodEyeOpennessComposesWithBlink 里"相邻两帧"的背景漂移
+      从空闲时的 0~5 像素涨到 1276 / 4121 像素，而闭眼的信号只有 1223 像素
+      （两帧眨眼原始值都是 1.0000）—— "漂移"与"信号"同量级，比值断言必然会红。
+      注意这条**不是**偶发时序抖动：负载下每一帧都吃满夹取上限，所以它每次都发生在同一处。
+
+      所以"相邻帧"这件事必须由**虚拟时间**钉住，而不是由墙钟碰运气：置 0 之后
+      呼吸/待机动作/物理/眨眼都停在原地，只有我们要观察的那一个量（显式睁闭眼乘数）在变。
+      步长**仍然过 kMaxFrameDeltaSeconds 的夹取**，所以它走的是与真实路径同一条代码路径，
+      只是输入不同；生产代码里没有任何调用点，时间步长在真实运行中不受影响
+      （真实计时路径由本文件其他用例的真实墙钟帧循环覆盖：animatesAcrossFrames /
+      sampleEyeOpenness / waitForMoodSettle 都在真的等时间）。
+
+      传 nullptr 或调用 resetNextFrameDeltaForTest() = 回到墙钟路径。
+      用法：渲染一帧前调一次，它只影响紧接着的那一帧。*/
+    void setNextFrameDeltaForTest(float seconds);
+    void resetNextFrameDeltaForTest();
 
     bool isLoaded() const;
 

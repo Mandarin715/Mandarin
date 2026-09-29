@@ -189,6 +189,10 @@ int main(int argc, char *argv[])
                      &CharacterWindowBase::ShowInnerThought);
     QObject::connect(&dialogWin, &Dialog::requestHideInnerThought, characterWin,
                      &CharacterWindowBase::HideInnerThought);
+    /*TTS 播放状态 → 立绘说话（Live2D 让嘴巴开合；PNG 路径是空实现）。
+       走基类的槽是为了让两种立绘共用同一条连接：连到派生类就要在这里写 if 分支。*/
+    QObject::connect(&dialogWin, &Dialog::requestSpeakState, characterWin,
+                     &CharacterWindowBase::SetSpeaking);
 
     /*托盘*/
     QSystemTrayIcon tray;

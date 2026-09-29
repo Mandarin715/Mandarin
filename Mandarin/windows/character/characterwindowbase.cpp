@@ -131,11 +131,21 @@ void CharacterWindowBase::SetTachieSize(int size)
     relayoutContent();
 }
 
+/*TTS 播放状态（说话开关）。
+
+  PNG 路径的默认实现**故意什么都不做**：一张静止立绘没有可以开合的嘴，
+  强行做点什么（换图/抖一下）反而会引入用户没要求的行为。
+  这里不打日志也是刻意的 —— 每次播放开始/结束都打一条只会刷屏。
+  Live2D 路径覆写它（见 Live2DCharacterWindow::SetSpeaking）。*/
+void CharacterWindowBase::SetSpeaking(bool speaking)
+{
+    Q_UNUSED(speaking);
+}
+
 void CharacterWindowBase::contextMenuEvent(QContextMenuEvent *event)
 {
     emit requestToggleVisible(); //发出信号
 }
-
 //鼠标按下
 void CharacterWindowBase::mousePressEvent(QMouseEvent *event)
 {

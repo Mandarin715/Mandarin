@@ -77,6 +77,11 @@ class Dialog : public QWidget
     void requestSetCharTachie(QString TachieName);
     void requestShowInnerThought(QString text);
     void requestHideInnerThought();
+    /*TTS 是否在播（true = 开始/继续播，false = 停止或出错）。
+       立绘据此让嘴巴开合 —— 是"纸片人开合"，不做音素口型、也不看音量。
+       为什么用布尔而不是把音频数据送出去：需求要的就是"在说话"这一个信号，
+       音频分析要么引依赖、要么在播放线程里做活儿，得不偿失。*/
+    void requestSpeakState(bool speaking);
 
   public slots:
     void ReloadAIConfig();          // 完整重载（角色切换/F5）

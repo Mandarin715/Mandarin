@@ -88,6 +88,13 @@ class TestLive2DWindow : public QObject
     /*校准素材：14 个原型各出一张固定区域的脸部裁切图（只出图，不判断好坏）*/
     void rendersMoodArchetypeCalibrationSheet();
 
+    /*---------- 心情过渡与说话嘴巴的窗口层接线（本阶段新增） ----------*/
+    /*character/live2dMoodBlendMs 必须真的被读出来并夹取（硬编码 200ms 过不了）*/
+    void moodBlendDurationComesFromConfig();
+    /*窗口的 SetSpeaking（Dialog::requestSpeakState 的落点）必须一路走到渲染器：
+       嘴巴随时间开合、且回落到心情值。这条钉住"接线"，渲染器级的数学另有专测。*/
+    void setSpeakingDrivesMouthFlapThroughWindow();
+
   private:
     static QString modelDir();
     static QString modelDirFor(const QString &name);
@@ -116,6 +123,28 @@ class TestLive2DWindow : public QObject
           读回值是"预设值 + 摆动"，不能与预设值直接比较；
         - ParamBreath / ParamHair*：物理/呼吸所有，预设根本不写（见 Live2DMoodPreset）。*/
     static QStringList readBackParameters();
+
+    /*切换心情后**等过渡走完**（并且真的渲出一帧），然后才让调用方去读参数/读帧。
+
+      为什么非等不可（两个各自独立的理由，缺一都会让断言读到错误的东西）：
+        ① 覆盖值现在是**逐帧过渡**的（见 Live2DOffscreenRenderer::setMoodBlendDurationMs）：
+           刚 reloadContent 完读回来的还是上一个心情的值 —— 直接断言"等于预设值"必然失败，
+           而那不是 bug，是过渡正好走到一半；
+        ② applyMood 不再同步渲染一帧（那 4ms 主线程卡顿正是本阶段要修的"顿"的一部分），
+           所以要等帧循环把新参数渲出来。窗口隐藏时帧循环是停的，这里就自己渲。
+
+      ⚠️ 这不等于"把断言放宽"：等待之后的断言仍然是**精确**的（参数必须等于预设值、
+      帧必须与切换前不同），只是把"什么时候读"从一个随机的瞬间改成"过渡已经结束"。
+      过渡本身的行为由 test_live2doffscreen 的 BLEND 系列单独钉住，
+      以及本文件 moodBlendDurationComesFromConfig 钉住配置键。
+
+      为什么要顺带推动一帧：过渡参数只在 renderFrame 的 tick 里推进，光等墙钟不动帧
+      是永远走不完的（帧循环在窗口隐藏时也是停的）。
+
+      blendMs：本次要等的过渡时长；传 0 则用**当前生效**的 200ms 默认值。
+      返回 false 表示等待期间一帧都渲不出来（真实的失败，调用方应当断言）。*/
+    static bool waitForMoodSettle(Live2DCharacterWindow *window, int blendMs = 0,
+                                 int extraFrames = 3);
 
     /*在一串真实帧上采样眼睛（与眨眼原始值）。
 
@@ -146,7 +175,10 @@ class TestLive2DWindow : public QObject
       eyeMultiplier：这一帧的睁闭眼乘数（1.0 = 眼睛完全交给眨眼；<1 = 情绪把眼睛压小）。
       **必须显式给**，因为它决定了帧的样子 —— renderEyeProbe 内部在读值之前会把
       乘数设成这个值再渲染，所以"读到的值"与"渲出的帧"必定属于同一帧。*/
-    static void renderEyeProbe(Live2DCharacterWindow *window,
+    /*返回 false = 这一帧没渲出来（窗口被销毁/渲染失败），调用方不能拿空帧去比对。
+       为什么要这个返回值：下面所有"相邻帧"证据都必须成立在**真的渲出了一帧**之上，
+       否则 QImage() 的尺寸比较会给出与时间无关的假结论。*/
+    static bool renderEyeProbe(Live2DCharacterWindow *window,
                                const QHash<QString, float> &eyeMultiplier,
                                const QString &eyeParameterId, QImage *frame, float *composed,
                                float *blink);
@@ -267,6 +299,31 @@ QStringList TestLive2DWindow::readBackParameters()
             QStringLiteral("ParamBrowRY")};
 }
 
+bool TestLive2DWindow::waitForMoodSettle(Live2DCharacterWindow *window, int blendMs,
+                                         int extraFrames)
+{
+    if (window == nullptr)
+        return false;
+
+    /*每次新建窗口时过渡时长的默认值就是 200ms（临时配置里只写 fps/scale），
+       所以这里不必去问窗口要时长；非默认值的用例显式把 blendMs 传进来。*/
+    constexpr int kDefaultBlendMs = 200;
+    const int settleMs = (blendMs > 0 ? blendMs : kDefaultBlendMs) + 120;
+
+    QElapsedTimer clock;
+    clock.start();
+    int rendered = 0;
+    while (clock.elapsed() < settleMs || rendered < extraFrames)
+    {
+        if (clock.elapsed() > settleMs + 2000)
+            break; //兜底：窗口一直渲不出帧时别把测试吊死，交给调用方断言
+        if (window->renderFrameNow())
+            ++rendered;
+        QTest::qWait(10);
+    }
+    return rendered > 0;
+}
+
 TestLive2DWindow::EyeBlinkSamples
 TestLive2DWindow::sampleEyeOpenness(Live2DCharacterWindow *window, const QString &eyeParameterId,
                                     const QString &moodName, int samples, int waitMs)
@@ -276,7 +333,13 @@ TestLive2DWindow::sampleEyeOpenness(Live2DCharacterWindow *window, const QString
         return result;
 
     if (!moodName.isEmpty())
+    {
         window->reloadContent(moodName); //会立刻出一帧（本函数随后每帧都取一次）
+        /*⚠️ 但那一帧**不保证**已经带上新心情：覆盖值是逐帧过渡的，而且 applyMood 不再同步
+           渲染。这里先等过渡走完，后面的采样窗口里读到的才是这个心情真正该有的值
+           （不然前几十帧采到的是"上一个心情 → 这个心情"的半路值，区间会被污染）。*/
+        waitForMoodSettle(window);
+    }
 
     /*每帧之间等的毫秒数（默认 100）决定"采样窗口在**虚拟时间**里有多长"。
       眨眼间隔是随机 0~7s 一次（默认 SetBlinkingInterval(4.0)），
@@ -315,21 +378,24 @@ TestLive2DWindow::sampleEyeOpenness(Live2DCharacterWindow *window, const QString
     return result;
 }
 
-void TestLive2DWindow::renderEyeProbe(Live2DCharacterWindow *window,
+bool TestLive2DWindow::renderEyeProbe(Live2DCharacterWindow *window,
                                       const QHash<QString, float> &eyeMultiplier,
                                       const QString &eyeParameterId, QImage *frame, float *composed,
                                       float *blink)
 {
+    if (window == nullptr)
+        return false;
     //先定这一帧的睁闭眼乘数，再渲染：读到的值与渲出的帧才属于同一帧
     window->setEyeOpennessMultiplierForTest(eyeMultiplier);
     if (!window->renderFrameNow())
-        return;
+        return false;
     if (frame != nullptr)
         *frame = window->renderedImage();
     if (composed != nullptr)
         *composed = window->parameterValue(eyeParameterId);
     if (blink != nullptr)
         *blink = window->blinkValue();
+    return true;
 }
 
 /*把"眼睛全睁"的乘数（= 眨眼自己说了算，值恒为 1）+ "眼睛闭到某心情的开度"
@@ -341,6 +407,48 @@ static QHash<QString, float> eyeMultiplierFrom(const QStringList &eyeParameterId
         multipliers.insert(id, value);
     return multipliers;
 }
+
+namespace {
+/*==================== 眨眼合成用例里"相邻帧"这件事的前提（实测结论，别再踩）====================
+
+  test_live2dwindow 里所有"眼睛闭下去有没有落到屏幕上"的证据都建立在**相邻两帧**之上：
+  只切睁闭眼乘数、连渲两帧，两帧之间物理/呼吸/待机动作几乎不动，于是像素差的主项是眼睛。
+  这个前提**不是"没有 wait 就等于时间没走"**：帧的时间步长取自墙钟，
+  被抢占时一帧的 deltaSeconds 可以是正常值的几十倍 —— 2026-09-29 在 26 个 CPU 燃烧线程
+  把 24 逻辑核压到 100% 时实测复现：
+    drift（连渲两帧、只切乘数）= 712 像素，而 reference 帧之间的眨眼原始值**都是 1.0000**，
+    闭眼造成的 eyeDiff = 1223 ⇒ 比值只有 2x < 5x，用例失败。
+  也就是说 712 那笔漂移纯粹来自"某一帧被卡了很久、呼吸/待机动作跳了一大步"，
+  与眨眼相位无关（眨眼区间是 0 宽）—— 光等"眨眼全睁"挡不住它。
+
+  所以判据改成**条件式的**：连渲两帧，只有在这一对帧真的满足
+    (a) 眨眼全程处于全睁（否则眼睛开度差会被眨眼进度吃掉），且
+    (b) 两帧之间真实流逝的时间够短（否则呼吸/物理已经跳了一大步）
+  时才把它当作"相邻帧"。任一条不满足就重新取一对（不是放宽断言：断言仍是
+  "闭眼像素差必须远超相邻帧漂移"，只是保证用来定标的那对帧真的可比）。
+  两条都不满足时用**超时**报错，而不是悄悄用坏数据继续。====================*/
+
+/*眨眼原始值 >= 这个数才算"全睁"。眨眼状态机的 interval 态恰好给 1.0，
+   所以 0.999 是"落在 interval 态里"的判据，不是"差不多睁着"。*/
+constexpr float kEyeProbeBlinkOpen = 0.999f;
+
+/*一对"相邻帧"之间允许流逝的墙钟上限（毫秒）。
+
+  为什么要有上限：drift 与两帧之间流逝的**时间**成正比（呼吸/待机动作是时间的函数），
+  所以"时间没走"才是这个对比成立的前提。上限不是"性能阈值"，而是"这两帧还算相邻吗"的判据。
+
+  为什么取 150ms：本机 atri（400x936、dpr 1.25）单帧渲染实测 5~10ms（见日志），
+  150ms 已经是正常帧时间的 15~30 倍，只有真的被抢占/换页才会超过它；
+  而空闲时两帧只用 10~20ms，离上限一个数量级，所以不会把正常情形挡在门外。
+  实测（26 个燃烧线程、负载 100%）只需要重试极少数几次就能同时满足 (a)(b)。
+
+  超时给 60s：这个循环里每次重试都要**真的渲一帧**，而在被抢占的机器上一帧可能要几百毫秒，
+  所以"重试次数"不能当超时单位，得用墙钟。60s 远大于眨眼间隔上限（7s）与任何合理抖动，
+  却仍然会在"帧真的渲不出来/眨眼真的卡死"时失败，不会把测试吊死。*/
+constexpr int kEyeProbeMaxGapMs = 150;
+constexpr int kEyeProbeDeadlineMs = 60000;
+} // namespace
+
 QRect TestLive2DWindow::faceRegionOfInterest(const QRect &figureBounds)
 {
     if (figureBounds.isEmpty())
@@ -2392,8 +2500,10 @@ void TestLive2DWindow::applyingMoodChangesRenderedFrame()
     QVERIFY2(window.renderFrameNow(), "中立对照帧渲染失败");
     const QImage controlFrame = window.renderedImage();
 
-    // 换 happy：applyMood 内部会立刻出一帧，所以 renderedImage() 就是心情后的第一帧
+    // 换 happy。⚠️ 必须等过渡走完 + 等帧循环真的渲出那一帧（见 waitForMoodSettle 的说明）：
+    // 不然 moodFrame 拿到的还是中性帧，下面的像素差会是 0 —— 而参数读回又会读到半路的值。
     window.reloadContent(happyMood);
+    QVERIFY2(waitForMoodSettle(&window), "换心情后等不到过渡走完/渲不出帧");
     const QImage moodFrame = window.renderedImage();
     QVERIFY2(!moodFrame.isNull(), "心情帧为空");
 
@@ -2548,7 +2658,9 @@ void TestLive2DWindow::switchingMoodDoesNotAccumulate()
     const QHash<QString, float> happyExpected = preset.parametersForMood(happyMood);
 
     // ① 先确认 happy 真的落到了模型上（否则"切回中立"这条断言毫无意义 —— 什么都没变过）
+    // 等过渡走完再读：覆盖值是逐帧过渡的，刚切完读到的是上一个心情的值（见 waitForMoodSettle）
     window.reloadContent(happyMood);
+    QVERIFY2(waitForMoodSettle(&window), "换到 happy 后等不到过渡走完");
     QVERIFY2(window.renderFrameNow(), "happy 帧渲染失败");
     int happyApplied = 0;
     for (const QString &parameterId : readBack)
@@ -2568,6 +2680,7 @@ void TestLive2DWindow::switchingMoodDoesNotAccumulate()
 
     // ② 切回 neutral：读回值必须**全部**回到中立，一个都不许残留
     window.reloadContent(neutralMood);
+    QVERIFY2(waitForMoodSettle(&window), "切回 neutral 后等不到过渡走完");
     QVERIFY2(window.renderFrameNow(), "neutral 帧渲染失败");
     const QHash<QString, float> neutralExpected =
         preset.parametersForArchetype(QStringLiteral("neutral"));
@@ -2685,36 +2798,125 @@ void TestLive2DWindow::moodEyeOpennessComposesWithBlink()
        被淹没在一个与眼睛无关的大数字里 —— 这条错误设计在开发时真的踩到过。
        关掉乘数（=1.0）正是**旧行为**：眨眼自己说了算，情绪完全压不住眼睛。
 
-       ⚠️ 必须等眨眼处于**全睁**（interval 态，值恒为 1.0）时再量：
-       若这一对相邻帧恰好落在眨眼中，眼睛的开度差就从 (1.0→0.05) 缩成 (0.5→0.02)，
-       像素差会掉到 353 这种量级 —— 实测就是这么抓到偶发失败的（同一个用例
-       上一次跑出 1218、下一次 353，纯粹取决于眨眼相位）。等到全睁再量，
-       读数只由模型几何决定，与时间无关。
-       三次渲染之间没有任何等待 → delta 只有几毫秒，物理不跳、眨眼进度不动。*/
+       ⚠️ "相邻帧"这个前提**必须逐次校验**（见文件上方 kEyeProbeMaxGapMs 的实测记录）：
+        1) 眨眼必须全程处于**全睁**（interval 态）：落在眨眼里时开度差会从 (1.0→0.05)
+           缩成 (0.5→0.02)，实测读数从 1218 掉到 353；
+        2) 两帧之间真实流逝的时间必须够短：时间步长取自墙钟，被抢占时一帧能走几十毫秒的
+           正常量，呼吸/待机动作随之跳一大步 —— 2026-09-29 复现的失败里，两帧眨眼原始值
+           **都是 1.0000**（条件 1 成立）却仍有 712 像素漂移，全部来自这一条。
+        所以下面用"取一对 → 校验两条 → 不合格就重取"的**条件式等待**，
+        超时才报错；而不是"渲两帧然后假设它们是相邻的"。*/
     const QHash<QString, float> openEyes = eyeMultiplierFrom(eyeParameterIds, 1.0f);
     const QHash<QString, float> moodEyes = eyeMultiplierFrom(eyeParameterIds, sleepyMoodValue);
+
+    /*⚠️ 先等中立那一段的过渡彻底走完再动乘数。
+       渲染器现在每帧都会用"当前覆盖表"重推一次睁闭眼乘数（为了让它与过渡中的覆盖值
+       同一帧，见 OffscreenRenderer 的 applyMoodBlend）；若覆盖表还在过渡中，
+       renderEyeProbe 刚设好的乘数会在同一次 tick 里被半路值覆盖掉 ——
+       实测症状就是"眼睛压到 0.05 之后画面只差 0 个像素"。*/
+    QVERIFY2(waitForMoodSettle(&window, 0, 2), "中立过渡没走完，无法做相邻帧对照");
 
     QImage blinkOpenA;
     QImage blinkOpenB;
     float blinkA = 1.0f;
     float blinkB = 1.0f;
-    renderEyeProbe(&window, openEyes, eyeParameter, &blinkOpenA, nullptr, &blinkA);
-    //等待"眨眼全睁"：interval 态占绝大部分时间（间隔 0~7s、闭眼全过程 0.3s），
-    //循环上限给得比最坏情况宽（100 × 100ms = 10s）
-    for (int attempt = 0; attempt < 100 && blinkA < 0.999f; ++attempt)
+    //实际取到的那一对帧之间的墙钟间隔（毫秒）+ 尝试次数：报进日志，是"它们真的相邻"的证据
+    qint64 pairGapMs = -1;
+    int pairAttempts = 0;
     {
-        QTest::qWait(100);
-        renderEyeProbe(&window, openEyes, eyeParameter, &blinkOpenA, nullptr, &blinkA);
+        QElapsedTimer pairClock;
+        QElapsedTimer overall;
+        overall.start();
+        while (true)
+        {
+            ++pairAttempts;
+            pairClock.start();
+            if (!renderEyeProbe(&window, openEyes, eyeParameter, &blinkOpenA, nullptr, &blinkA))
+            {
+                QTest::qWait(20); //帧没渲出来：等一会儿再重试，别把 CPU 打满
+                continue;
+            }
+            if (!renderEyeProbe(&window, openEyes, eyeParameter, &blinkOpenB, nullptr, &blinkB))
+            {
+                QTest::qWait(20);
+                continue;
+            }
+            pairGapMs = pairClock.elapsed();
+            const bool blinkOpen = blinkA >= kEyeProbeBlinkOpen && blinkB >= kEyeProbeBlinkOpen;
+            if (blinkOpen && pairGapMs <= kEyeProbeMaxGapMs)
+                break; //这一对帧真的可比：全睁 + 时间够短
+            /*不合格：多半是落进了一次眨眼（0~7s 随机一次），或者这一对被抢占了很久。
+               用 qWait 让时间过去（眨眼状态机要真的过时间才会走完），再取下一对。
+               ⚠️ 不能紧循环重试：不推进时间的话眨眼永远停在闭着的相位上。*/
+            QTest::qWait(50);
+            if (overall.elapsed() > kEyeProbeDeadlineMs)
+            {
+                QVERIFY2(false,
+                         qPrintable(QStringLiteral(
+                                        "%1s 内找不到一对可比的相邻帧：最后一次 blink=%2~%3"
+                                        "（要求都 ≥%4）、两帧间隔 %5ms（要求 ≤%6ms）——"
+                                        "眨眼卡死或渲染一直在被抢占")
+                                        .arg(kEyeProbeDeadlineMs / 1000)
+                                        .arg(double(blinkA))
+                                        .arg(double(blinkB))
+                                        .arg(double(kEyeProbeBlinkOpen))
+                                        .arg(pairGapMs)
+                                        .arg(kEyeProbeMaxGapMs)));
+            }
+        }
     }
-    QVERIFY2(blinkA >= 0.999f,
-             qPrintable(QStringLiteral("10s 内没等到眨眼全睁（当前 %1）——基准帧不可比")
-                            .arg(double(blinkA))));
-    renderEyeProbe(&window, openEyes, eyeParameter, &blinkOpenB, nullptr, &blinkB);
 
+    /*闭眼帧必须也取自"眨眼全睁"的那一刻，并且与刚刚那一对帧的距离同样要近
+       （"最终值 = 乘数 × 眨眼原始值"这个逐帧等式、以及像素对照都要求这一点）。
+       条件式等待 + 超时，同 A/B 那一对。*/
     QImage eyesClosed;
     float closedComposed = 1.0f;
     float closedBlink = 1.0f;
-    renderEyeProbe(&window, moodEyes, eyeParameter, &eyesClosed, &closedComposed, &closedBlink);
+    int closedAttempts = 0;
+    qint64 closedGapMs = -1;
+    {
+        QElapsedTimer closedClock;
+        QElapsedTimer overall;
+        overall.start();
+        while (true)
+        {
+            ++closedAttempts;
+            closedClock.start();
+            if (!renderEyeProbe(&window, moodEyes, eyeParameter, &eyesClosed, &closedComposed,
+                                &closedBlink))
+            {
+                QTest::qWait(20);
+                continue;
+            }
+            /*眨眼在闭眼帧渲染期间翻开也不行：那会让"最终值 = 乘数 × 眨眼原始值"里的
+               眨眼原始值与实际渲出的帧错开。再读一次当前眨眼值确认这一刻它没动。*/
+            const float blinkAfterProbe = window.blinkValue();
+            closedGapMs = closedClock.elapsed();
+            const bool blinkStillOpen = closedBlink >= kEyeProbeBlinkOpen &&
+                                        blinkAfterProbe >= kEyeProbeBlinkOpen;
+            if (blinkStillOpen && closedGapMs <= kEyeProbeMaxGapMs)
+                break;
+            QTest::qWait(50);
+            if (overall.elapsed() > kEyeProbeDeadlineMs)
+            {
+                QVERIFY2(false,
+                         qPrintable(QStringLiteral(
+                                        "%1s 内取不到一对可比的闭眼帧：blink=%2（渲染后 %3）"
+                                        "（要求都 ≥%4）、间隔 %5ms（要求 ≤%6ms）")
+                                        .arg(kEyeProbeDeadlineMs / 1000)
+                                        .arg(double(closedBlink))
+                                        .arg(double(blinkAfterProbe))
+                                        .arg(double(kEyeProbeBlinkOpen))
+                                        .arg(closedGapMs)
+                                        .arg(kEyeProbeMaxGapMs)));
+            }
+        }
+    }
+    /*校准用的显式乘数用完必须放手（并让眼睛重新跟随心情）：
+       否则它会一直压制覆盖表，把后面 (c) 那一段" sleepy 心情下眨眼还活着"的采样
+       变成"眼睛被钉在 0.05"的错误读数。*/
+    window.clearEyeOpennessMultiplierOverride();
+    QVERIFY2(window.renderFrameNow(), "解除显式乘数后的一帧渲染失败");
 
     QVERIFY2(!blinkOpenA.isNull() && !blinkOpenB.isNull() && !eyesClosed.isNull(),
              "相邻帧渲染失败");
@@ -2733,12 +2935,21 @@ void TestLive2DWindow::moodEyeOpennessComposesWithBlink()
           static_cast<double>(eyeDiff) * 100.0 / static_cast<double>(total), double(closedBlink),
           double(closedComposed),
           drift > 0 ? static_cast<double>(eyeDiff) / static_cast<double>(drift) : -1.0);
+    /*"这一对帧真的相邻"的**证据**：两条前提各自的实际读数 + 取到它们花了多少次尝试。
+       没有这行日志，失败时无法区分"眼睛真的没生效"与"这次取到的帧根本不可比"。*/
+    qInfo("EYEPROBE adjacency: pair attempts=%d gap=%lld ms blink=%.4f/%.4f | closed attempts=%d"
+          " gap=%lld ms blink=%.4f | limits: blink>=%.3f gap<=%d ms",
+          pairAttempts, pairGapMs, double(blinkA), double(blinkB), closedAttempts, closedGapMs,
+          double(closedBlink), double(kEyeProbeBlinkOpen), kEyeProbeMaxGapMs);
 
     /*(a) 闭眼真的落到屏幕上。先定标：实测 atri 上"眼睛 1.0 → 0.05"只改变 **1212** 像素
        （0.207% 画布）—— 闭眼参数动的是眼睑那一小块，不是半张脸，所以绝对量级本来就不大；
        而**旧行为**（乘数不生效）下同一个切换只改变 **1** 个像素。两条一起断言：
          - 绝对下限 500：比"完全没生效"（0~1 像素）高三个数量级，又不假装眼睛有半张脸大；
-         - 相对倍数 5x：挡住"某次漂移恰好很大"把结论蒙对（实测漂移 0~1 像素）。
+         - 相对倍数 5x：挡住"背景摆动恰好很大"把结论蒙对（空闲实测漂移 0~1 像素）。
+       上面已经用条件式等待把"这一对帧真的相邻 + 眨眼全睁"钉住了，所以 5x 这条是在
+       **可比的两帧**上断言，而不是靠"没有 wait 就等于时间没走"这个曾经被 26 线程
+       满负载打破的假设（那次 drift=712、eyeDiff=1223，比值只有 2x）。
        修改眼睛参数建模（例如换成眼睑面积大得多的模型）可能让这个绝对值变化，
        但"远超同类相邻帧漂移"这条与模型无关，是主要判据。*/
     QVERIFY2(eyeDiff > 500,
@@ -2747,10 +2958,14 @@ void TestLive2DWindow::moodEyeOpennessComposesWithBlink()
                             .arg(double(sleepyMoodValue))
                             .arg(eyeDiff)));
     QVERIFY2(eyeDiff > drift * 5,
-             qPrintable(QStringLiteral("闭眼造成的像素差 %1 没有明显超过相邻帧漂移 %2 ——"
+             qPrintable(QStringLiteral("闭眼造成的像素差 %1 没有明显超过相邻帧漂移 %2"
+                                       "（这对帧间隔 %3ms、眨眼 %4~%5）——"
                                        "无法证明变化来自眼睛而不是背景摆动")
                             .arg(eyeDiff)
-                            .arg(drift)));
+                            .arg(drift)
+                            .arg(pairGapMs)
+                            .arg(double(blinkA))
+                            .arg(double(blinkB))));
 
     /*(b) 是乘积：这一刻的最终值 ≈ 乘数 × 这一刻的眨眼原始值。
        两张帧是相邻渲染的（眨眼进度只差几个百分点，落在下面的容差里），
@@ -2931,6 +3146,8 @@ void TestLive2DWindow::rendersMoodArchetypeCalibrationSheet()
     const QString neutralMood = preset.representativeMoodForArchetype(QStringLiteral("neutral"));
     QVERIFY2(!neutralMood.isEmpty(), "neutral 没有别名");
     window.reloadContent(neutralMood);
+    // 等过渡走完：这张帧要用来定裁切区，不能是"上一个心情 → neutral"的半路帧
+    QVERIFY2(waitForMoodSettle(&window), "neutral 过渡没走完");
     QVERIFY2(window.renderFrameNow(), "neutral 帧渲染失败");
     const QImage neutralFrame = window.renderedImage();
     QVERIFY2(!neutralFrame.isNull(), "neutral 帧为空");
@@ -2957,6 +3174,11 @@ void TestLive2DWindow::rendersMoodArchetypeCalibrationSheet()
                  qPrintable(QStringLiteral("原型 %1 没有别名，出不了这一格").arg(archetype)));
 
         window.reloadContent(moodName);
+        /*等过渡走完再出这一格：这 14 张图是给人做**目视校准**的素材，
+           半路帧（上一个原型 → 这个原型）会让校准结论完全错掉。
+           代价是每格多等约 0.2s（过渡时长），14 格多约 3s，可以接受。*/
+        QVERIFY2(waitForMoodSettle(&window),
+                 qPrintable(QStringLiteral("原型 %1 的过渡没走完").arg(archetype)));
         QVERIFY2(window.renderFrameNow(), qPrintable(QStringLiteral("原型 %1 渲染失败").arg(archetype)));
         const QImage frame = window.renderedImage();
         QVERIFY2(!frame.isNull(), "渲染帧为空");
@@ -3008,6 +3230,197 @@ void TestLive2DWindow::rendersMoodArchetypeCalibrationSheet()
     qInfo("MOOD calibration summary: %d files, roi=%d,%d %dx%d (identical region), "
           "requested-vs-actual deviations=%d entries (see per-archetype lines above)",
           savedPaths.size(), roi.x(), roi.y(), roi.width(), roi.height(), mismatchedParams);
+}
+
+/*[配置键] character/live2dMoodBlendMs 必须真的被读出来，并且被夹到安全范围。
+
+  为什么是窗口层用例、而且要用**真行为**验证：这个键只有窗口知道（它读 config.ini 的
+  settingsPath()），渲染器只拿到一个毫秒数。所以"读 + 夹取"这条线只能在这里钉。
+  又因为不许改用户的真实 config.ini，全程走 initTestCase 建立的 MANDARIN_CONFIG_INI
+  临时文件（与 live2dFps/live2dScale 同一套机制）。
+
+  观察量取"窗口报出来的过渡时长"本身，而不是"再去量一次过渡曲线"：
+  后者要在窗口层跑几十帧、还得先装载模型，成本高得多，而"配置 → 时长"这件事
+  在渲染器级用例（moodBlendDurationIsConfigurable）里已经证明会改变真实过渡长度了。
+
+  夹取的三条都要验，因为"夹取"是**行为**不是装饰：
+    - 0（或负）会让过渡消失（参数一帧跳过去，正是要修的用户症状）→ 抬到下限；
+    - 超大值（例如 1 小时）会让表情"永远在半路上"→ 压到上限；
+    - 非数字/缺键 → 用默认值（与 fps/scale 的既有做法一致）。*/
+void TestLive2DWindow::moodBlendDurationComesFromConfig()
+{
+    const auto durationForConfiguredValue = [this](const QString &rawValue) {
+        QSettings settings(m_tempConfigPath, QSettings::IniFormat);
+        if (rawValue.isNull())
+            settings.remove(QStringLiteral("character/live2dMoodBlendMs"));
+        else
+            settings.setValue(QStringLiteral("character/live2dMoodBlendMs"), rawValue);
+        settings.sync();
+        //每次新建窗口：配置只在构造/装载时读一次（这是刻意的，帧循环里绝不读盘）
+        Live2DCharacterWindow window;
+        return window.moodBlendDurationMs();
+    };
+
+    const int configured = durationForConfiguredValue(QStringLiteral("450"));
+    const int zeroClamped = durationForConfiguredValue(QStringLiteral("0"));
+    const int negativeClamped = durationForConfiguredValue(QStringLiteral("-100"));
+    const int hugeClamped = durationForConfiguredValue(QStringLiteral("3600000"));
+    const int missingDefault = durationForConfiguredValue(QString());
+    const int garbageDefault = durationForConfiguredValue(QStringLiteral("abc"));
+
+    qInfo("MOODBLEND config: 450→%d, 0→%d, -100→%d, 3600000→%d, 缺键→%d, 非数字→%d", configured,
+          zeroClamped, negativeClamped, hugeClamped, missingDefault, garbageDefault);
+
+    //① 配置值真的被读出来（硬编码 200 的实现会在这里失败）
+    QVERIFY2(configured == 450,
+             qPrintable(QStringLiteral("character/live2dMoodBlendMs=450 读出来是 %1，"
+                                       "配置键没有被读（时长是硬编码的？）")
+                            .arg(configured)));
+    //② 0 / 负数必须被抬高：否则过渡被关掉，换心情又会"顿一下"
+    QVERIFY2(zeroClamped >= 50,
+             qPrintable(QStringLiteral("过渡时长配成 0 之后报出来 %1 —— 过渡被关掉了，"
+                                       "换心情会一帧跳过去")
+                            .arg(zeroClamped)));
+    QVERIFY2(negativeClamped == zeroClamped,
+             qPrintable(QStringLiteral("过渡时长配成 -100 与 0 的夹取结果不一致（%1 vs %2）")
+                            .arg(negativeClamped)
+                            .arg(zeroClamped)));
+    //③ 超大值必须被压住：1 小时的过渡 = 表情永远走不到目标
+    QVERIFY2(hugeClamped <= 5000,
+             qPrintable(QStringLiteral("过渡时长配成 3600000 之后报出来 %1 —— 没有上限，"
+                                       "表情会永远停在半路")
+                            .arg(hugeClamped)));
+    QVERIFY2(hugeClamped > zeroClamped,
+             qPrintable(QStringLiteral("上限（%1）不该低于下限（%2）").arg(hugeClamped).arg(zeroClamped)));
+    //④ 缺键/非数字回默认值（默认 200ms，与头文件/文档一致）
+    QVERIFY2(missingDefault == 200,
+             qPrintable(QStringLiteral("缺键时过渡时长是 %1，默认值应当是 200")
+                            .arg(missingDefault)));
+    QVERIFY2(garbageDefault == 200,
+             qPrintable(QStringLiteral("非数字时过渡时长是 %1，默认值应当是 200")
+                            .arg(garbageDefault)));
+
+    //收尾：把这个键移除，免得影响同一进程里后面的用例（临时文件是共用的）
+    {
+        QSettings settings(m_tempConfigPath, QSettings::IniFormat);
+        settings.remove(QStringLiteral("character/live2dMoodBlendMs"));
+        settings.sync();
+    }
+}
+
+/*[接线] 窗口的 SetSpeaking（= main.cpp 里 Dialog::requestSpeakState 的落点）
+  必须一路走到渲染器，让嘴巴随时间开合，并在停止后回落到心情值。
+
+  为什么这条不能省（渲染器级已有三条 SPEAK 用例）：
+  那些用例直接调 renderer.setSpeaking()，证明的是**数学**；
+  而用户路径多两跳 —— Dialog 的信号 → 基类槽（虚函数）→ 派生类 → 渲染器。
+  少了这里，一个"槽忘了转给渲染器"的改动在渲染器级测试里是全绿的。
+
+  ⚠️ 帧时间来自墙钟，所以必须 QTest::qWait（见 waitForMoodSettle 的说明）。*/
+void TestLive2DWindow::setSpeakingDrivesMouthFlapThroughWindow()
+{
+    const QString modelName = preferredModelName();
+    const QString dir = modelDirFor(modelName);
+    if (!QFileInfo::exists(dir))
+        QSKIP("本机没有用户配置的模型（禁二传，不入库），跳过说话接线验证");
+
+    Live2DMoodPreset preset;
+    if (!loadConfiguredMoodPreset(&preset))
+        QSKIP("本机没有当前角色/模型的心情预设数据（Documents 下，不入库），跳过");
+
+    Live2DCharacterWindow window;
+    window.loadModel(modelName);
+    QVERIFY2(window.isModelLoaded(), "模型装载失败，无法验证说话接线");
+    QVERIFY2(window.isMoodPresetEnabled(), "情绪预设没装载成功");
+
+    // 模型没声明嘴巴参数时这条测试没有意义（换模型可能不同）
+    if (preset.parameters().value(QStringLiteral("mouthOpen")).id.isEmpty())
+        QSKIP("本机的 parameter-map 里没有 mouthOpen，跳过说话接线验证");
+
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QCoreApplication::processEvents();
+    window.hide();
+    QCoreApplication::processEvents();
+
+    /*用一个**开口量为 0** 的心情的原型：这样"张嘴"一定来自扑动，
+       不会与心情自己的开口量混在一起（surprised/sleepy/cry/excited 都会预设开口量）。*/
+    const QString neutralMood = preset.representativeMoodForArchetype(QStringLiteral("neutral"));
+    QVERIFY2(!neutralMood.isEmpty(), "neutral 没有别名");
+    const float neutralMouthOpen =
+        preset.parametersForArchetype(QStringLiteral("neutral"))
+            .value(QStringLiteral("ParamMouthOpenY"), -1.0f);
+    QVERIFY2(qAbs(neutralMouthOpen) <= 0.05f,
+             qPrintable(QStringLiteral("neutral 原型的开口量是 %1（不是 0），"
+                                       "本用例的前提（张嘴来自扑动）不成立")
+                            .arg(double(neutralMouthOpen))));
+
+    window.reloadContent(neutralMood);
+    QVERIFY2(waitForMoodSettle(&window), "neutral 过渡没走完");
+
+    // ① 不说话：开口量应当停在心情值上（不动）
+    QVector<float> idle;
+    for (int index = 0; index < 15; ++index)
+    {
+        QTest::qWait(20);
+        QVERIFY2(window.renderFrameNow(), "静默帧渲染失败");
+        idle.append(window.parameterValue(QStringLiteral("ParamMouthOpenY")));
+    }
+    const float idleMin = *std::min_element(idle.constBegin(), idle.constEnd());
+    const float idleMax = *std::max_element(idle.constBegin(), idle.constEnd());
+    QVERIFY2(idleMax - idleMin <= 1e-4f,
+             qPrintable(QStringLiteral("没说话时开口量就在 %1~%2 之间变（应当纹丝不动）")
+                            .arg(double(idleMin))
+                            .arg(double(idleMax))));
+
+    // ② 说话：走真实窗口路径（这就是 main.cpp 那条 connect 会调到的槽）
+    window.SetSpeaking(true);
+    QVector<float> speaking;
+    for (int index = 0; index < 40; ++index)
+    {
+        QTest::qWait(20);
+        QVERIFY2(window.renderFrameNow(), "说话帧渲染失败");
+        speaking.append(window.parameterValue(QStringLiteral("ParamMouthOpenY")));
+    }
+    const float speakingMin = *std::min_element(speaking.constBegin(), speaking.constEnd());
+    const float speakingMax = *std::max_element(speaking.constBegin(), speaking.constEnd());
+    qInfo("SPEAK window[%s]: idle span=%.5f → speaking %s span=%.4f",
+          qPrintable(modelName), double(idleMax - idleMin),
+          qPrintable(QStringLiteral("%1~%2").arg(double(speakingMin)).arg(double(speakingMax))),
+          double(speakingMax - speakingMin));
+    QVERIFY2(speakingMax - speakingMin > 0.05f,
+             qPrintable(QStringLiteral("窗口收到 SetSpeaking(true) 后开口量只在 %1~%2 之间 ——"
+                                       "信号没有走到渲染器（嘴没动）")
+                            .arg(double(speakingMin))
+                            .arg(double(speakingMax))));
+
+    // ③ 停止说话：回落到心情值（neutral 是 0）
+    window.SetSpeaking(false);
+    QVector<float> stopped;
+    for (int index = 0; index < 45; ++index)
+    {
+        QTest::qWait(20);
+        QVERIFY2(window.renderFrameNow(), "停止说话后的帧渲染失败");
+        stopped.append(window.parameterValue(QStringLiteral("ParamMouthOpenY")));
+    }
+    const int tailBegin = stopped.size() * 3 / 4;
+    float tailMin = stopped[tailBegin];
+    float tailMax = stopped[tailBegin];
+    for (int index = tailBegin; index < stopped.size(); ++index)
+    {
+        tailMin = std::min(tailMin, stopped[index]);
+        tailMax = std::max(tailMax, stopped[index]);
+    }
+    qInfo("SPEAK window stop: tail span=%.5f (%.5f~%.5f), mood=%.5f",
+          double(tailMax - tailMin), double(tailMin), double(tailMax), double(neutralMouthOpen));
+    QVERIFY2(tailMax - tailMin <= 0.02f,
+             qPrintable(QStringLiteral("SetSpeaking(false) 后开口量仍在 %1~%2 之间摆")
+                            .arg(double(tailMin))
+                            .arg(double(tailMax))));
+    QVERIFY2(qAbs(tailMax - neutralMouthOpen) <= 0.02f,
+             qPrintable(QStringLiteral("停止说话后开口量停在 %1，不等于心情值 %2")
+                            .arg(double(tailMax))
+                            .arg(double(neutralMouthOpen))));
 }
 
 QTEST_MAIN(TestLive2DWindow)

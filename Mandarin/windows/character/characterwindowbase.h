@@ -34,6 +34,12 @@ class CharacterWindowBase : public QWidget
     void SetTachieSize(int size);
     /*按角色/心情名重载内容（由 Dialog::requestSetCharTachie 驱动，必须是 public 才能 connect）*/
     virtual void reloadContent(const QString &contentName) = 0;
+    /*TTS 是否在播（由 Dialog::requestSpeakState 驱动）。
+       放在基类是因为"说话"是**角色的行为**，与立绘用 PNG 还是 Live2D 无关：
+       PNG 路径没有可动的地方，用默认空实现（什么都不做，也绝不报错）；
+       Live2D 路径覆写它把状态转给渲染器，让嘴巴开合。
+       与 ShowInnerThought/HideInnerThought 同一套理由 —— 基类承接信号，子类各自实现。*/
+    virtual void SetSpeaking(bool speaking);
 
   protected:
     /*子类渲染完成后调用：登记 alpha 图及其窗口内位置，并重算交互区*/

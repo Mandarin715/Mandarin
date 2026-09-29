@@ -64,6 +64,7 @@ Live2DCharacterWindow::Live2DCharacterWindow(QWidget *parent)
     : CharacterWindowBase(parent)
 {
     applyFrameRateFromConfig();
+    applyMoodBlendFromConfig();
 
     m_frameTimer = new QTimer(this);
     //高帧率（280Hz 屏上可能配到 120~240fps）必须用精确定时器：
@@ -103,6 +104,29 @@ void Live2DCharacterWindow::applyRenderScaleFromConfig()
         clampDouble(settings.value("character/live2dScale", 1.0).toDouble(),
                     kMinRenderScale, kMaxRenderScale);
     qInfo() << "Live2D 渲染缩放:" << m_renderScale;
+}
+
+void Live2DCharacterWindow::applyMoodBlendFromConfig()
+{
+    /*心情过渡时长：character/live2dMoodBlendMs，默认 200ms，夹取 [50,3000]。
+       为什么要夹（两条都是真实会发生的误配）：
+         - 0/负数 → 过渡被关掉，参数一帧跳过去，用户看到的还是"换心情顿一下"（本阶段要修的症状）；
+         - 极大值（例如手抖多打几个 0）→ 表情永远停在半路，AI 说的心情迟迟落不到脸上。
+       非数字（ok==false）与缺键一样回默认值 —— 与 fps/scale 的既有做法保持一致。*/
+    QSettings settings(settingsPath(), QSettings::IniFormat);
+    bool ok = false;
+    const int raw = settings.value("character/live2dMoodBlendMs", kDefaultMoodBlendMs)
+                        .toString()
+                        .toInt(&ok);
+    m_moodBlendDurationMs =
+        clampInt(ok ? raw : kDefaultMoodBlendMs, kMinMoodBlendMs, kMaxMoodBlendMs);
+    /*转发给渲染器：过渡是在渲染器的帧循环里按帧时间做的（见
+       Live2DOffscreenRenderer::setMoodBlendDurationMs）—— 窗口层不做插值，
+       它只负责"把用户配的数安全地交下去"。未装载模型时这次调用会安全地落空，
+       装载后 loadModel() 再调一次补上。*/
+    m_renderer.setMoodBlendDurationMs(m_moodBlendDurationMs);
+    qInfo() << "Live2D 心情过渡时长:" << m_moodBlendDurationMs << "ms（配置原值:" << raw
+            << "合法:" << ok << "）";
 }
 
 /*在目录里挑出要用的 model3.json 文件名。
@@ -191,6 +215,9 @@ bool Live2DCharacterWindow::loadModel(const QString &modelName)
         return false;
 
     applyRenderScaleFromConfig();
+    /*过渡时长也要在这里补一次：构造时渲染器还没装载模型，setMoodBlendDurationMs 会落空
+       （见 applyMoodBlendFromConfig 的说明）。装载成功后必须让用户配的值真的生效。*/
+    applyMoodBlendFromConfig();
 
     //入口文件名以目录里的实际内容为准（可能不叫 <模型名>.model3.json）
     const QString modelJsonName = resolveModelJsonName(dir, name);
@@ -263,19 +290,35 @@ void Live2DCharacterWindow::applyMood(const QString &moodName)
     if (!m_modelLoaded || m_logicalCanvasSize.isEmpty())
         return; //还没有画布：等下一帧/首次布局时自然带上，这里不能渲一个错尺寸的帧
 
-    /*立刻出一帧并请求重绘：AI 刚说完话，表情必须在同一拍就变，不能等下一次定时器；
-      交互区也顺手刷新 —— 表情会改变剪影（闭眼/低头），命中判定应当跟着变。*/
-    if (renderAndRegisterFrame())
-    {
-        refreshInteractiveRegion();
-        update();
-    }
+    /*⚠️ 这里**故意不立刻渲染**（曾经是 renderAndRegisterFrame() + update()）。
+
+       为什么要去掉：换心情是跟着 AI 的回复走的，而这条路径跑在**主线程**上，
+       一次同步渲染实测约 4ms（240x300 是 2~4ms，真实画布更大）。它插在帧循环的
+       两个 8ms 节拍**之间**，于是那一拍的间隔被撑长 —— 用户看到的"顿一下"里
+       有一半是这次卡顿。而定时器最迟 8ms 后就会带着新参数渲一帧，
+       把工作交给它，延迟的代价小到看不见，却把主线程的那 4ms 还了回去。
+
+       注意与"过渡"的分工：这里只是不再抢帧；表情的变化本身由
+       renderer.setParameterOverrides 的逐帧过渡负责（见 applyMoodBlend），
+       所以下一拍渲出来的那一帧正好是过渡的第一帧，不会漏掉任何东西。
+       交互区同理：下一拍（≤8ms）的 refreshInteractiveRegion 会跟着新剪影更新。*/
+    update(); //请求重绘：帧循环到点自己会渲，这里只保证窗口被标记为脏
 }
 
 void Live2DCharacterWindow::reloadContent(const QString &contentName)
 {
     //基类契约：按内容名切换（PNG 路径按名换图，Live2D 路径按名换情绪）
     applyMood(contentName);
+}
+
+/*TTS 播放状态 → 渲染器的说话扑动。
+
+  这里**不**顺手渲染一帧：说话状态是"接下来每一帧都要变"的东西，
+  而帧循环最迟 8ms 就会带着它渲下一帧 —— 与 applyMood 去掉同步渲染同一个理由
+  （那 4ms 主线程卡顿正是用户感到的"顿"）。*/
+void Live2DCharacterWindow::SetSpeaking(bool speaking)
+{
+    m_renderer.setSpeaking(speaking);
 }
 
 float Live2DCharacterWindow::parameterValue(const QString &parameterId) const
@@ -291,6 +334,11 @@ float Live2DCharacterWindow::blinkValue() const
 void Live2DCharacterWindow::setEyeOpennessMultiplierForTest(const QHash<QString, float> &values)
 {
     m_renderer.setEyeOpennessMultiplier(values);
+}
+
+void Live2DCharacterWindow::clearEyeOpennessMultiplierOverride()
+{
+    m_renderer.clearEyeOpennessMultiplierOverride();
 }
 
 /*画布尺寸启发式（v3）：

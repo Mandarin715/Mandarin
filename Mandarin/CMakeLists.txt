@@ -525,6 +525,44 @@ if(BUILD_TESTING)
     )
     add_test(NAME test_tachiegeometry COMMAND test_tachiegeometry)
 
+    # 立绘窗口基类的**窗口层契约**：Dialog::requestSpeakState → CharacterWindowBase::SetSpeaking
+    # 这条连接挂在基类上（PNG 与 Live2D 共用），PNG 路径的默认实现必须"接受任何值且零副作用"。
+    # 纯 Qt Widgets，不需要模型、不需要 GL、不需要真窗口。
+    add_executable(test_characterwindowbase
+        tests/test_characterwindowbase.cpp
+        windows/character/characterwindowbase.cpp
+        utils/DragHelper.cpp
+    )
+    target_include_directories(test_characterwindowbase PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_BINARY_DIR}
+    )
+    target_link_libraries(test_characterwindowbase PRIVATE
+        Qt${QT_VERSION_MAJOR}::Test
+        Qt${QT_VERSION_MAJOR}::Gui
+        Qt${QT_VERSION_MAJOR}::Widgets
+    )
+    set_target_properties(test_characterwindowbase PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_custom_command(TARGET test_characterwindowbase POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "$<TARGET_FILE_DIR:Qt${QT_VERSION_MAJOR}::Core>/../plugins/platforms"
+            "$<TARGET_FILE_DIR:test_characterwindowbase>/platforms"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Test>"
+            "$<TARGET_FILE_DIR:test_characterwindowbase>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Core>"
+            "$<TARGET_FILE_DIR:test_characterwindowbase>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Gui>"
+            "$<TARGET_FILE_DIR:test_characterwindowbase>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Widgets>"
+            "$<TARGET_FILE_DIR:test_characterwindowbase>"
+    )
+    add_test(NAME test_characterwindowbase COMMAND test_characterwindowbase)
+
     # 绘制步的几何验证：drawImage(rect(), img) 只有在 img 的**逻辑**尺寸等于控件逻辑尺寸时
     # 才是 1:1 拷贝（否则 Qt 会重采样）。纯 Qt Widgets，不需要模型、不需要 GL。
     add_executable(test_devicepixelblit

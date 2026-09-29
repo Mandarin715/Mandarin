@@ -31,6 +31,7 @@
 #include <QHash>
 #include <QOffscreenSurface>
 #include <QOpenGLContext>
+#include <QRandomGenerator>
 #include <QStringList>
 #include <QSurfaceFormat>
 #include <QVector>
@@ -55,6 +56,51 @@ constexpr float kWatermarkHiddenValue = 1.0f;
   数据超出 [0,1] 时 Core 本来也会夹，这里只是提前一步把负值/零值挡在乘数之外。
   注意这不是"修数据"：预设的 0.05 原样生效，只有 ≤0 的非法值才被抬到这个下限。*/
 constexpr float kEyeOpennessMultiplierFloor = 0.01f;
+
+/*心情过渡的默认时长（毫秒）。与窗口层 `character/live2dMoodBlendMs` 的默认值一致；
+   正常路径由窗口从 config.ini 读出来喂进来，这个常数只保证"没人设过时"的行为是确定的。*/
+constexpr int kDefaultMoodBlendMs = 200;
+
+/*心情过渡的收敛 epsilon（参数单位）。
+
+  为什么必须有它：过渡是"起点 → 目标"的**线性**插值，最后一步的浮点乘加会留下
+  最后一丝残差（float 在 0.9 附近的表示本身就不精确）。没有这一步，读回值会是
+  "0.899999976" 这种"接近但不等于"的数 —— 测试与校准都读不到精确值。
+  剩余差值 ≤ epsilon 时直接落到目标值。
+
+  取值 1e-4 的依据：本模型参数的量程最小是 0~1 的开合量，1e-4 是它的万分之一；
+  量程最大的是头部角度 ±30，1e-4 是它的三百万分之一。两者都远小于 8bit 输出
+  （每级 1/255 ≈ 3.9e-3）能表现的一步，所以"落到目标"与"差一丝"在屏幕上是同一张图；
+  而任何有意义的过渡位移都是它的成百上千倍，不会被它提前截断。
+  （更小不行：float 在 1.0 附近的 epsilon 是 1.2e-7，但插值的乘加误差会让
+   1e-7 这种阈值永远不满足，过渡结束时反而留一个可见量级之外的残差。）*/
+constexpr float kBlendSnapEpsilon = 1e-4f;
+
+/*单帧时间步长上限（秒）。与 renderFrame 喂给物理/驱动器的夹取一致：
+   超过这个值的间隔不是"一帧"，当一帧处理（首帧/窗口还没映射时可能隔几百毫秒）。
+   过渡也必须用同一把尺子，否则一次卡顿会把过渡整段推完，看起来还是"跳"。*/
+constexpr float kMaxFrameDeltaSeconds = 0.1f;
+
+/*说话嘴巴（纸片人口型）的参数名与节奏。
+
+  为什么只驱动 ParamMouthOpenY：模型 model3.json 的 Groups[LipSync] 同时声明了
+  ParamMouthOpenY 与 ParamMouthForm，但两者语义不同 —— OpenY 是**开口量**（0~1 的上下开合），
+  MouthForm 是**嘴形**（本模型 moc 声明 [-1,0]，由心情决定"笑/撇嘴"）。
+  两个都写就是心情与口型互相打架（用户看到的是"说话时表情被抹掉"）。
+
+  节奏取 3~5 次/秒：与正常语速同量级（每秒约 4~6 个音节，每个音节一开一合）。需求明确要求"不规则"，所以每次过零都重新摇频率与振幅 ——
+  干净正弦读起来像缝纫机。*/
+const QString kSpeakingMouthParameter = QStringLiteral("ParamMouthOpenY");
+/*开合频率：**3~5 次/秒**。最初写的是 8~10，实机一看像在快速嘀嗒 —— 正常语速约每秒 4~6 个
+  音节，9Hz 的开合远快于任何人说话时的嘴。3~5 与语速同量级，看着像"在说话"而不是"在抖"。*/
+constexpr float kSpeakingFlapMinHz = 3.0f;
+constexpr float kSpeakingFlapMaxHz = 5.0f;
+/*振幅（相对声明量程的比例）：下限保证"看得见"，上限留出余量给心情的开口量叠加
+   （扑动是**加**在心情值上的，所以自己不能顶满量程，否则 clamp 会把波峰削平）。*/
+constexpr float kSpeakingFlapMinAmplitude = 0.28f;
+constexpr float kSpeakingFlapMaxAmplitude = 0.55f;
+/*过零时"最张开"仍要保留一点开度：完全合到 0 会让开合在低帧率下闪烁。*/
+constexpr float kSpeakingFlapFloor = 0.05f;
 
 /*把文件读成字节。**唯一**的读盘入口：QFile 走 Windows 宽字符 API，中文路径没问题。*/
 bool readAllBytes(const QString &path, QByteArray *out)
@@ -249,14 +295,9 @@ class OffscreenUserModel : public Csm::CubismUserModel
                 _motionManager->StartMotion(m_idleMotion, false);
         }
 
-        // 参数覆盖：盖在动作结果之上，优先级最高
-        for (auto it = m_parameterOverrides.constBegin();
-             it != m_parameterOverrides.constEnd(); ++it)
-        {
-            const Csm::csmString id(it.key().toUtf8().constData());
-            _model->SetParameterValue(Csm::CubismFramework::GetIdManager()->RegisterId(id),
-                                      it.value());
-        }
+        // 参数覆盖：盖在动作结果之上，优先级最高。
+        // **按帧时间朝目标逼近**（不是原子换表）：换心情才不会一帧跳过去（见 applyMoodBlend）。
+        applyMoodBlend(deltaSeconds);
 
         _model->SaveParameters();
 
@@ -279,12 +320,269 @@ class OffscreenUserModel : public Csm::CubismUserModel
         m_parameterOverrides.insert(parameterId, value);
     }
 
-    /*整组替换：一次赋值换掉整张表（不是"清空 + 逐条插入"）。
-      为什么要这样：情绪预设换了之后，上一种情绪的条目**必须消失**，
-      否则它每帧继续施加、新预设看起来没生效（见头文件说明）。*/
+    /*按帧时间把一个参数从"过渡起点"**线性**推进到目标。
+
+      ⚠️ 必须是**线性**（current = start + (target-start) × progress），不能写成
+      "current += (target-current) × progress"：后者是指数逼近 —— 每帧只吃掉剩余差值的
+      一个比例，永远到不了目标（实测：设了 200ms 的过渡，1.4s 后还差 0.001 没走完），
+      而且**过渡长度与配置的时长不成比例**（200ms 与 600ms 观察到的帧数只差 1.9 倍而不是
+      3 倍：绝大部分时间花在"追最后那一点点"上）。线性推进则保证 time>=duration 时
+      恰好落在目标上。这也是 kBlendSnapEpsilon 存在的前提：最后一步直接落到目标。*/
+    static float blendToward(float start, float target, float progress)
+    {
+        const float mixed = start + (target - start) * progress;
+        return (std::fabs(target - mixed) <= kBlendSnapEpsilon) ? target : mixed;
+    }
+
+    /*整组替换**目标**覆盖值。
+
+      为什么要整组：情绪预设换了之后，上一种情绪的条目**必须消失**，
+      否则它每帧继续施加、新预设看起来没生效（"切了中立她还在笑"）。
+
+      ⚠️ 换的是**目标**，不是本帧真正施加的值：真正施加的值由 applyMoodBlend 逐帧推进。
+      目标**没变**时这里什么都不做（幂等）—— 重复施加同一个心情不会把过渡重启、
+      更不会把参数打回起点。目标变了才重新取起点并重置计时。*/
     void setParameterOverrides(const QHash<QString, float> &overrides)
     {
+        if (m_parameterOverrides == overrides)
+            return; // 同一个目标：过渡不重启（"同一个心情再说一次"必须是无操作）
+        /* 取起点必须**无条件**做：即使上一次过渡还没跑完也要从"此刻的值"重新出发，
+           否则起点表里没有这个参数，就会从 0 或上一次的旧起点开始 —— 屏幕上是一次跳变。
+           （"过渡途中又换心情"是真实时序：AI 的两句话之间常常不足 200ms。）*/
+        captureBlendStart();
         m_parameterOverrides = overrides;
+        m_blendActive = true;
+        m_blendElapsedSeconds = 0.0f;
+        /*换心情即结束"显式乘数"状态：之后眼睛乘数重新由覆盖表推导。
+           否则一次校准实验的乘数会把之后所有心情的眼睛都钉住。*/
+        m_eyeMultiplierExplicit = false;
+    }
+
+    /*用于测试/重建正常路径：解除显式乘数，让眼睛重新跟随覆盖表。*/
+    void clearExplicitEyeMultiplier() { m_eyeMultiplierExplicit = false; }
+
+    /*设置/清除"显式乘数"标记（由 Live2DOffscreenRenderer::setEyeOpennessMultiplier 驱动）。*/
+    void setExplicitEyeMultiplier(bool on) { m_eyeMultiplierExplicit = on; }
+
+    /*说话开关。语义只是"目标状态"：真正的幅度爬升/衰减在 advanceSpeakingFlap 里按帧时间做。*/
+    void setSpeaking(bool speaking) { m_speaking = speaking; }
+
+    /*心情过渡时长（毫秒）。0 = 关掉插值，立刻跳到目标。
+
+       已有过渡在跑时改时长要**重新取起点**：否则"新进度 × 旧起点"会在下一帧跳一下
+       （换配置本来就是一次用户可见的变化，重取起点让它从头平滑地走完新时长）。*/
+    void setMoodBlendDurationMs(int milliseconds)
+    {
+        const int clamped = std::max(0, milliseconds);
+        if (clamped == m_moodBlendMs)
+            return;
+        if (m_blendActive)
+            captureBlendStart();
+        m_moodBlendMs = clamped;
+        m_blendActive = true;
+        m_blendElapsedSeconds = 0.0f;
+    }
+
+    /*把当前值记成过渡起点、计时清零。*/
+    void captureBlendStart()
+    {
+        m_blendStartValues = m_currentOverrides;
+        m_blendElapsedSeconds = 0.0f;
+    }
+
+    /*按帧时间把当前覆盖值朝目标推进，再写进模型。
+
+      为什么需要它（用户症状）：覆盖原本是整组原子替换，参数会在一帧里从 0.9 落到 0 ——
+      屏幕上就是"换心情时顿一下"。
+
+      三条约定（都是可观察行为，见 test_live2doffscreen 的 BLEND 系列）：
+        1. **时间制**：进度 = 累计帧时间 / 过渡时长。用帧时间而不是"每帧固定走百分之几"，
+           是为了高帧率下手感不变（本项目 fps 可配：固定比例的实现会让 120fps 快一倍）；
+        2. **线性且收敛**：见 blendToward。过渡结束时值**精确等于**目标；
+        3. **不重启**：目标没变就不动起点（见 setParameterOverrides）。
+
+      被移除的参数（目标表里没有、当前表里还有）朝 **0** 回落，落到位后删掉条目 ——
+      绝大多数参数的默认值就是 0；留着条目才是"残留情绪"那个 bug。
+
+      最后一步把**说话扑动**加到嘴巴的开口量上（见 advanceSpeakingFlap）。*/
+    void applyMoodBlend(float deltaSeconds)
+    {
+        if (_model == nullptr)
+            return;
+
+        // 时长 ≤0 = 不插值：直接采用目标表（保留"立刻生效"这条老路径，调试与性能实验都用得上）
+        if (m_moodBlendMs <= 0)
+        {
+            m_currentOverrides = m_parameterOverrides;
+            m_blendActive = false;
+        }
+        else if (m_blendActive)
+        {
+            m_blendElapsedSeconds += deltaSeconds;
+        }
+
+        const float durationSeconds = static_cast<float>(m_moodBlendMs) / 1000.0f;
+        const float progress =
+            (durationSeconds > 0.0f)
+                ? std::min(m_blendElapsedSeconds / durationSeconds, 1.0f)
+                : 1.0f;
+
+        // 1) 目标表里仍然存在的参数：从起点线性推进到目标
+        for (auto it = m_parameterOverrides.constBegin(); it != m_parameterOverrides.constEnd();
+             ++it)
+        {
+            const float start = m_blendStartValues.value(it.key(), it.value());
+            m_currentOverrides.insert(it.key(), blendToward(start, it.value(), progress));
+        }
+
+        // 2) 目标表里已经没有的参数：朝 0 回落，落到就删掉让驱动器/物理重新完全接管
+        for (auto it = m_currentOverrides.begin(); it != m_currentOverrides.end();)
+        {
+            if (m_parameterOverrides.contains(it.key()))
+            {
+                ++it;
+                continue;
+            }
+            const float start = m_blendStartValues.value(it.key(), 0.0f);
+            const float released = blendToward(start, 0.0f, progress);
+            if (released == 0.0f)
+            {
+                m_blendStartValues.remove(it.key());
+                it = m_currentOverrides.erase(it);
+            }
+            else
+            {
+                it.value() = released;
+                ++it;
+            }
+        }
+
+        /*3) 说话扑动：先推进相位/幅度，再取这一帧的扑动量（未说话时恒为 0）。
+            必须在写参数**之前**算：扑动量要"加在心情值上"一起写进去。*/
+        const float flap = advanceSpeakingFlap(deltaSeconds);
+
+        // 4) 本帧真正施加的值 = 插值后的当前表（+ 嘴巴的扑动量）
+        for (auto it = m_currentOverrides.constBegin(); it != m_currentOverrides.constEnd(); ++it)
+        {
+            const Csm::csmString id(it.key().toUtf8().constData());
+            const Csm::CubismIdHandle handle =
+                Csm::CubismFramework::GetIdManager()->RegisterId(id);
+            float value = it.value();
+            if (flap != 0.0f && it.key() == kSpeakingMouthParameter)
+            {
+                /*组合方式：clamp(心情值 + 扑动量, min, max)。
+                   所以"说话时刚好很惊讶"（心情把嘴张到 0.8）不会被压回去 ——
+                   clamp 只挡越界，不做平均。范围取**模型声明**的 min/max，不硬编码。*/
+                const Live2DOffscreenRenderer::DeclaredRange range = declaredRangeOf(kSpeakingMouthParameter);
+                value = std::min(range.max, std::max(range.min, value + flap));
+            }
+            _model->SetParameterValue(handle, value);
+        }
+
+        /*眼睛乘数用**本帧真正施加的覆盖值**推导（而不是目标表）：否则闭眼参数还在路上、
+           乘数已经到目标，两者错帧，过渡期间眼睛会比应有的样子更闭/更睁。
+           这里顺手替掉了窗口层那次 setEyeOpennessMultiplier（见 .cpp 的 setParameterOverrides）。
+
+           ⚠️ 但**显式**给的乘数（setEyeOpennessMultiplierForTest，校准/实验用）优先：
+           那种调用就是要"这一帧眼睛按我说的开"，不能被心情值重推回去。*/
+        if (!m_eyeMultiplierExplicit)
+            setEyeOpennessMultiplier(m_currentOverrides);
+    }
+
+    /*说话扑动：一帧的推进与取值。
+
+      为什么是"相位累加"而不是"t × 频率"：频率每次过零都在变，
+      用绝对时间乘频率会在换频的那一帧产生相位跳变（嘴会抽一下）。
+      累加相位则天然连续 —— 换频只改变接下来走多快。
+
+      不规则从哪来：每个周期（相位转过 2π）重新摇一次目标频率（3~5Hz）与振幅，
+      再朝它平滑过渡。干净正弦读起来像缝纫机，这是"像在说话"与"像机器人"的区别。
+
+      返回这一帧的扑动量（参数单位；未说话且幅度已衰减完时为**精确的 0**）。*/
+    float advanceSpeakingFlap(float deltaSeconds)
+    {
+        /*幅度按与心情过渡**同一套机制**走：线性趋近目标（说话=1，停止=0），到达即 snap。
+           注意两个方向都要走时长，尤其**起播那一下不能一帧抬满** ——
+           TTS 每次开口都会触发一次 setSpeaking(true)，若一帧就抬满，
+           嘴在开口瞬间"啪"地跳到满幅，用户看到的就是又一次跳变。*/
+        const float amplitudeTarget = m_speaking ? 1.0f : 0.0f;
+        const float durationSeconds = static_cast<float>(m_moodBlendMs) / 1000.0f;
+        const float step =
+            (durationSeconds > 0.0f) ? std::min(deltaSeconds / durationSeconds, 1.0f) : 1.0f;
+
+        if (m_speakingFlapAmplitude != amplitudeTarget)
+        {
+            if (!m_speakingFlapDecaying)
+            {
+                /*开始说话：把幅度与相位都归零，从"闭着的嘴"平滑张开。
+                   不归零的话，上一次说话残留的相位会让这一句以一个随机的开口量起步
+                   （幅度从 0 长起来，但相位决定它先从哪一侧开始）—— 那是一次可见的抽动。*/
+                m_speakingFlapAmplitude = 0.0f;
+                m_speakingFlapPhase = 0.0f;
+                m_speakingFlapFrequencyHz = kSpeakingFlapMinHz;
+                m_speakingFlapDecaying = true;
+            }
+            const float mixed = m_speakingFlapAmplitude
+                                + (amplitudeTarget - m_speakingFlapAmplitude) * step;
+            m_speakingFlapAmplitude =
+                (std::fabs(amplitudeTarget - mixed) <= kBlendSnapEpsilon) ? amplitudeTarget
+                                                                         : mixed;
+        }
+        else if (!m_speaking)
+        {
+            // 幅度已经到 0 并停住：扑动彻底退出，返回精确 0（"不贡献任何东西"）
+            m_speakingFlapAmplitude = 0.0f;
+            m_speakingFlapDecaying = false;
+            m_speakingFlapPhase = 0.0f;
+            return 0.0f;
+        }
+
+        if (m_speakingFlapAmplitude <= 0.0f)
+            return 0.0f;
+
+        // 推进相位；转过一个周期就重新摇频率（这就是"不规则"的来源）
+        m_speakingFlapPhase += 2.0f * static_cast<float>(M_PI) * m_speakingFlapFrequencyHz
+                               * deltaSeconds;
+        if (m_speakingFlapPhase >= 2.0f * static_cast<float>(M_PI))
+        {
+            m_speakingFlapPhase = std::fmod(m_speakingFlapPhase, 2.0f * static_cast<float>(M_PI));
+            m_speakingFlapFrequencyHz =
+                kSpeakingFlapMinHz
+                + (kSpeakingFlapMaxHz - kSpeakingFlapMinHz) * uniformUnitRandom();
+            m_speakingFlapTargetAmplitude =
+                kSpeakingFlapMinAmplitude
+                + (kSpeakingFlapMaxAmplitude - kSpeakingFlapMinAmplitude) * uniformUnitRandom();
+        }
+        // 振幅本身也平滑过渡（周期内不去突变），看起来是"越说越有劲/越说越轻"
+        m_speakingFlapCurrentAmplitude +=
+            (m_speakingFlapTargetAmplitude - m_speakingFlapCurrentAmplitude) * 0.25f;
+
+        const Live2DOffscreenRenderer::DeclaredRange mouthRange = declaredRangeOf(kSpeakingMouthParameter);
+        const float span = mouthRange.max - mouthRange.min;
+        if (span <= 0.0f)
+            return 0.0f;
+
+        /*波形：sin 在 [-1,1]，映射到 [kSpeakingFlapFloor, 1] 的**单侧**开合 ——
+           嘴不会"负开"，只会从"几乎闭合"到"张开"。
+           乘上"说话幅度"（0→1 的包络）与量程，就是参数单位的扑动量。*/
+        const float wave = 0.5f + 0.5f * std::sin(m_speakingFlapPhase); // 0~1
+        const float shaped = kSpeakingFlapFloor + (1.0f - kSpeakingFlapFloor) * wave;
+        return m_speakingFlapAmplitude * m_speakingFlapCurrentAmplitude * span * shaped;
+    }
+
+    /*[0,1) 均匀随机。用 QRandomGenerator 而不是 rand()：后者在多线程/库混用下
+       种子与序列都不可控，而这条曲线的"不规则"是**用户看得见**的行为，值得一个像样的源。*/
+    static float uniformUnitRandom()
+    {
+        return static_cast<float>(QRandomGenerator::global()->generateDouble());
+    }
+
+    /*取某个参数**模型声明**的范围；模型没声明时给一个"不干涉"的兜底
+       （min=0、max=0 → span=0 → 扑动自动失效，而不是拿一个硬编码的量程去写越界值）。*/
+    Live2DOffscreenRenderer::DeclaredRange declaredRangeOf(const QString &parameterId) const
+    {
+        const QHash<QString, Live2DOffscreenRenderer::DeclaredRange> ranges = declaredParameterRanges();
+        return ranges.value(parameterId, Live2DOffscreenRenderer::DeclaredRange());
     }
 
     /*睁闭眼的**乘数**（情绪预设专用），在 OnLateUpdate 之后施加。
@@ -308,7 +606,6 @@ class OffscreenUserModel : public Csm::CubismUserModel
         m_eyeOpennessMultiplier.clear();
         if (_model == nullptr || _eyeBlink == nullptr)
             return; //模型没声明眨眼参数组：睁闭眼就是普通参数，交给覆盖表写绝对值
-
         const Csm::csmVector<Csm::CubismIdHandle> &ids = _eyeBlink->GetParameterIds();
         for (Csm::csmUint32 index = 0; index < ids.GetSize(); ++index)
         {
@@ -355,6 +652,8 @@ class OffscreenUserModel : public Csm::CubismUserModel
     void clearParameterOverrides()
     {
         m_parameterOverrides.clear();
+        // 当前表也必须清：留着它的话，"关掉情绪功能"之后那一份插值中的值还会被施加
+        m_currentOverrides.clear();
         m_eyeOpennessMultiplier.clear();
     }
 
@@ -797,13 +1096,42 @@ class OffscreenUserModel : public Csm::CubismUserModel
     QString m_modelDir;
     std::unique_ptr<Csm::CubismModelSettingJson> m_setting;
     QVector<GLuint> m_textureIds;
+    /*覆盖值的**目标**表（setParameterOverrides 写这里）*/
     QHash<QString, float> m_parameterOverrides;
+    /*覆盖值的**当前**表：本帧真正施加的就是它，逐帧朝目标推进。
+       初始为空：第一次施加目标表时，起点直接取目标值（不做"从 0 淡入"——
+       装载模型后的第一份心情必须立刻是它该有的样子，不能慢半拍）。*/
+    QHash<QString, float> m_currentOverrides;
+    /*本次过渡的**起点**快照（每个参数从哪个值开始走）与已累计的帧时间。
+       为什么要快照而不是"拿当前值按比例走"：后者是指数逼近，永远到不了目标
+       （见 blendToward 的说明）。快照 + 线性推进保证 time>=时长 时恰好落在目标。*/
+    QHash<QString, float> m_blendStartValues;
+    float m_blendElapsedSeconds = 0.0f;
+    bool m_blendActive = false;
+    /*心情过渡时长（毫秒）。窗口层从 character/live2dMoodBlendMs 读出来喂进来。*/
+    int m_moodBlendMs = kDefaultMoodBlendMs;
+
+    /*说话扑动（见 advanceSpeakingFlap）：
+       相位是**累加**的（换频时不跳变），频率/振幅每个周期重摇一次以获得不规则感。
+       m_speakingFlapDecaying 是"已经开始过一句话"的记号 —— 它把"刚开口"（幅度与相位归零）
+       与"说到一半"区分开，不然每帧都会把相位重置，嘴就永远不动了。*/
+    bool m_speaking = false;
+    bool m_speakingFlapDecaying = false;
+    float m_speakingFlapPhase = 0.0f;
+    float m_speakingFlapFrequencyHz = kSpeakingFlapMinHz;
+    float m_speakingFlapAmplitude = 0.0f;        // 0~1 的包络（说话=1，停止=0）
+    float m_speakingFlapTargetAmplitude = kSpeakingFlapMinAmplitude;
+    float m_speakingFlapCurrentAmplitude = kSpeakingFlapMinAmplitude;
 
     /*睁闭眼的乘数（**只包含眨眼声明的参数**），由 setEyeOpennessMultiplier 从覆盖表里挑出来。
       为什么单独存一份而不是每次从 m_parameterOverrides 里筛：眨眼参数要在 OnLateUpdate
       之后重写一次，而"哪些参数归眨眼管"是模型声明（Groups[EyeBlink]）决定的，
       每次筛都要问一遍 m_setting；存下来也让"这一帧到底乘了什么"可以一眼看清。*/
     QHash<QString, float> m_eyeOpennessMultiplier;
+    /*true = 这份乘数是**显式**给的（setEyeOpennessMultiplier 的调用方，
+       校准/实验用），applyMoodBlend 不许用覆盖表把它重推回去。
+       见 OffscreenUserModel::applyMoodBlend 的说明。*/
+    bool m_eyeMultiplierExplicit = false;
 
     Csm::ACubismMotion *m_idleMotion = nullptr; // 待机动作；所有权在 _motionManager
     /*眨眼 Updater 拿的是这个标志的**引用**：动作没更新参数的那些帧才让眨眼生效。
@@ -862,6 +1190,11 @@ struct Live2DOffscreenRenderer::Impl
     bool glReady = false;
     QSize targetSize;
     QElapsedTimer clock;
+    /*下一帧的时间步长覆盖（见 Live2DOffscreenRenderer::setNextFrameDeltaForTest）。
+       hasNextFrameDelta=false 时走正常墙钟路径；true 时该值**原样**当帧步长
+       （仍然过 kMaxFrameDeltaSeconds 的夹取，保证与真实路径同一把尺子）。*/
+    bool hasNextFrameDelta = false;
+    float nextFrameDelta = 0.0f;
 
     /*人物可见范围（**输出空间**浮点，画布横竖都映射到 [-1, 1]）。
 
@@ -1070,7 +1403,8 @@ QImage Live2DOffscreenRenderer::renderFrame(const QSize &size)
       会把它整个覆盖掉 —— 那段分支从来就没生效过（只在"还没有任何测量结果"的首帧上
       短暂生效）。留着它只会让人以为投影里有一层各向异性补偿，从而去写
       "再乘画布宽高比"之类的错误换算。*/
-    /*单帧时间步长夹取。
+    /*单帧时间步长夹取。上限常量 kMaxFrameDeltaSeconds 在文件顶部：心情过渡的插值也用
+       **同一把尺子**，否则一次卡顿会把过渡整段推完，看起来仍然是"跳"。
 
       为什么必须夹：这个 delta 直接喂给呼吸/眨眼/物理。load() 之后到第一帧渲染之间
       可能隔着几百毫秒（窗口还没映射、dpr 未定），甚至测试里会隔几秒 —— 那不是"一帧"，
@@ -1078,9 +1412,11 @@ QImage Live2DOffscreenRenderer::renderFrame(const QSize &size)
       比之后大 40%，还会留下持续的摆动）。
       不夹的话：首帧必抖一下，人物包围盒测量也随之失真（探针量到的活动范围与真实帧对不上，
       画布余量算不准）。所以按一个正常的帧间隔上限夹住，超大间隔当"一帧"处理。*/
-    constexpr float kMaxFrameDeltaSeconds = 0.1f; // 10fps 以下就当一帧
-    const float deltaSeconds = std::min(
-        static_cast<float>(m_impl->clock.restart()) / 1000.0f, kMaxFrameDeltaSeconds); // 首帧即建立时间基准
+    const float wallDeltaSeconds = static_cast<float>(m_impl->clock.restart()) / 1000.0f;
+    const float deltaSeconds =
+        std::min(m_impl->hasNextFrameDelta ? m_impl->nextFrameDelta : wallDeltaSeconds,
+                 kMaxFrameDeltaSeconds); // 首帧即建立时间基准
+    m_impl->hasNextFrameDelta = false;      //覆盖只生效一帧（见 setNextFrameDeltaForTest）
     m_impl->model->tick(deltaSeconds);
     m_impl->model->drawModel();
 
@@ -1117,10 +1453,22 @@ void Live2DOffscreenRenderer::setParameterOverrides(const QHash<QString, float> 
     if (m_impl->model != nullptr)
     {
         m_impl->model->setParameterOverrides(overrides);
-        /*同一份覆盖表顺手推给"睁闭眼乘数"：哪些参数算眼睛由模型声明决定，
-          这里不重复判断一次（也不会漏掉"换了模型、眨眼参数不同"的情况）。*/
-        m_impl->model->setEyeOpennessMultiplier(overrides);
     }
+}
+
+/*过渡时长：窗口层从 character/live2dMoodBlendMs 读出来喂进来（见头文件说明）。
+   刻意**不**在 setParameterOverrides 里顺手重设 —— 那样"换一次心情"会把用户/测试
+   刚设好的时长覆盖掉。*/
+void Live2DOffscreenRenderer::setMoodBlendDurationMs(int milliseconds)
+{
+    if (m_impl->model != nullptr)
+        m_impl->model->setMoodBlendDurationMs(milliseconds);
+}
+
+void Live2DOffscreenRenderer::setSpeaking(bool speaking)
+{
+    if (m_impl->model != nullptr)
+        m_impl->model->setSpeaking(speaking);
 }
 
 void Live2DOffscreenRenderer::clearParameterOverrides()
@@ -1136,7 +1484,18 @@ void Live2DOffscreenRenderer::clearParameterOverrides()
 void Live2DOffscreenRenderer::setEyeOpennessMultiplier(const QHash<QString, float> &moodValues)
 {
     if (m_impl->model != nullptr)
+    {
+        /*显式乘数置位：正常路径（换心情）走 setParameterOverrides，那里会清掉这个标记；
+           只有"直接调这个接口"的校准/实验才留下它（见 OffscreenUserModel::applyMoodBlend）。*/
+        m_impl->model->setExplicitEyeMultiplier(!moodValues.isEmpty());
         m_impl->model->setEyeOpennessMultiplier(moodValues);
+    }
+}
+
+void Live2DOffscreenRenderer::clearEyeOpennessMultiplierOverride()
+{
+    if (m_impl->model != nullptr)
+        m_impl->model->clearExplicitEyeMultiplier();
 }
 
 QHash<QString, Live2DOffscreenRenderer::DeclaredRange>
@@ -1179,6 +1538,23 @@ QString Live2DOffscreenRenderer::watermarkParamId() const
     if (m_impl->model == nullptr)
         return QString();
     return m_impl->model->watermarkParamId();
+}
+
+/*见头文件说明：只给测试用来把"相邻两帧"钉在**虚拟时间**上，生产代码不调用。*/
+void Live2DOffscreenRenderer::setNextFrameDeltaForTest(float seconds)
+{
+    m_impl->hasNextFrameDelta = true;
+    m_impl->nextFrameDelta = std::max(0.0f, seconds);
+}
+
+void Live2DOffscreenRenderer::resetNextFrameDeltaForTest()
+{
+    m_impl->hasNextFrameDelta = false;
+    m_impl->nextFrameDelta = 0.0f;
+    /*时间基准也要重置：冻结期间墙钟一直在走，回到真实路径时第一帧的间隔里会含着
+       整段冻结时长（会被夹取上限吃掉）。重置基准让"解冻后的第一帧"就是一个正常帧间隔，
+       免得它莫名其妙地吃满 100ms 再继续。*/
+    m_impl->clock.restart();
 }
 
 bool Live2DOffscreenRenderer::isLoaded() const

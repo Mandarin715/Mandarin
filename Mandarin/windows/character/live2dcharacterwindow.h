@@ -63,11 +63,19 @@ class Live2DCharacterWindow : public CharacterWindowBase
       与校准实验用的（见 Live2DOffscreenRenderer::setEyeOpennessMultiplier）。*/
     void setEyeOpennessMultiplierForTest(const QHash<QString, float> &moodValues);
 
+    /*用完上面那份显式乘数后放手：让眼睛重新跟随当前心情的覆盖表。
+       记号（"显式"）不放手的话，那份乘数会把之后所有心情的眼睛都钉住。*/
+    void clearEyeOpennessMultiplierOverride();
+
     /*情绪预设是否可用（两份 JSON 装载成功）。不可用时情绪功能自关：不施加任何覆盖。*/
     bool isMoodPresetEnabled() const { return m_moodPreset.isEnabled(); }
 
     /*帧循环节拍（毫秒），由 character/live2dFps 推出*/
     int frameIntervalMs() const { return m_frameIntervalMs; }
+    /*心情过渡时长（毫秒），由 character/live2dMoodBlendMs 推出（已夹取）。
+       暴露出来是为了让"配置真的被读到并被夹取"这条能直接断言 ——
+       只看帧循环是看不出过渡时长的。*/
+    int moodBlendDurationMs() const { return m_moodBlendDurationMs; }
     /*实际提交给渲染器的分辨率（逻辑尺寸 × 有效 dpr）*/
     QSize renderSize() const;
 
@@ -77,6 +85,10 @@ class Live2DCharacterWindow : public CharacterWindowBase
       找不到/非法的名字回退 neutral（绝不会把上一种情绪留在屏幕上）。
       没装载模型时调用也是安全的：只记住心情，模型装载成功后补上。*/
     void reloadContent(const QString &contentName) override;
+
+    /*TTS 播放状态：转给渲染器，让嘴巴做"纸片人"开合（见
+       Live2DOffscreenRenderer::setSpeaking）。基类默认实现什么都不做（PNG 路径）。*/
+    void SetSpeaking(bool speaking) override;
 
   protected:
     void relayoutContent() override; //按 m_tachieSizePercent 重算逻辑画布并渲染首帧
@@ -130,6 +142,13 @@ class Live2DCharacterWindow : public CharacterWindowBase
     static constexpr int kDefaultFps = 60;
     static constexpr int kMinFps = 5;
     static constexpr int kMaxFps = 240;
+    /*心情过渡：默认 200ms；下限 50ms、上限 3000ms。
+       下限的理由：过渡比"一帧"还短就等于没过渡（参数在一帧里跳过去，正是要修的症状）。
+       上限的理由：过渡长过几秒就不是"过渡"，而是"表情永远在半路上"，
+       而且会让"AI 说话的心情"迟迟落不到脸上。两个值都远松于可用区间，只挡明显配错的数。*/
+    static constexpr int kDefaultMoodBlendMs = 200;
+    static constexpr int kMinMoodBlendMs = 50;
+    static constexpr int kMaxMoodBlendMs = 3000;
     static constexpr double kMinRenderScale = 0.5;
     static constexpr double kMaxRenderScale = 2.0;
     static constexpr int kMaxRenderSide = 2048;       //渲染长边上限（护 VRAM 与读回带宽）
@@ -161,6 +180,9 @@ class Live2DCharacterWindow : public CharacterWindowBase
     /*读 config.ini 的帧率/缩放（各自带默认值与安全夹取）*/
     void applyFrameRateFromConfig();
     void applyRenderScaleFromConfig();
+    /*读 config.ini 的心情过渡时长（character/live2dMoodBlendMs）并转发给渲染器。
+       与 fps/scale 同一套做法：默认值 + 安全夹取 + 只记一条日志（不每秒刷屏）。*/
+    void applyMoodBlendFromConfig();
 
     /*探针渲染：量出人物可见范围在绘制输出空间里的跨度（见 Live2DOffscreenRenderer::
       probeFigureMetrics），据此定画布宽高比与目标占比。*/
@@ -186,6 +208,8 @@ class Live2DCharacterWindow : public CharacterWindowBase
     /*渲染参数（均可由 config.ini 覆盖）*/
     int m_frameIntervalMs = 1000 / kDefaultFps;
     double m_renderScale = 1.0;
+    /*心情过渡时长（毫秒；已夹取）。构造时从 config.ini 读一次，之后不再读盘。*/
+    int m_moodBlendDurationMs = kDefaultMoodBlendMs;
 
     /*重入保护：高帧率 + 慢帧时不能让定时器把渲染排队堆起来；也用于 paintEvent 里的重排*/
     bool m_renderingFrame = false;
