@@ -1190,7 +1190,7 @@ struct Live2DOffscreenRenderer::Impl
     bool glReady = false;
     QSize targetSize;
     QElapsedTimer clock;
-    /*下一帧的时间步长覆盖（见 Live2DOffscreenRenderer::setNextFrameDeltaForTest）。
+    /*下一帧的时间步长覆盖（见 Live2DOffscreenRenderer::setNextFrameDeltaSeconds）。
        hasNextFrameDelta=false 时走正常墙钟路径；true 时该值**原样**当帧步长
        （仍然过 kMaxFrameDeltaSeconds 的夹取，保证与真实路径同一把尺子）。*/
     bool hasNextFrameDelta = false;
@@ -1416,7 +1416,7 @@ QImage Live2DOffscreenRenderer::renderFrame(const QSize &size)
     const float deltaSeconds =
         std::min(m_impl->hasNextFrameDelta ? m_impl->nextFrameDelta : wallDeltaSeconds,
                  kMaxFrameDeltaSeconds); // 首帧即建立时间基准
-    m_impl->hasNextFrameDelta = false;      //覆盖只生效一帧（见 setNextFrameDeltaForTest）
+    m_impl->hasNextFrameDelta = false;      //覆盖只生效一帧（见 setNextFrameDeltaSeconds）
     m_impl->model->tick(deltaSeconds);
     m_impl->model->drawModel();
 
@@ -1540,14 +1540,15 @@ QString Live2DOffscreenRenderer::watermarkParamId() const
     return m_impl->model->watermarkParamId();
 }
 
-/*见头文件说明：只给测试用来把"相邻两帧"钉在**虚拟时间**上，生产代码不调用。*/
-void Live2DOffscreenRenderer::setNextFrameDeltaForTest(float seconds)
+/*见头文件说明：把下一帧的时间步长钉住。生产代码用它做探针的**虚拟时间**推进
+  （不再 msleep 3s），测试用它把"相邻两帧"钉在虚拟时间上。*/
+void Live2DOffscreenRenderer::setNextFrameDeltaSeconds(float seconds)
 {
     m_impl->hasNextFrameDelta = true;
     m_impl->nextFrameDelta = std::max(0.0f, seconds);
 }
 
-void Live2DOffscreenRenderer::resetNextFrameDeltaForTest()
+void Live2DOffscreenRenderer::clearNextFrameDelta()
 {
     m_impl->hasNextFrameDelta = false;
     m_impl->nextFrameDelta = 0.0f;

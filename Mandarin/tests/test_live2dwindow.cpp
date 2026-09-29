@@ -8,6 +8,7 @@
 #include <QCryptographicHash>
 #include <QDir>
 #include <QElapsedTimer>
+#include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
 #include <QImage>
@@ -22,6 +23,7 @@
 #include <QTemporaryDir>
 #include <QTest>
 #include <QThread>
+#include <QTimer>
 
 #include <algorithm>
 #include <cmath>
@@ -94,6 +96,14 @@ class TestLive2DWindow : public QObject
     /*窗口的 SetSpeaking（Dialog::requestSpeakState 的落点）必须一路走到渲染器：
        嘴巴随时间开合、且回落到心情值。这条钉住"接线"，渲染器级的数学另有专测。*/
     void setSpeakingDrivesMouthFlapThroughWindow();
+
+    /*---------- 立绘大小变更的性能与重入（本阶段修复的缺陷） ----------*/
+    /*用户报告：「改立绘大小后卡约 5 秒才变，之后持续掉帧」。
+       这条用例同时钉住三件事（缺一条都可能让"修好了"变成"改坏了"）：
+         ① 一次 SetTachieSize 阻塞主线程多久（修复前 = 探针 20 × 150ms 墙钟睡眠 ≈ 3s）；
+         ② 变更后连续 60 次重绘会不会**每帧**重新触发重排（= 每帧一次探针 = 持续掉帧）；
+         ③ 画布**真的**变了、且与窗口尺寸一致（防"把大小变更整个停掉"式的假修复）。*/
+    void sizeChangeSettlesWithoutRelayoutPerFrame();
 
   private:
     static QString modelDir();
@@ -3421,6 +3431,417 @@ void TestLive2DWindow::setSpeakingDrivesMouthFlapThroughWindow()
              qPrintable(QStringLiteral("停止说话后开口量停在 %1，不等于心情值 %2")
                             .arg(double(tailMax))
                             .arg(double(neutralMouthOpen))));
+}
+
+/*==================================================================================
+  立绘大小变更：一次变更阻塞多久、变更后会不会**每帧**重排、画布最终有没有真的换
+  ==================================================================================
+
+  观察手段只用**行为**，不给生产代码加任何测试钩子：
+    - 重排次数：派生一个计数窗口，覆写受保护的 relayoutContent()（重排是"探针 + 实测校正"
+      唯一的入口，数它就等于数"一次大小变更干了多少活"）；
+    - 绘制次数：同法覆写 paintEvent，用来证明 repaint() 真的走到了那条自检路径
+      （否则"60 帧里没有重排"可能只是**一帧都没画**，断言就成了空的）；
+    - 阻塞时长：QElapsedTimer 夹住整次 SetTachieSize 调用（主线程墙钟）。
+
+  ⚠️ 为什么必须让帧循环开着（window.show() + 不写 blend/FPS 之外的配置）：
+  窗口隐藏时帧循环本来就是停的，那时"会不会每帧重排"根本无从观察。*/
+namespace {
+
+class CountingLive2DWindow : public Live2DCharacterWindow
+{
+  public:
+    int relayoutCount = 0; //重排次数 = 跑了几次探针 + 实测校正
+    int paintCount = 0;    //paintEvent 次数（证明 repaint() 确实到达了自检路径）
+
+    /*帧节奏诊断用：每次重排/重绘的时刻（毫秒，取自测试注入的时钟）。
+       指针为空时不记（默认），免得给不需要的诊断付代价。*/
+    const QElapsedTimer *stampClock = nullptr;
+    QVector<qint64> paintStamps;
+    QVector<qint64> relayoutStamps;
+
+  protected:
+    void relayoutContent() override
+    {
+        ++relayoutCount;
+        if (stampClock != nullptr)
+            relayoutStamps.append(stampClock->elapsed());
+        Live2DCharacterWindow::relayoutContent();
+    }
+    void paintEvent(QPaintEvent *event) override
+    {
+        ++paintCount;
+        if (stampClock != nullptr)
+            paintStamps.append(stampClock->elapsed());
+        Live2DCharacterWindow::paintEvent(event);
+    }
+};
+
+struct PaintRunResult
+{
+    int frames = 0;    //真正跑了几次重绘
+    int relayouts = 0; //这一串重绘里又触发了多少次重排
+    qint64 ms = 0;     //这一串重绘的总墙钟
+};
+
+/*连做 frames 次**同步**重绘（QWidget::repaint 会立刻送 QPaintEvent，正是那条自检的路径）。
+
+  ⚠️ 早退保护：如果重排真的每帧都发生，一次 repaint 就要 ~3s（20 次 150ms 睡眠），
+  60 帧要跑三分钟。所以重排超过 3 次就停 —— 早退时的 relayouts 照样足够证明"每帧都重排"，
+  而修复后这个早退永远不触发（重排为 0）。*/
+PaintRunResult paintFrames(CountingLive2DWindow *window, int frames)
+{
+    PaintRunResult result;
+    const int relayoutsBefore = window->relayoutCount;
+    QElapsedTimer clock;
+    clock.start();
+    for (int i = 0; i < frames; ++i)
+    {
+        window->repaint();
+        ++result.frames;
+        if (window->relayoutCount - relayoutsBefore > 3)
+            break;
+    }
+    result.ms = clock.elapsed();
+    result.relayouts = window->relayoutCount - relayoutsBefore;
+    return result;
+}
+
+/*一整条帧管线的每帧成本（与 reportsFullPipelineFrameCost 同一把尺子）。*/
+struct FrameCost
+{
+    double msPerFrame = 0.0;
+    int frames = 0;
+    QSize canvas;
+    QSize render;
+};
+
+FrameCost measureFrameCost(CountingLive2DWindow *window, int frames)
+{
+    FrameCost cost;
+    cost.canvas = window->contentSize();
+    cost.render = window->renderSize();
+    if (!window->renderFrameNow())
+        return cost;
+    QElapsedTimer clock;
+    clock.start();
+    for (int i = 0; i < frames; ++i)
+    {
+        if (!window->renderFrameNow())
+            break;
+        ++cost.frames;
+    }
+    cost.msPerFrame = cost.frames > 0 ? double(clock.elapsed()) / cost.frames : 0.0;
+    return cost;
+}
+
+/*让**真实事件循环**跑一段（帧定时器就活在里面），数这段时间里实际画出多少帧、帧间隔多大。
+   这是"用户看到的持续掉帧"最接近的观察量：不是某一次调用的耗时，而是帧**节奏**。
+
+   ⚠️ 必须是**一个连续的事件循环**（QEventLoop + singleShot 退出），不能用
+   `QTest::qWait(10)` 循环：qWait 每次都新建一个嵌套事件循环，8ms 的帧定时器
+   在每个 10ms 窗口里最多只被投递一次，量出来的帧率会被这个轮询粒度钉在 ~60fps 上
+   （实测 41 帧/606ms = 67.7fps —— 那是我自己的轮询假象，不是帧循环的真实节奏）。*/
+struct PaceResult
+{
+    int paints = 0;
+    int relayouts = 0;
+    qint64 ms = 0;
+    qint64 medianGapMs = 0;
+    qint64 maxGapMs = 0;
+    double fps = 0.0;
+};
+
+PaceResult paceFor(CountingLive2DWindow *window, int durationMs)
+{
+    PaceResult result;
+    const int paintsBefore = window->paintCount;
+    const int relayoutsBefore = window->relayoutCount;
+    const int stampsBefore = window->paintStamps.size();
+
+    QEventLoop loop;
+    QTimer::singleShot(durationMs, &loop, &QEventLoop::quit);
+    QElapsedTimer clock;
+    clock.start();
+    loop.exec();
+    result.ms = clock.elapsed();
+    result.paints = window->paintCount - paintsBefore;
+    result.relayouts = window->relayoutCount - relayoutsBefore;
+    result.fps = result.ms > 0 ? result.paints * 1000.0 / double(result.ms) : 0.0;
+
+    QVector<qint64> gaps;
+    for (int i = stampsBefore + 1; i < window->paintStamps.size(); ++i)
+        gaps.append(window->paintStamps[i] - window->paintStamps[i - 1]);
+    std::sort(gaps.begin(), gaps.end());
+    if (!gaps.isEmpty())
+    {
+        result.medianGapMs = gaps[gaps.size() / 2];
+        result.maxGapMs = gaps.last();
+    }
+    return result;
+}
+
+/*画布宽高比相对参照值的偏差（0.01 = 1%）。用来验证"探针结果与画布尺寸无关"：
+   如果探针沾了画布尺寸，缓存复用后不同尺寸下的画布宽高比就会互相矛盾。*/
+double aspectDeviation(const QSize &size, double referenceAspect)
+{
+    if (size.isEmpty() || referenceAspect <= 0.0)
+        return 1.0;
+    const double aspect = double(size.width()) / double(size.height());
+    return std::abs(aspect - referenceAspect) / referenceAspect;
+}
+
+/*探针次数的观察通道：数**探针自己打印的那条日志**。
+
+  为什么要走日志：`probeFigureMetrics()` 是私有且非虚的，派生类覆写不了；而"探针到底跑了
+  几次"正是这条缺陷的核心观察量（每次布局一次探针 = 20 帧渲染，修复前还要再睡 3s）。
+  锚点用纯 ASCII（[LIVE2D-PROBE-RUN] / [LIVE2D-PROBE-CACHED]）：控制台是 GBK，
+  中文日志在那里是乱码，ASCII 标记不受影响。
+
+  一条都不吞：转发给上一个 handler，QtTest 自己的捕获与默认输出照旧。*/
+int g_probeRuns = 0;
+int g_probeCacheReuses = 0;
+QtMessageHandler g_previousMessageHandler = nullptr;
+
+void countingMessageHandler(QtMsgType type, const QMessageLogContext &context,
+                            const QString &message)
+{
+    if (message.contains(QLatin1String("[LIVE2D-PROBE-RUN]")))
+        ++g_probeRuns;
+    else if (message.contains(QLatin1String("[LIVE2D-PROBE-CACHED]")))
+        ++g_probeCacheReuses;
+    if (g_previousMessageHandler != nullptr)
+        g_previousMessageHandler(type, context, message);
+}
+
+/*RAII：用例中途 QSKIP / QVERIFY 提前 return 时也必须把 handler 换回去，
+   否则后面所有用例的输出都会挂在这个计数器上。*/
+struct MessageHandlerScope
+{
+    MessageHandlerScope()
+    {
+        g_probeRuns = 0;
+        g_probeCacheReuses = 0;
+        g_previousMessageHandler = qInstallMessageHandler(countingMessageHandler);
+    }
+    ~MessageHandlerScope() { qInstallMessageHandler(g_previousMessageHandler); }
+};
+
+} // namespace
+
+void TestLive2DWindow::sizeChangeSettlesWithoutRelayoutPerFrame()
+{
+    const QString modelName = preferredModelName();
+    if (!QFileInfo::exists(modelDirFor(modelName)))
+        QSKIP("本机没有用户配置的模型（禁二传，不入库），跳过立绘大小变更验证");
+
+    /*用户档位 120fps / 1.5x（与 config.ini 一致）：帧循环开着，重排才会被"每一拍"观察到。*/
+    {
+        QSettings settings(m_tempConfigPath, QSettings::IniFormat);
+        settings.setValue("character/live2dFps", 120);
+        settings.setValue("character/live2dScale", 1.5);
+        settings.sync();
+    }
+
+    CountingLive2DWindow window;
+    const MessageHandlerScope messageScope; //数探针次数（作用域结束时自动换回 handler）
+    QVERIFY2(window.loadModel(modelName), "模型装载失败，无法量立绘大小变更");
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QCoreApplication::processEvents();
+
+    const QSize canvasFull = window.contentSize();
+    QVERIFY2(!canvasFull.isEmpty(), "首次布局没有给出画布尺寸");
+    QCOMPARE(window.size(), canvasFull); //初始布局自己就必须是收敛的
+    const int layoutsForStartup = window.relayoutCount;
+    qInfo("SIZE 基准：画布 %dx%d 窗口 %dx%d（装载+首帧布局共重排 %d 次，探针 %d 次）",
+          canvasFull.width(), canvasFull.height(), window.width(), window.height(),
+          layoutsForStartup, layoutsForStartup);
+
+    //变更前的每帧重绘成本（画布 100%）：修复后要比它，不能只看绝对数
+    const int paintsBefore = window.paintCount;
+    const PaintRunResult before = paintFrames(&window, 60);
+    qInfo("SIZE 变更前：%d 次重绘共 %lld ms（重排 %d 次，paintEvent 实际进入 %d 次，"
+          "平均 %.2f ms/次）",
+          before.frames, before.ms, before.relayouts,
+          window.paintCount - paintsBefore,
+          before.frames > 0 ? double(before.ms) / before.frames : 0.0);
+
+    /*---- 诊断 A：真事件循环下的帧节奏（100%） ----*/
+    QElapsedTimer stampClock; //帧节奏用的统一时间基准（重绘时刻都记它）
+    stampClock.start();
+    window.stampClock = &stampClock;
+    const PaceResult paceBefore = paceFor(&window, 600);
+    qInfo("PACE 变更前（100%%）：%d 帧 / %lld ms = %.1f fps，重排 %d 次，"
+          "帧间隔中位 %lld ms 最大 %lld ms",
+          paceBefore.paints, paceBefore.ms, paceBefore.fps, paceBefore.relayouts,
+          paceBefore.medianGapMs, paceBefore.maxGapMs);
+
+    /*---- 诊断 B：整条帧管线的每帧成本（100%） ----*/
+    const FrameCost costFull = measureFrameCost(&window, 30);
+    qInfo("COST 画布 %dx%d（渲染 %dx%d）：%.2f ms/帧（节拍 %d ms，120fps 预算 8.3 ms）",
+          costFull.canvas.width(), costFull.canvas.height(), costFull.render.width(),
+          costFull.render.height(), costFull.msPerFrame, window.frameIntervalMs());
+
+    const int relayoutsBeforeChange = window.relayoutCount;
+
+    /*========== 被测量的一刻：一次立绘大小变更 ==========*/
+    QElapsedTimer changeClock;
+    changeClock.start();
+    window.SetTachieSize(50);
+    const qint64 blockMs = changeClock.elapsed();
+
+    const QSize canvasHalf = window.contentSize();
+    const int relayoutsForChange = window.relayoutCount - relayoutsBeforeChange;
+    const bool canvasMatchesWindow = (canvasHalf == window.size());
+    qInfo("SIZE SetTachieSize(50)：阻塞 %lld ms；画布 %dx%d 窗口 %dx%d（一致=%d）；"
+          "这次变更重排 %d 次",
+          blockMs, canvasHalf.width(), canvasHalf.height(), window.width(), window.height(),
+          int(canvasMatchesWindow), relayoutsForChange);
+
+    /*========== 关键问题：变更之后，重绘会不会每帧重新触发重排 ==========*/
+    const int paintsBeforeAfterRun = window.paintCount;
+    const PaintRunResult after = paintFrames(&window, 60);
+    const int paintsInAfterRun = window.paintCount - paintsBeforeAfterRun;
+    qInfo("SIZE 变更后：%d 次重绘共 %lld ms（重排 %d 次；paintEvent 实际进入 %d 次；"
+          "平均 %.2f ms/次重绘）",
+          after.frames, after.ms, after.relayouts, paintsInAfterRun,
+          after.frames > 0 ? double(after.ms) / after.frames : 0.0);
+
+    /*---- 诊断 C：变更之后的帧节奏（50%） ----*/
+    const PaceResult paceAfter = paceFor(&window, 600);
+    qInfo("PACE 变更后（50%%）：%d 帧 / %lld ms = %.1f fps，重排 %d 次，"
+          "帧间隔中位 %lld ms 最大 %lld ms",
+          paceAfter.paints, paceAfter.ms, paceAfter.fps, paceAfter.relayouts,
+          paceAfter.medianGapMs, paceAfter.maxGapMs);
+
+    /*---- 诊断 D：一次"输入"到底等于几次大小变更 ----
+        SettingChild_Char::on_spinBox_TachieSize_textChanged 是**每敲一个字符**发一次
+       requestSetTachieSize（见该函数），所以用户在 0 的基础上敲 "150" 会依次得到
+       1 → 15 → 150 三次变更。这里照抄这三次，量"敲三个字符"一共冻多久。*/
+    QElapsedTimer typingClock;
+    typingClock.start();
+    window.SetTachieSize(1);
+    const qint64 firstKeyMs = typingClock.elapsed();
+    window.SetTachieSize(15);
+    const qint64 secondKeyMs = typingClock.elapsed() - firstKeyMs;
+    window.SetTachieSize(150);
+    const qint64 thirdKeyMs = typingClock.elapsed() - secondKeyMs - firstKeyMs;
+    qInfo("TYPE 敲 \"150\" 三个字符（= 三次 SetTachieSize）：%lld + %lld + %lld = %lld ms",
+          firstKeyMs, secondKeyMs, thirdKeyMs, typingClock.elapsed());
+
+    /*---- 诊断 E：加大立绘之后的每帧成本（用户档位 120fps/1.5x） ----
+       如果"放大之后持续掉帧"来自"画布变大、每帧成本超预算"，这里就会看到
+       ms/帧 超过 8.3 ms。*/
+    const FrameCost cost150 = measureFrameCost(&window, 30);
+    qInfo("COST 150%%：画布 %dx%d（渲染 %dx%d）%.2f ms/帧",
+          cost150.canvas.width(), cost150.canvas.height(), cost150.render.width(),
+          cost150.render.height(), cost150.msPerFrame);
+    window.SetTachieSize(200);
+    const FrameCost cost200 = measureFrameCost(&window, 30);
+    qInfo("COST 200%%：画布 %dx%d（渲染 %dx%d）%.2f ms/帧",
+          cost200.canvas.width(), cost200.canvas.height(), cost200.render.width(),
+          cost200.render.height(), cost200.msPerFrame);
+
+    /*注释掉的诊断数字到此为止，下面是断言。*/
+
+    /*① 大小**真的**变了：50% 的画布必须比 100% 小，且新画布与窗口一致。
+        没有这条，"把 relayoutContent 变成空函数"也能过上面两条断言。*/
+    QVERIFY2(canvasHalf != canvasFull,
+             qPrintable(QStringLiteral("SetTachieSize(50) 之后画布仍是 %1x%2 —— 大小没有真的变")
+                            .arg(canvasFull.width())
+                            .arg(canvasFull.height())));
+    QVERIFY2(canvasHalf.height() < canvasFull.height(),
+             qPrintable(QStringLiteral("立绘大小 100%%→50%%，画布高度却从 %1 变成 %2（没有变小）")
+                            .arg(canvasFull.height())
+                            .arg(canvasHalf.height())));
+    QVERIFY2(canvasMatchesWindow,
+             qPrintable(QStringLiteral("变更后画布 %1x%2 与窗口 %3x%4 不一致 —— 布局没有收敛")
+                            .arg(canvasHalf.width())
+                            .arg(canvasHalf.height())
+                            .arg(window.width())
+                            .arg(window.height())));
+
+    /*② 一次变更最多一次重排（= 最多一次探针），不是"每个按键/每帧一次"。*/
+    QVERIFY2(relayoutsForChange <= 1,
+             qPrintable(QStringLiteral("一次 SetTachieSize 触发了 %1 次重排（应 ≤ 1）")
+                            .arg(relayoutsForChange)));
+
+    /*③ 变更之后的重绘**不得**再触发重排 —— 这就是用户看到的"持续掉帧"。
+        先证明这 60 次重绘真的进了 paintEvent（否则断言是空的）。*/
+    QVERIFY2(after.frames == 60,
+             qPrintable(QStringLiteral("只跑成 %1 次重绘（早退保护被触发 = 每帧都在重排）")
+                            .arg(after.frames)));
+    QVERIFY2(paintsInAfterRun == after.frames,
+             qPrintable(QStringLiteral("发了 %1 次 repaint 却只进了 %2 次 paintEvent —— "
+                                       "这条断言的前提（每帧都跑自检）不成立")
+                            .arg(after.frames)
+                            .arg(paintsInAfterRun)));
+    QVERIFY2(after.relayouts == 0,
+             qPrintable(QStringLiteral("变更后的 %1 次重绘里又重排了 %2 次 —— "
+                                       "自检每帧都在重排（每帧一次探针 = 持续掉帧）")
+                            .arg(after.frames)
+                            .arg(after.relayouts)));
+
+    /*④ 阻塞预算（**stated budget**）。
+        修复前实测：单个 3042ms（三次连续调用 3276 + 3038 + 3055 = 9369ms），
+                    其中 2970ms 是探针/校正的**墙钟睡眠**（msleep(150)×19 + msleep(120)）；
+        修复后实测：单个 9ms，三次连续 25ms（本机空闲，120fps/1.5x/atri）。
+        预算取 **120ms** 的依据：
+          - 比修复后实测宽 13 倍，普通抖动/慢机器不会误报；
+          - 又**故意卡在"一次 150ms 睡眠"之下** —— 只要有人把任何一处
+            `msleep(kProbeSampleIntervalMs)` 加回去，这次调用立刻 ≥150ms 而被抓住。
+            预算如果给宽（例如 800ms），加回一次睡眠仍然会通过，这条断言就废了。
+        真正的含义：这条路径上**不许再有墙钟睡眠**（它冻结的是整个应用的主线程）。*/
+    QVERIFY2(blockMs < 120,
+             qPrintable(QStringLiteral("一次 SetTachieSize 阻塞主线程 %1 ms（预算 120 ms；"
+                                       "修复前实测 3042 ms）")
+                            .arg(blockMs)));
+
+    /*⑤ 探针**真的**只跑了一次（一个人物几何 = 一次探针），而且后续重排走的是缓存。
+        这条比"重排次数 ≤ 1"更直接：它数的是探针本身，任何"把探针挪到别处每帧再跑"的
+        写法都会在这里暴露 —— 本用例一共做了 6 次布局（装载首帧 + 5 次大小变更），
+        探针只要跑第 2 次就会被抓住。
+        （缓存命中那条日志**故意只记一次**：用户拖输入框时不能刷屏。所以这里只要求它
+        出现过一次，用来证明"后续重排走的是缓存这条分支"，而不是数命中次数。）*/
+    QVERIFY2(g_probeRuns == 1,
+             qPrintable(QStringLiteral("整个用例里探针跑了 %1 次（应恰好 1 次 = 装载模型那一次；"
+                                       "换立绘大小不得重探）")
+                            .arg(g_probeRuns)));
+    QVERIFY2(g_probeCacheReuses >= 1,
+             "一次都没走到「探针已缓存」这条分支 —— 缓存没有生效在重排路径上");
+
+    /*⑥ 探针结果与画布尺寸**无关**（缓存能成立的前提）——用画布宽高比钉住：
+        所有尺寸下画布宽高比必须都贴住同一个人物真实宽高比。
+        容差 1.5% 的来源：设备像素对齐对两条边各最多引入 0.7% 的偏差
+        （见 utils/DevicePixelAlign.h），两次对齐之差最大 ≈1.4%。
+        如果探针沾了画布尺寸，"用缓存 vs 重新探"就会给出互相矛盾的宽高比，
+        这条会在不同尺寸之间看到远超 1.5% 的分歧。
+        （1%/15% 两档不参与：那些画布被 kMinCanvasSide=32 兜住，宽高比本来就无意义。）*/
+    const double referenceAspect = double(canvasFull.width()) / double(canvasFull.height());
+    qInfo("ASPECT 参照（100%% 画布）= %.6f；50%%=%.4f%% 150%%=%.4f%% 200%%=%.4f%%",
+          referenceAspect,
+          aspectDeviation(canvasHalf, referenceAspect) * 100.0,
+          aspectDeviation(cost150.canvas, referenceAspect) * 100.0,
+          aspectDeviation(cost200.canvas, referenceAspect) * 100.0);
+    QVERIFY2(aspectDeviation(canvasHalf, referenceAspect) < 0.015,
+             qPrintable(QStringLiteral("50%% 画布 %1x%2 的宽高比偏离 100%% 画布 %3x%4 达 %5%% —— "
+                                       "探针结果疑似与画布尺寸有关（缓存的前提不成立）")
+                            .arg(canvasHalf.width())
+                            .arg(canvasHalf.height())
+                            .arg(canvasFull.width())
+                            .arg(canvasFull.height())
+                            .arg(aspectDeviation(canvasHalf, referenceAspect) * 100.0)));
+    QVERIFY2(aspectDeviation(cost150.canvas, referenceAspect) < 0.015,
+             qPrintable(QStringLiteral("150%% 画布 %1x%2 的宽高比偏离参照 %3%%")
+                            .arg(cost150.canvas.width())
+                            .arg(cost150.canvas.height())
+                            .arg(aspectDeviation(cost150.canvas, referenceAspect) * 100.0)));
+    QVERIFY2(aspectDeviation(cost200.canvas, referenceAspect) < 0.015,
+             qPrintable(QStringLiteral("200%% 画布 %1x%2 的宽高比偏离参照 %3%%")
+                            .arg(cost200.canvas.width())
+                            .arg(cost200.canvas.height())
+                            .arg(aspectDeviation(cost200.canvas, referenceAspect) * 100.0)));
 }
 
 QTEST_MAIN(TestLive2DWindow)

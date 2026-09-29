@@ -80,7 +80,7 @@ class TestLive2DOffscreen : public QObject
        **必须真的等**：帧的时间步长来自墙钟（renderFrame 内部 clock.restart()），
        紧循环连调 renderFrame() 的话两帧只隔几微秒 → 过渡永远走不完。
        values 非空时把每帧读到的 probeParameter 记下来。
-       injectedDeltaSeconds > 0 时**注入固定步长**（走 setNextFrameDeltaForTest，仍是同一条
+       injectedDeltaSeconds > 0 时**注入固定步长**（走 setNextFrameDeltaSeconds，仍是同一条
        夹取路径），于是"虚拟时间"由调用方钉住、与机器负载无关；此时不再 sleep（步长已经是
        注入的，等待没有意义，也让用例更快）。需要真实墙钟的用例传默认值 0 即可。*/
     static bool advanceFrames(Live2DOffscreenRenderer *renderer, const QString &probeParameter,
@@ -221,7 +221,7 @@ bool TestLive2DOffscreen::advanceFrames(Live2DOffscreenRenderer *renderer,
     for (int index = 0; index < frames; ++index)
     {
         if (injectedDeltaSeconds > 0.0f)
-            renderer->setNextFrameDeltaForTest(injectedDeltaSeconds);
+            renderer->setNextFrameDeltaSeconds(injectedDeltaSeconds);
         else
             QThread::msleep(static_cast<unsigned long>(waitMs > 0 ? waitMs : 0));
         if (renderer->renderFrame(targetSize).isNull())

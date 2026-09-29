@@ -15,7 +15,6 @@
 #include <QScreen>
 #include <QSettings>
 #include <QShowEvent>
-#include <QThread>
 #include <QTimer>
 
 #include <algorithm>
@@ -240,6 +239,14 @@ bool Live2DCharacterWindow::loadModel(const QString &modelName)
     m_modelLoaded = true;
     m_frameIndex = 0;
     m_renderingFrame = false;
+    /*人物几何的缓存必须在这里失效：渲染器刚重建了模型实例，旧模型量到的可见范围
+       对新模型没有意义。（这是**唯一**的失效点 —— 换立绘大小不重探，见
+       probeFigureMetrics 的缓存说明。）
+       自检重排的"同一组合只试一次"记录也一起清掉：换模型是一次全新的事件。*/
+    m_figureMetricsValid = false;
+    m_figureMetricsReuseLogged = false;
+    m_relayoutAttempted = false;
+    m_relayoutGaveUpLogged = false;
     qInfo() << "Live2D 模型已装载:" << modelJsonName << "于" << dir;
 
     /*情绪预设：路径要靠模型名才推得出来（…/Live2D/<模型名>/presets/moods.json），
@@ -536,12 +543,14 @@ bool Live2DCharacterWindow::measureFigureOccupancy(double *fractionX, double *fr
     QRect unionBounds;
     for (int pass = 0; pass < kMeasuredFramePasses; ++pass)
     {
+        /*真的让时间过去一小段，姿势才会走到不同相位 —— 但走的是**虚拟时间**。
+           与被删掉的 msleep(120) 等价：渲染器的步长上限是 100ms，睡 120ms 喂进去的
+           也是 100ms 的步长；这里传同一个 120ms 走同一条夹取路径。
+           顺带也去掉了这里的 processEvents()：重排中途让出主线程只会让 paintEvent
+           有机会在"画布还没定完"的窗口期进来（见 renderAndRegisterFrame 的重入保护）。*/
         if (pass > 0)
-        {
-            // 真的让时间过去一小段，姿势才会走到不同相位
-            QThread::msleep(static_cast<unsigned long>(kMeasuredFrameIntervalMs));
-            QCoreApplication::processEvents();
-        }
+            m_renderer.setNextFrameDeltaSeconds(kMeasuredFrameIntervalMs / 1000.0f);
+
         if (!renderAndRegisterFrame() || m_scaledImg.isNull())
             return false;
 
@@ -620,18 +629,56 @@ bool Live2DCharacterWindow::opaqueBoundsInFrame(QRect *bounds) const
   不做模型画布像素取整（本模型画布是 1x1，取整会把人物范围毁成 1x1）。*/
 void Live2DCharacterWindow::probeFigureMetrics()
 {
+    /*========== 缓存：探针量的是**模型**的属性，不是画布的 ==========
+
+      为什么可以缓存（结构性理由，不是"看着差不多"）：
+        ① 探针帧永远是固定的 512x512 正方形（kProbeCanvasSide），与真实画布尺寸无关；
+        ② 取样走**测量模式**（setMeasureMode(true)），变换是固定的等比 kMeasureScale，
+           与 m_displayRatioX/Y、与画布尺寸都无关（见 OffscreenUserModel::drawModel）；
+        ③ 反解回"自然缩放"只除以那个固定的 fit（见 probeFigureMetrics 的 fold-back），
+           没有任何一项来自画布。
+      所以画布尺寸是这份结果的**输出**，不是它的输入 —— 换个立绘大小重探一遍是纯浪费。
+
+      浪费有多大（修复前实测）：一次重排 = 3.0s 主线程冻结，其中 2.97s 是
+      `msleep(150)` × 19 + `msleep(120)` × 1。而 SettingChild_Char 的立绘大小输入框是
+      `textChanged` 驱动的 —— **每敲一个字符**就发一次 requestSetTachieSize，
+      于是"改一次大小"实际是 N × 3.0s 的全应用冻结（实测敲 "150" 三个字符 = 9369ms），
+      用户看到的就是"延迟几秒才变、之后持续卡顿"。
+
+      失效点只有 loadModel()：换模型 / 重新装载（渲染器会重建模型实例）。*/
+    if (m_figureMetricsValid)
+    {
+        if (!m_figureMetricsReuseLogged)
+        {
+            m_figureMetricsReuseLogged = true;
+            qInfo() << "Live2D 探针 [LIVE2D-PROBE-CACHED] 已缓存（人物几何是模型的属性，与画布"
+                       "尺寸无关）：宽高比"
+                    << m_figureAspect << "跨度" << m_figureSpanX << "x" << m_figureSpanY
+                    << "→ 本次重排不再重探（省下 20 次取样）";
+        }
+        return;
+    }
+
     m_renderer.clearFigureSpan();
     m_renderer.setMeasureMode(true);
 
     bool probeOk = true;
     for (int i = 0; i < kProbeSamples; ++i)
     {
-        // 取样之间真的让时间过去，呼吸/物理才会走到不同相位（i=0 不睡，省一次等待）
+        /*取样之间推进**虚拟时间**，不再让墙钟睡眠（更不用 processEvents 把事件循环
+           放进来 —— 重排中途让出主线程只会给自检重排制造可乘之机）。
+
+           为什么推进量与被删掉的 msleep(150) 等价：渲染器的单帧步长上限是 100ms
+           （Live2DOffscreenRenderer::kMaxFrameDeltaSeconds），以前"睡 150ms 再渲一帧"
+           喂进去的也是被夹成 100ms 的步长。这里传的就是同一个 150ms，走的还是那条夹取
+           路径 ⇒ 探针覆盖的虚拟时间段与修复前逐位相同（i=0 仍旧不推进，与以前一样）。
+           好处：主线程一秒都不睡，而且取样相位不再随机器负载/渲染耗时漂移（确定性）。
+           为什么不借机把窗口拉长去覆盖完整的 2.667s 循环：测量模式下人物的纵向范围已经
+           饱和在 1.977/2.0，拉长窗口只会让并集顶到测量帧边界，把"人物多大"量成
+           "被裁掉多大"。*/
         if (i > 0)
-        {
-            QThread::msleep(static_cast<unsigned long>(kProbeSampleIntervalMs));
-            QCoreApplication::processEvents();
-        }
+            m_renderer.setNextFrameDeltaSeconds(kProbeSampleIntervalMs / 1000.0f);
+
         const QImage probe = m_renderer.renderFrame(QSize(kProbeCanvasSide, kProbeCanvasSide));
         if (probe.isNull())
         {
@@ -653,6 +700,9 @@ void Live2DCharacterWindow::probeFigureMetrics()
         m_figureSpanX = 2.0;
         m_figureSpanY = 2.0;
         m_renderer.clearFigureSpan();
+        /*⚠️ 探针失败**不置** m_figureMetricsValid：这是一次失败，不是"模型量不出东西"。
+           下一次重排应当再试（否则偶发的一次 GL 失败会把兜底尺寸永久钉住）。
+           失败路径没有睡眠，重试的代价是 20 帧渲染。*/
         return;
     }
 
@@ -664,9 +714,16 @@ void Live2DCharacterWindow::probeFigureMetrics()
     m_figureSpanX = std::max(1e-6, static_cast<double>(metrics.spanX));
     m_figureSpanY = std::max(1e-6, static_cast<double>(metrics.spanY));
 
-    qInfo() << "Live2D 探针:" << kProbeSamples << "次取样（测量模式），人物可见范围"
+    /*纯 ASCII 标记 [LIVE2D-PROBE-RUN]：测试要数"探针真的跑了几次"，而控制台是 GBK、
+       中文日志会变乱码，所以用它当可解析的锚点（probeFigureMetrics 是私有且非虚的，
+       派生类覆写不了，日志是唯一不侵入实现的观察通道）。*/
+    qInfo() << "Live2D 探针 [LIVE2D-PROBE-RUN]:" << kProbeSamples
+            << "次取样（测量模式 + 虚拟时间），人物可见范围"
             << "宽" << m_figureSpanX << "高" << m_figureSpanY << "（满画布 = 2）→ 真实宽高比"
             << m_figureAspect;
+
+    //量成功了才缓存：下一次重排（换立绘大小）直接用这三个数，不再取样
+    m_figureMetricsValid = true;
 }
 /*每帧：渲染 → 登记；交互区只在低频节拍上重算（QBitmap 构造成本太高，不能进帧热路径）*/
 void Live2DCharacterWindow::onFrameTick()
@@ -724,9 +781,16 @@ bool Live2DCharacterWindow::renderAndRegisterFrame()
             std::max(1, static_cast<int>(std::lround(physicalSize.height() * shrink))));
     }
 
+    /*重入保护：**保存并恢复**，不是无条件置 false。
+       为什么（这是一个真实存在的隐患，不是洁癖）：relayoutContent() 在开头就把
+       m_renderingFrame 置位，用来挡住"重排期间 paintEvent 又来自检重排"；而重排内部
+       要经本函数渲染好几帧。无条件置 false 会在第一次内部渲染之后就把外层那道保护
+       提前解除，于是重排还没定完画布时 paintEvent 就有机会进来看到"画布 != 窗口"。
+       保存-恢复让"是谁置位的、由谁解除"这条语义成立。*/
+    const bool wasRenderingFrame = m_renderingFrame;
     m_renderingFrame = true;
     QImage frame = m_renderer.renderFrame(physicalSize);
-    m_renderingFrame = false;
+    m_renderingFrame = wasRenderingFrame;
 
     if (frame.isNull())
         return false; //渲染失败就跳过，不覆盖上一张好帧（防闪烁）
@@ -796,13 +860,42 @@ void Live2DCharacterWindow::paintEvent(QPaintEvent *event)
     // 但两者并不等价（系统只改缩放比例、窗口不挪的情况就只变 dpr），所以两个条件都看：
     // 多存一个 dpr 的代价可以忽略，漏掉一次重排的代价是"整帧被重采样、看不清"。
     const qreal currentDpr = devicePixelRatioF();
-    if (!m_renderingFrame && !m_logicalCanvasSize.isEmpty() &&
-        (m_logicalCanvasSize != size() || qAbs(m_layoutDpr - currentDpr) > 1e-9))
+    const bool canvasMismatch =
+        !m_logicalCanvasSize.isEmpty() &&
+        (m_logicalCanvasSize != size() || qAbs(m_layoutDpr - currentDpr) > 1e-9);
+    if (m_renderingFrame || !canvasMismatch)
+        return;
+
+    /*⚠️ 同一个 (窗口尺寸, dpr) 组合只试一次。
+       为什么：这条自检跑在**每一次重绘**里。如果那个不一致是持久的（重排也修不好 ——
+       例如窗口管理器把 resize 夹到别的尺寸），"每帧重绘都重排"就是每帧一次探针/一次
+       实测校正，用户看到的正是**持续掉帧**：帧率被压到接近 0，而且看起来永远好不了。
+       一次修不好就说明"重排"不是这个不一致的解，此时记一条日志、放手，画面继续按
+       当前画布画（宁可尺寸不完美，也不能每帧卡一次）。
+       放手不等于永久放弃：真正的变化（窗口被真正 resize、跨屏/改缩放导致 dpr 变化）
+       会产生一个**新的组合**，那时必须重新尝试 —— 所以记录的是组合本身。*/
+    const bool alreadyTriedThisPair = m_relayoutAttempted &&
+                                      m_relayoutAttemptedForSize == size() &&
+                                      qAbs(m_relayoutAttemptedForDpr - currentDpr) <= 1e-9;
+    if (alreadyTriedThisPair)
     {
-        qInfo() << "Live2D 画布" << m_logicalCanvasSize << "与窗口" << size() << "不一致，或 dpr 由"
-                << m_layoutDpr << "变为" << currentDpr << "：按 dpr" << currentDpr << "重排";
-        relayoutContent();
+        if (!m_relayoutGaveUpLogged)
+        {
+            m_relayoutGaveUpLogged = true;
+            qWarning() << "Live2D 画布" << m_logicalCanvasSize << "与窗口" << size() << "/ dpr"
+                       << currentDpr << "重排一次后仍不一致：不再每次重绘都重排"
+                       << "（窗口尺寸或 dpr 真正变化时会重新尝试）";
+        }
+        return;
     }
+
+    qInfo() << "Live2D 画布" << m_logicalCanvasSize << "与窗口" << size() << "不一致，或 dpr 由"
+            << m_layoutDpr << "变为" << currentDpr << "：按 dpr" << currentDpr << "重排";
+    m_relayoutAttempted = true;
+    m_relayoutAttemptedForSize = size();
+    m_relayoutAttemptedForDpr = currentDpr;
+    m_relayoutGaveUpLogged = false;
+    relayoutContent();
 }
 
 /*当前内容的**逻辑**尺寸（= 窗口尺寸）。
@@ -865,11 +958,17 @@ void Live2DCharacterWindow::showEvent(QShowEvent *event)
     if (!m_pendingModelName.isEmpty())
     {
         m_pendingModelName.clear();
+        /*"自检重排只试一次"的记录要清掉：显示是一次全新的事件（跨屏拖动、隐藏再显示
+           都可能带来新的 dpr/尺寸），不该被上一次的放手状态挡住。*/
+        m_relayoutAttempted = false;
+        m_relayoutGaveUpLogged = false;
         relayoutContent();
     }
     else if (!m_logicalCanvasSize.isEmpty() && m_logicalCanvasSize != size())
     {
         // 跨屏/DPI 变化导致窗口尺寸变了，按新 dpr 重排
+        m_relayoutAttempted = false;
+        m_relayoutGaveUpLogged = false;
         relayoutContent();
     }
 

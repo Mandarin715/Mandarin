@@ -113,8 +113,14 @@ class Live2DCharacterWindow : public CharacterWindowBase
     /*画布尺寸启发式的基准高、探针参数与各类夹取范围*/
     static constexpr int kBaseCanvasHeight = 900;
     static constexpr int kProbeCanvasSide = 512;
-    /*探针取样次数与间隔：要覆盖整段待机动作（本模型 2.667s 一循环）。
-       20 次 × 150ms ≈ 3s > 一个循环，够把动作走满一遍；只做一次布局，成本可接受。*/
+    /*探针取样次数与"取样之间推进多少虚拟时间"。
+       20 次 × 150ms：要覆盖整段待机动作（本模型 2.667s 一循环）。
+       ⚠️ 这个 150ms 是**虚拟时间**，不是墙钟睡眠：渲染器的帧步长上限是 100ms
+       （Live2DOffscreenRenderer 的 kMaxFrameDeltaSeconds），所以每个取样实际推进 100ms、
+       20 次共 ≈1.9s —— 与"以前真的 msleep(150)"时渲染器看到的步长**逐位相同**
+       （150ms 的墙钟间隔本来就会被夹成 100ms）。不把它调大（例如 200ms）是故意的：
+       测量模式下人物的纵向范围已经饱和到 1.977/2.0，把窗口拉长只会让并集顶到测量帧边界、
+       把"人物到底多大"量成"被裁掉的大小"。*/
     static constexpr int kProbeSamples = 20;
     static constexpr int kProbeSampleIntervalMs = 150;
     /*人物目标占比：**横竖同一个值**，于是画布四边留出 (1-ratio)/2 的余量。
@@ -135,7 +141,9 @@ class Live2DCharacterWindow : public CharacterWindowBase
     /*一次测量取几帧求并集、帧间隔多少毫秒。
        为什么要并集：待机动作/呼吸会让姿势移动，单帧包围盒可能恰好偏松，按它校正会把
        人物放得比"整段动作都装得下"更大，动作一摆就贴边。取 2 帧（间隔 120ms）是
-       成本与稳健性的折中：多渲一帧约几毫秒，比裁掉人物便宜得多。*/
+       成本与稳健性的折中：多渲一帧约几毫秒，比裁掉人物便宜得多。
+       ⚠️ 与探针同理：这 120ms 现在也是**虚拟时间**（不再 msleep），实际推进量同样是
+       被夹取的 100ms —— 与以前逐位相同。*/
     static constexpr int kMeasuredFramePasses = 2;
     static constexpr int kMeasuredFrameIntervalMs = 120;
     static constexpr int kRegionRefreshInterval = 10;
@@ -185,7 +193,11 @@ class Live2DCharacterWindow : public CharacterWindowBase
     void applyMoodBlendFromConfig();
 
     /*探针渲染：量出人物可见范围在绘制输出空间里的跨度（见 Live2DOffscreenRenderer::
-      probeFigureMetrics），据此定画布宽高比与目标占比。*/
+      probeFigureMetrics），据此定画布宽高比与目标占比。
+
+      **同一份模型只探一次**：结果缓存在 m_figureAspect/m_figureSpanX/m_figureSpanY 里
+      （它是模型的属性，与画布尺寸无关 —— 理由见 m_figureMetricsValid 的说明）。
+      取样之间用**虚拟时间**（setNextFrameDeltaSeconds）推进，不再 msleep。*/
     void probeFigureMetrics();
 
     /*量当前画布上人物实际占多少（横/竖各一个 0~1 的比例）。
@@ -228,6 +240,17 @@ class Live2DCharacterWindow : public CharacterWindowBase
     double m_displayRatioX = kTargetFigureRatio;
     double m_displayRatioY = kTargetFigureRatio;
 
+    /*上面这三个量是不是已经由探针量出来过（**属于模型**，与画布尺寸无关）。
+        为什么必须缓存：探针量的是模型的可见范围与真实宽高比 —— 探针帧是固定的
+        512x512 正方形，测量模式用的是固定的等比变换（kMeasureScale），反解回"自然缩放"
+        只除以那个固定值（见 Live2DOffscreenRenderer::probeFigureMetrics）。画布尺寸是从
+        这份结果**推**出来的，不是它的输入。所以"换个立绘大小就重探一遍"是纯浪费：
+        修复前实测一次布局 = 3.0s 主线程冻结，而输入框每敲一个字符就触发一次。
+        失效点只有 loadModel()（换模型 / 重新装载）。*/
+    bool m_figureMetricsValid = false;
+    /*"探针已缓存、本次重排不再重探"只记一条日志：用户拖输入框时不能刷屏*/
+    bool m_figureMetricsReuseLogged = false;
+
     /*最近一帧对应的**逻辑**画布尺寸。
       为什么不实时用 m_scaledImg.size()/dpr 推：窗口一旦映射到屏幕，devicePixelRatioF()
       会变（本例 1.0 → 1.25），同一个 QImage 用新 dpr 去除就会算出另一个逻辑尺寸，
@@ -239,6 +262,16 @@ class Live2DCharacterWindow : public CharacterWindowBase
       为什么不只比 m_logicalCanvasSize 与 size()：dpr 与逻辑尺寸通常一起变，但并不等价
       （系统只改缩放比例、窗口不挪时只变 dpr），多存一个 dpr 是廉价保险。*/
     qreal m_layoutDpr = 0.0;
+
+    /*paintEvent 自检重排的"同一组合只试一次"记录（见 paintEvent 的说明）。
+      为什么要它：一旦"画布 vs 窗口/dpr"的不一致是**持久**的（重排也修不好，例如
+      窗口管理器把 resize 夹掉了），每帧重绘都重排就是"每次重绘一次探针" —— 用户看到的
+      是持续掉帧。记下"为哪个 (窗口尺寸, dpr) 组合试过"就能做到：同一组合只试一次、
+      记一条日志就放手，而真正的尺寸/dpr 变化（新组合）照样会重新尝试。*/
+    bool m_relayoutAttempted = false;
+    QSize m_relayoutAttemptedForSize;
+    qreal m_relayoutAttemptedForDpr = 0.0;
+    bool m_relayoutGaveUpLogged = false;
 
     /*reloadContent 在窗口还没映射时只记模型名，真正的首次布局推迟到 showEvent
       （那时 devicePixelRatioF() 才是真实值）。*/
