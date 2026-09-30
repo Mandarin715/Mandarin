@@ -14,6 +14,7 @@
 #include <QImage>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonArray>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPixmap>
@@ -73,6 +74,12 @@ class TestLive2DWindow : public QObject
     /*[范围纪律] parameter-map.json 的 min/max/neutral 必须**逐条等于**模型自己声明的
       最小值/最大值/默认值 —— 范围是模型的事实，不是可以手抄的东西*/
     void parameterMapRangesMatchModelDeclarations();
+    /*[范围纪律·用户模型那一档] 用户实际在用的模型（config.ini 的 live2dModel）必须
+       在这份遍历里被真的覆盖到 —— 否则"遍历"可能悄悄漏掉他正在看的那个模型。*/
+    void preferredModelHasVerifiedParameterMap();
+    /*诊断：把每个模型的全部声明参数与 cdi3 显示名打出来（写 parameter-map.json 的依据）。
+       **只打印、不断言数值** —— 它是一张给人看的表，不是判据。*/
+    void dumpsDeclaredParameterTable();
     /*初稿数值不许越界、不许碰驱动器/物理占用的参数*/
     void moodPresetValuesWithinParameterRanges();
     /*词表外的词必须回退 neutral（而不是"保持上一种情绪"）*/
@@ -87,7 +94,8 @@ class TestLive2DWindow : public QObject
     void moodIgnoringEyesLeavesBlinkUnchanged();
     /***残留情绪的回归测试**：happy → neutral 后参数必须全部回到中立*/
     void switchingMoodDoesNotAccumulate();
-    /*校准素材：14 个原型各出一张固定区域的脸部裁切图（只出图，不判断好坏）*/
+    /*校准素材：14 个原型各出一张固定区域的脸部裁切图（只出图，不判断好坏）。
+       本阶段起遍历每个带 parameter-map.json 的模型，文件名带模型名；另出一张跨模型总表。*/
     void rendersMoodArchetypeCalibrationSheet();
 
     /*---------- 心情过渡与说话嘴巴的窗口层接线（本阶段新增） ----------*/
@@ -116,7 +124,59 @@ class TestLive2DWindow : public QObject
     /*按当前用户配置（CharSelect + live2dModel）装载情绪预设。
       返回 false 表示数据不在（模型/JSON 都在 Documents/ 下，禁二传不入库）→ 调用方 QSKIP。*/
     static bool loadConfiguredMoodPreset(Live2DMoodPreset *preset);
-    /*情绪数据目录（= Live2DMoodPreset 推导出来的那一层，parameter-map.json 在这里）。
+
+    /*========== 「每一个写了 parameter-map.json 的模型」这一层（多模型数据） ==========
+
+      为什么要有它（本阶段扩展 miku 时加）：以前这类用例只跑 preferredModelName()（atri），
+      于是 miku 的数据写错也不会有人报 —— 而"再挂一个模型"恰恰是这套数据驱动机制的全部
+      卖点。现在改成**遍历所有确实带了 parameter-map.json 的模型**：
+      新模型只要把数据放进 Character/Assets/<角色>/Live2D/<模型名>/，就自动进入核对范围，
+      不需要再动测试（也不需要动 C++）。
+
+      模型**文件**目录与**数据**目录在本机是分开的（见 openConfiguredModel 的说明），
+      所以这里按"数据目录在不在"枚举，再回到模型根目录找同名模型来装载。*/
+
+    /*一个"有数据"的模型：名字（= 两个目录共用的那一层）+ 数据目录 + 模型文件目录。*/
+    struct MappedModel
+    {
+        QString name;
+        QString dataDir;  // parameter-map.json 所在目录
+        QString modelDir; // model3.json / moc3 所在目录（可能与 dataDir 不同层）
+    };
+
+    /*枚举**所有**带 parameter-map.json 的模型（按名字排序，顺序稳定）。
+       没有任何一个有数据时返回空表（调用方 QSKIP："本机没这套数据"而不是失败）。*/
+    static QVector<MappedModel> mappedModels();
+    /*枚举模型**文件**根目录下所有带 *.model3.json 的模型名（诊断用；数据不一定有）。*/
+    static QStringList modelNamesWithModelFiles();
+    /*按名字装载模型：候选①模型根目录 ②角色资源目录（与情绪数据同层），
+       逐个 *.model3.json 试着装载。返回 false = 本机没有/装不上。
+       usedDir 非空时写回**真正装上的那个目录**（诊断要按它去找 cdi3.json 显示名）。*/
+    static bool openModelByName(const QString &name, Live2DOffscreenRenderer *renderer,
+                                QString *usedDir = nullptr);
+
+    /*[范围纪律] 对**一个**模型做 parameter-map ↔ 模型声明 的逐条核对。
+       返回 true = 逐项相符；false 时 error 里是全部差异（**报出全部再断言**：
+       只报第一条会让人修一轮跑一轮）。抽成函数是为了让"通用核对"与"只跑用户模型"
+       两条入口走**同一份**判据 —— 两份实现迟早会分叉，分叉出来的那一半就不再抓 bug 了。*/
+    static bool verifyModelRanges(const Live2DMoodPreset &preset, QString *error);
+
+    /*诊断：把一个模型的**全部**声明参数（含 cdi3 显示名）打出来。
+       这是"写 parameter-map.json 时该抄哪些数字"的唯一合法来源（不许从 vtube.json 手推）。
+       只打印、不断言内容 —— 它是一张给人看的表。返回打印的行，供拼装日志。*/
+    static QStringList dumpDeclaredParameters(const QString &modelName,
+                                              const QString &modelDirPath,
+                                              Live2DOffscreenRenderer *renderer);
+
+    /*把一组**同尺寸**图并排拼成一张总表（左边标原型名），落盘。
+       为什么要有它：每个模型的 14 张裁切图分开落盘（这样 atri 的既有素材不被覆盖），
+       但"人眼比对"需要**一张**图 —— 分开的 28 个文件在资源管理器里没法并排看。
+       拼图只把已有的图摆到一起，**不做任何缩放/重采样**（缩放会抹掉"嘴巴只动了一个像素"
+       这类结论，而这些图的用途正是像素级判读）。*/
+    static bool composeContactSheet(const QStringList &labels, const QVector<QImage> &images,
+                                    const QString &outPath, QString *error);
+
+    /*情绪数据目录
       注意它**不是**模型文件目录 —— 本机模型在 Documents/Mandarin/Live2D/<模型名>，
       情绪数据在 Documents/Mandarin/Character/Assets/<角色>/Live2D/<模型名>。
       用 renderer 自己的装载去打开同一个 moc（不另写一套 moc 解析，也就不会把
@@ -2167,26 +2227,26 @@ void TestLive2DWindow::moodPresetCoversEveryTachieMood()
           preset.archetypeNames().size());
 }
 
-/*按用户配置装载**模型**（不是情绪数据）。两处路径在本机是分开的：
-
-  模型文件  Documents/Mandarin/Live2D/<模型名>/
-  情绪数据  Documents/Mandarin/Character/Assets/<角色>/Live2D/<模型名>/
-
-  （名字对不上是模型作者与用户各自的组织方式，代码从第一天就走"两个候选目录"匹配，
-  见 Live2DCharacterWindow::resolveModelDir；这里沿用同样的两条路径，不新造规则。）*/
 bool TestLive2DWindow::openConfiguredModel(Live2DOffscreenRenderer *renderer)
 {
-    if (renderer == nullptr)
-        return false;
-    const QString modelName = preferredModelName();
-    if (modelName.isEmpty())
+    return openModelByName(preferredModelName(), renderer);
+}
+
+/*按**名字**装载模型（上面那条"按用户配置"的入口现在只是它的一层壳）。
+   两条候选路径与 Live2DCharacterWindow::resolveModelDir 一致；逐个 *.model3.json 试，
+   任何一个装上了就算成功 —— 模型作者给 json 起什么名字由他决定，不该写死。*/
+bool TestLive2DWindow::openModelByName(const QString &name, Live2DOffscreenRenderer *renderer,
+                                       QString *usedDir)
+{
+    if (usedDir != nullptr)
+        usedDir->clear();
+    if (renderer == nullptr || name.trimmed().isEmpty())
         return false;
 
     /*候选①：用户配置的模型根目录；候选②：角色资源目录（与情绪数据同层）。
-      两者都找不到就返回 false（调用方 QSKIP）。*/
+       两者都找不到就返回 false（调用方 QSKIP）。*/
     QStringList candidates;
-    candidates << modelDirFor(modelName)
-               << Live2DMoodPreset::resolveModelDir(modelName);
+    candidates << modelDirFor(name) << Live2DMoodPreset::resolveModelDir(name);
     for (const QString &dir : candidates)
     {
         if (dir.isEmpty() || !QFileInfo::exists(dir))
@@ -2197,11 +2257,132 @@ bool TestLive2DWindow::openConfiguredModel(Live2DOffscreenRenderer *renderer)
         {
             QString error;
             if (renderer->load(dir, jsonName, &error))
+            {
+                if (usedDir != nullptr)
+                    *usedDir = dir;
                 return true;
+            }
         }
     }
     return false;
 }
+
+/*枚举所有带 parameter-map.json 的模型。
+
+  为什么以**数据目录**为入口而不是模型目录：本用例要验证的是"数据表与模型声明相符"，
+  没有数据表的模型没有任何可核对的东西（它照样能渲染，只是没有情绪词汇）。反过来说，
+  只要有人放了一份 parameter-map.json，它就**必须**被核对 —— 哪怕他忘了放模型文件，
+  那也是一种数据错误（下面的用例会把它报出来，而不是静默跳过）。
+
+  角色目录由 Live2DMoodPreset::resolveModelDir 推导（读**真实** config.ini 的 CharSelect），
+  所以这里不需要自己拼路径、也就不会与生产代码的推导分叉。*/
+QVector<TestLive2DWindow::MappedModel> TestLive2DWindow::mappedModels()
+{
+    QVector<MappedModel> result;
+    const QString charName = ReadNowSelectChar();
+    if (charName.isEmpty() || charName == QStringLiteral("未选择"))
+        return result;
+
+    const QString modelsRoot =
+        QDir(CharacterAssestPath).filePath(charName + QStringLiteral("/Live2D"));
+    const QDir root(modelsRoot);
+    if (!root.exists())
+        return result;
+
+    const QStringList names = root.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QString &name : names)
+    {
+        const QString dataDir = root.filePath(name);
+        if (!QFileInfo::exists(QDir(dataDir).filePath(QStringLiteral("parameter-map.json"))))
+            continue;
+
+        MappedModel model;
+        model.name = name;
+        model.dataDir = dataDir;
+        /*模型文件目录：先在模型根目录找同名目录，没有再退回数据目录本身
+           （与生产代码 resolveModelDir 的"两个候选目录"是同一套约定）。*/
+        const QString fileDir = modelDirFor(name);
+        model.modelDir = QFileInfo::exists(fileDir) ? fileDir : dataDir;
+        result.append(model);
+    }
+    return result;
+}
+
+QStringList TestLive2DWindow::modelNamesWithModelFiles()
+{
+    QStringList names;
+    const QDir root(Live2DModelRootPath);
+    const QStringList entries = root.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QString &entry : entries)
+    {
+        const QStringList jsons =
+            QDir(root.filePath(entry)).entryList({QStringLiteral("*.model3.json")}, QDir::Files);
+        if (!jsons.isEmpty())
+            names.append(entry);
+    }
+    return names;
+}
+
+/*把一个模型的全部声明参数连同 cdi3 显示名打成表。
+
+  为什么连显示名一起打：miku 这种模型里大量参数是 `Param25` 这样的无语义 ID，
+  真正透露"这是全身 X 位移"的只有 cdi3.json 的 DisplayInfo（`x全身`）。
+  写 parameter-map.json 的人必须同时看到"名字"与"moc 的真实 min/默认/max" ——
+  分开查两张表迟早会把行对错。*/
+QStringList TestLive2DWindow::dumpDeclaredParameters(const QString &modelName,
+                                                     const QString &modelDirPath,
+                                                     Live2DOffscreenRenderer *renderer)
+{
+    QStringList lines;
+    if (renderer == nullptr || !renderer->isLoaded())
+        return lines;
+
+    //显示名：模型目录里 cdi3.json 的 Parameters[].Id → Name（缺文件就留空，不影响范围）
+    QHash<QString, QString> displayNames;
+    const QDir dir(modelDirPath);
+    const QStringList cdi3Files = dir.entryList({QStringLiteral("*.cdi3.json")}, QDir::Files);
+    for (const QString &cdi3Name : cdi3Files)
+    {
+        QFile file(dir.filePath(cdi3Name));
+        if (!file.open(QIODevice::ReadOnly))
+            continue;
+        const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+        for (const QJsonValue &value : doc.object().value(QStringLiteral("Parameters")).toArray())
+        {
+            const QJsonObject entry = value.toObject();
+            const QString id = entry.value(QStringLiteral("Id")).toString();
+            const QString name = entry.value(QStringLiteral("Name")).toString();
+            if (!id.isEmpty() && !name.isEmpty() && !displayNames.contains(id))
+                displayNames.insert(id, name);
+        }
+    }
+
+    /*范围一律从 Core 读（declaredParameterRanges）—— 这张表的意义正在于它是**模型的事实**，
+       不是 vtube.json 那种"某个 VTS 配置允许推多远"。*/
+    const QHash<QString, Live2DOffscreenRenderer::DeclaredRange> declared =
+        renderer->declaredParameterRanges();
+    QList<QString> ids = declared.keys();
+    std::sort(ids.begin(), ids.end());
+    for (const QString &id : ids)
+    {
+        const Live2DOffscreenRenderer::DeclaredRange range = declared.value(id);
+        lines.append(QStringLiteral("DECLARED %1 %2 min=%3 default=%4 max=%5 %6")
+                         .arg(modelName, id)
+                         .arg(double(range.min))
+                         .arg(double(range.neutral))
+                         .arg(double(range.max))
+                         .arg(displayNames.value(id, QStringLiteral("-"))));
+    }
+    return lines;
+}
+
+/*按用户配置装载**模型**（不是情绪数据）。两处路径在本机是分开的：
+
+  模型文件  Documents/Mandarin/Live2D/<模型名>/
+  情绪数据  Documents/Mandarin/Character/Assets/<角色>/Live2D/<模型名>/
+
+  （名字对不上是模型作者与用户各自的组织方式，代码从第一天就走"两个候选目录"匹配，
+  见 Live2DCharacterWindow::resolveModelDir；这里沿用同样的两条路径，不新造规则。）*/
 
 /*==================== 范围纪律：数据必须来自模型，不能手抄 ====================
 
@@ -2222,21 +2403,116 @@ bool TestLive2DWindow::openConfiguredModel(Live2DOffscreenRenderer *renderer)
   少一条、多一条、任一项不等，都是数据错 —— 而且要在目视校准之前就报出来，
   否则人会去校准一个永远不会生效的数字。
 
-  **报出全部差异再断言**：只报第一条会让人修一轮跑一轮，n 条差异要跑 n 遍。*/
+  **报出全部差异再断言**：只报第一条会让人修一轮跑一轮，n 条差异要跑 n 遍。
+
+  ⚠️ **本阶段（扩展 miku）起它遍历每一个带 parameter-map.json 的模型**，不再只看
+  preferredModelName()。理由：这套机制的全部卖点就是"再挂一个模型只改数据"，
+  而只测用户当前那一个模型时，新挂上来的那份数据写错了**没有任何人会报** ——
+  直到用户自己切过去看见一张错脸。遍历之后，新模型的数据一放进
+  Character/Assets/<角色>/Live2D/<模型名>/ 就自动进入核对范围。
+  仍然**不写死模型名**（模型禁二传、不入库，写死等于换台机器就全跳过）。*/
 void TestLive2DWindow::parameterMapRangesMatchModelDeclarations()
 {
+    const QVector<MappedModel> models = mappedModels();
+    if (models.isEmpty())
+        QSKIP("本机没有任何带 parameter-map.json 的模型（Documents 下，不入库），跳过");
+
+    QStringList allProblems;
+    QStringList verifiedNames;
+    for (const MappedModel &model : models)
+    {
+        Live2DMoodPreset preset;
+        if (!preset.load(model.name))
+        {
+            /*数据目录在、却装载失败：这是数据错，不是"本机没有"。
+               静默跳过会让一份坏掉的 JSON 永远不被发现（以前只测一个模型时更严重）。*/
+            allProblems.append(QStringLiteral("[%1] parameter-map.json/moods.json 装载失败"
+                                              "（数据坏了？目录 %2）")
+                                   .arg(model.name, model.dataDir));
+            continue;
+        }
+
+        Live2DOffscreenRenderer renderer;
+        if (!openModelByName(model.name, &renderer))
+        {
+            /***不 QSKIP**：有数据表却没有可供装载的模型文件是一致性问题，必须报出来
+               （用户删了模型却留着数据、或模型目录改名没跟上数据目录，都会命中这条）。*/
+            allProblems.append(
+                QStringLiteral("[%1] 有 parameter-map.json 但装载不了对应模型（找过 %2 与 %3）")
+                    .arg(model.name, model.modelDir,
+                         Live2DMoodPreset::resolveModelDir(model.name)));
+            continue;
+        }
+
+        QString error;
+        if (!verifyModelRanges(preset, &error))
+        {
+            allProblems.append(QStringLiteral("[%1] %2").arg(model.name, error));
+            continue;
+        }
+        verifiedNames.append(model.name);
+    }
+
+    qInfo("参数范围核对：带数据的模型 %d 个，逐项相符 %d 个（%s）", models.size(),
+          verifiedNames.size(), qPrintable(verifiedNames.join(QStringLiteral(", "))));
+
+    QVERIFY2(allProblems.isEmpty(),
+             qPrintable(QStringLiteral("parameter-map.json 的取值域与模型声明不符 —— "
+                                       "范围/中立值必须从模型读，不能手抄：\n%1")
+                            .arg(allProblems.join(QStringLiteral("\n")))));
+    /*至少核到一个：否则"遍历"可能因为枚举逻辑坏了而恒为空表，那样这条用例是绿的却什么都没验。*/
+    QVERIFY2(!verifiedNames.isEmpty(), "一个模型都没核到（枚举逻辑坏了？）");
+}
+
+/*[范围纪律·用户模型那一档] 用户实际在用的模型必须被上面那份遍历真的覆盖到、而且相符。
+
+   为什么单独再加一条：遍历的**起点**是角色资源目录（Live2DMoodPreset::resolveModelDir 读
+   CharSelect）。如果哪天角色名推导坏了、或者用户把模型文件放到了别处而数据留在原处，
+   遍历可能悄悄少掉他正在看的那个模型 —— 他屏幕上仍然是错的，测试却是绿的。
+   这条把"你正在用的那个模型"单独钉一次，代价只有一次装载。*/
+void TestLive2DWindow::preferredModelHasVerifiedParameterMap()
+{
+    const QString modelName = preferredModelName();
+    if (modelName.isEmpty())
+        QSKIP("本机没有用户配置的模型（禁二传，不入库），跳过");
+
     Live2DMoodPreset preset;
-    if (!loadConfiguredMoodPreset(&preset))
+    if (!preset.load(modelName))
         QSKIP("本机没有当前角色/模型的心情预设数据（Documents 下，不入库），跳过");
 
     Live2DOffscreenRenderer renderer;
-    if (!openConfiguredModel(&renderer))
+    if (!openModelByName(modelName, &renderer))
         QSKIP("本机没有用户配置的模型（禁二传，不入库），跳过参数范围核对");
+
+    QString error;
+    QVERIFY2(verifyModelRanges(preset, &error),
+             qPrintable(QStringLiteral("用户正在用的模型 %1 的范围核对没通过：\n%2")
+                            .arg(modelName, error)));
+    qInfo("用户模型范围核对[%s]通过", qPrintable(modelName));
+}
+
+/*[范围纪律] 一个模型的逐条核对（"遍历所有模型"与"只核用户模型"两条入口共用这一份判据）。
+
+   报出**全部**差异：只报第一条会让人修一轮跑一轮。
+   返回 false 时 error 里是全部问题；error 可为空（调用方只关心成败）。*/
+bool TestLive2DWindow::verifyModelRanges(const Live2DMoodPreset &preset, QString *error)
+{
+    const auto fail = [error](const QString &message) {
+        if (error != nullptr)
+            *error = message;
+        return false;
+    };
+
+    Live2DOffscreenRenderer renderer;
+    if (!openModelByName(preset.modelName(), &renderer))
+        return fail(QStringLiteral("本机装载不了模型 %1").arg(preset.modelName()));
 
     // 模型自己声明的取值域，直接问 Core（renderer 已经把 moc 打开成 CubismModel）
     const QHash<QString, Live2DOffscreenRenderer::DeclaredRange> declared =
         renderer.declaredParameterRanges();
-    QVERIFY2(!declared.isEmpty(), "模型没有声明任何参数（装载失败或读不出取值域）");
+    if (declared.isEmpty())
+        return fail(QStringLiteral("%1 没有声明任何参数（装载失败或读不出取值域）")
+                        .arg(preset.modelName()));
 
     /*JSON 里的十进制字面量经 double→float 往返会有 ~1e-7 的噪声；模型自己声明的
       0.5/-0.5 也一样。1e-4 足够盖住噪声，又远小于任何一个有意的手抄偏差
@@ -2244,7 +2520,9 @@ void TestLive2DWindow::parameterMapRangesMatchModelDeclarations()
     constexpr float kEpsilon = 1e-4f;
 
     const QHash<QString, Live2DMoodPreset::ParameterRange> ranges = preset.parameters();
-    QVERIFY2(!ranges.isEmpty(), "parameter-map.json 里一条参数都没有");
+    if (ranges.isEmpty())
+        return fail(QStringLiteral("%1 的 parameter-map.json 里一条参数都没有")
+                        .arg(preset.modelName()));
 
     QStringList missing;   // map 里写了、模型里没有
     QStringList wrongMin;  // map.min ≠ 模型声明的最小值
@@ -2298,8 +2576,8 @@ void TestLive2DWindow::parameterMapRangesMatchModelDeclarations()
     {
         const Live2DMoodPreset::ParameterRange range = it.value();
         const Live2DOffscreenRenderer::DeclaredRange d = declared.value(range.id);
-        table.append(QStringLiteral("%1 %2 map=[%3,%4] neutral=%5 | model=[%6,%7] default=%8")
-                         .arg(it.key(), range.id)
+        table.append(QStringLiteral("%1 %2 %3 map=[%4,%5] neutral=%6 | model=[%7,%8] default=%9")
+                         .arg(preset.modelName(), it.key(), range.id)
                          .arg(double(range.min))
                          .arg(double(range.max))
                          .arg(double(range.neutral))
@@ -2310,6 +2588,9 @@ void TestLive2DWindow::parameterMapRangesMatchModelDeclarations()
     table.sort();
     for (const QString &line : table)
         qInfo("%s", qPrintable(QStringLiteral("RANGE ") + line));
+
+    qInfo("参数范围核对[%s]：模型声明 %d 个参数，parameter-map 里 %d 条，逐项相符 %d 条",
+          qPrintable(preset.modelName()), declared.size(), ranges.size(), matched);
 
     QStringList problems;
     if (!missing.isEmpty())
@@ -2328,14 +2609,77 @@ void TestLive2DWindow::parameterMapRangesMatchModelDeclarations()
         problems.append(QStringLiteral("neutral 不是模型声明的默认值（%1）：%2")
                             .arg(wrongNeutral.size())
                             .arg(wrongNeutral.join(QStringLiteral(" | "))));
+    if (problems.isEmpty())
+        return true;
+    return fail(problems.join(QStringLiteral("\n")));
+}
 
-    qInfo("参数范围核对[%s]：模型声明 %d 个参数，parameter-map 里 %d 条，逐项相符 %d 条",
-          qPrintable(preset.modelName()), declared.size(), ranges.size(), matched);
+/*诊断：把每个模型的全部声明参数与 cdi3 显示名打出来。
 
-    QVERIFY2(problems.isEmpty(),
-             qPrintable(QStringLiteral("parameter-map.json 的取值域与模型声明不符 —— "
-                                       "范围/中立值必须从模型读，不能手抄：\n%1")
-                            .arg(problems.join(QStringLiteral("\n")))));
+   存在的理由（写 miku 的数据时踩到的坑）：miku 里 141 个参数中大部分是 `Param25` 这种
+   无语义 ID，唯一说明"这是全身 X 位移"的地方是模型自带的 cdi3.json 显示名；而**范围**
+   只能从 moc 读（vtube.json 的 OutputRange 是"VTS 允许推多远"，不是模型的能力边界 ——
+   手抄它让 atri 的 mouthForm 白写了两版）。这张表把"名字 + 真值"放在同一行，
+   就是为了不必再同时开三份文件对着看。**只打印、不断言**：给人写 parameter-map.json
+   用的依据，不是判据。*/
+void TestLive2DWindow::dumpsDeclaredParameterTable()
+{
+    /*可选过滤：MANDARIN_LIVE2D_DUMP_MODELS=atri,miku 只打这几个（默认打全部）。
+       用环境变量而不是 argv：QTest 已经占用了 argv，会把不认识的参数当失败。*/
+    QStringList wanted;
+    const QByteArray filter = qgetenv("MANDARIN_LIVE2D_DUMP_MODELS");
+    if (!filter.isEmpty())
+        wanted = QString::fromLocal8Bit(filter).split(QLatin1Char(','), Qt::SkipEmptyParts);
+
+    const QStringList names = modelNamesWithModelFiles();
+    if (names.isEmpty())
+        QSKIP("本机没有任何 Live2D 模型（禁二传，不入库），跳过参数表诊断");
+
+    int dumped = 0;
+    QStringList filePaths;
+    const QString outDir = QDir(QCoreApplication::applicationDirPath())
+                               .absoluteFilePath(QStringLiteral("../live2d-probe"));
+    QDir().mkpath(outDir);
+    for (const QString &name : names)
+    {
+        if (!wanted.isEmpty() && !wanted.contains(name))
+            continue;
+        Live2DOffscreenRenderer renderer;
+        QString usedDir;
+        if (!openModelByName(name, &renderer, &usedDir))
+        {
+            qInfo("PARAMTABLE %s: 装载失败，跳过", qPrintable(name));
+            continue;
+        }
+        const QStringList lines = dumpDeclaredParameters(name, usedDir, &renderer);
+        for (const QString &line : lines)
+            qInfo("%s", qPrintable(line));
+        qInfo("PARAMTABLE %s: %d declared parameters dumped (dir=%s)", qPrintable(name),
+              lines.size(), qPrintable(usedDir));
+
+        /*⚠️ 必须**另外落一份 UTF-8 文件**：控制台里的中文显示名是乱码
+           （Windows 控制台代码页 + Qt 的 local8Bit 转换），拿乱码的名字去写
+           parameter-map.json 就是在猜参数含义 —— 而这张表存在的全部意义正是"别猜"。
+           落盘用 QFile + toUtf8 写字节，与项目里"路径/文本一律自己读成字节"的做法一致。*/
+        const QString path =
+            QDir(outDir).absoluteFilePath(QStringLiteral("declared-params-%1.tsv").arg(name));
+        QFile file(path);
+        if (file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        {
+            file.write(QStringLiteral("# %1 declared parameters "
+                                      "(id\tmin\tdefault\tmax\tdisplayName)\n")
+                           .arg(name)
+                           .toUtf8());
+            for (const QString &line : lines)
+                file.write((line + QLatin1Char('\n')).toUtf8());
+            file.close();
+            filePaths.append(path);
+            qInfo("PARAMTABLE %s: written %s", qPrintable(name), qPrintable(path));
+        }
+        ++dumped;
+    }
+    QVERIFY2(dumped > 0, "一个模型都没打成表（模型目录都在吗？）");
+    QVERIFY2(filePaths.size() == dumped, "有模型的参数表没能落盘（目录写不进去？）");
 }
 
 /*数值范围核对：moods.json 的每个原型的**原始**取值都必须在 parameter-map 的 [min,max] 内，
@@ -3138,22 +3482,28 @@ void TestLive2DWindow::moodIgnoringEyesLeavesBlinkUnchanged()
                             .arg(double(happy.blinkMax))));
 }
 
-/*校准素材：14 个情绪原型各出一张**固定区域**的脸部裁切图到
-  `build2/tests/live2d-probe/mood-<原型>.png`。
+/*校准素材：**每个模型的** 14 个情绪原型各出一张**固定区域**的脸部裁切图。
 
-  **只出图、不判断好坏**：这些数值是未校准的初稿，判读由人来做（照 2 倍放大看，
-  见「判断锐度必须放大看」那条纪律）。所以这里不断言"表情对不对"，
-  只钉住"14 张图尺寸与裁切区完全一致"——否则并排目视时根本对不上。
+  本阶段（扩展 miku 到第二套数据）起它遍历每个带 parameter-map.json 的模型：
+
+    文件名    `mood-<模型名>-<原型>.png`（atri 的既有无后缀素材**刻意不动**）
+    共用的量  同一个模型内 14 张图共用**同一个** QRect 与同一个画布尺寸；
+              跨模型不共用（人物宽高比不同，同一个比例框切到的位置本来就不一样）
+    额外产物  一张跨模型总表 `_mood-sheet-<模型1>-<模型2>-….png`：
+              14 列（原型）× N 行（模型）。原因很实际 —— 人眼比对需要**一张**图，
+              分开的 28 个文件在资源管理器里没法并排看。
+
+  **只出图、不判断好坏**：数值是未校准的初稿，判读由人来做（照 2 倍放大看）。
+  所以这里不断言"表情对不对"，只钉住"同一模型的 14 张图尺寸/裁切区完全一致"。
 
   顺带把"预设值 vs 模型读回"打出来：被 Core **夹取**的值（写了但越界）会被列出来，
-  目视校准时必须知道哪几项其实不是他写的那个数，不然会去改一个永远不会生效的数字。
-  （眼睛的睁闭不在此列 —— 它是乘数合成值，见下面 deviations 处的说明。）*/
+  目视校准时必须知道哪几项其实不是他写的那个数。
+  （眼睛的睁闭不在此列 —— 它是乘数合成值。）*/
 void TestLive2DWindow::rendersMoodArchetypeCalibrationSheet()
 {
-    const QString modelName = preferredModelName();
-    const QString dir = modelDirFor(modelName);
-    if (!QFileInfo::exists(dir))
-        QSKIP("本机没有用户配置的模型（禁二传，不入库），跳过校准图");
+    const QVector<MappedModel> models = mappedModels();
+    if (models.isEmpty())
+        QSKIP("本机没有任何带 parameter-map.json 的模型（Documents 下，不入库），跳过校准图");
 
     // 固定 60fps/1.0x：裁切区尺寸必须可复现（本用例只出对照图，不量性能）
     {
@@ -3163,110 +3513,239 @@ void TestLive2DWindow::rendersMoodArchetypeCalibrationSheet()
         settings.sync();
     }
 
-    Live2DMoodPreset preset;
-    if (!loadConfiguredMoodPreset(&preset))
-        QSKIP("本机没有当前角色/模型的心情预设数据（Documents 下，不入库），跳过");
-
-    Live2DCharacterWindow window;
-    window.loadModel(modelName);
-    QVERIFY2(window.isModelLoaded(), "模型装载失败，无法出校准图");
-    QVERIFY2(window.isMoodPresetEnabled(), "情绪预设没装载成功");
-
-    window.show();
-    QVERIFY(QTest::qWaitForWindowExposed(&window));
-    QCoreApplication::processEvents();
-    // 冻住帧循环：14 张图之间不再有定时器插进来的任意时间推进（只留每次渲染自身的一帧）
-    window.hide();
-    QCoreApplication::processEvents();
-
-    // 先用 neutral 出一帧，从它的**人物包围盒**定脸部裁切区；14 张图共用这一个 QRect
-    const QString neutralMood = preset.representativeMoodForArchetype(QStringLiteral("neutral"));
-    QVERIFY2(!neutralMood.isEmpty(), "neutral 没有别名");
-    window.reloadContent(neutralMood);
-    // 等过渡走完：这张帧要用来定裁切区，不能是"上一个心情 → neutral"的半路帧
-    QVERIFY2(waitForMoodSettle(&window), "neutral 过渡没走完");
-    QVERIFY2(window.renderFrameNow(), "neutral 帧渲染失败");
-    const QImage neutralFrame = window.renderedImage();
-    QVERIFY2(!neutralFrame.isNull(), "neutral 帧为空");
-    QRect figureBounds;
-    QVERIFY2(opaqueBounds(neutralFrame, 32, &figureBounds), "neutral 帧里量不到人物");
-    const QRect roi = faceRegionOfInterest(figureBounds).intersected(neutralFrame.rect());
-    QVERIFY2(!roi.isEmpty(), "脸部裁切区是空的");
-
     const QString outDir = QDir(QCoreApplication::applicationDirPath())
                                .absoluteFilePath(QStringLiteral("../live2d-probe"));
     QVERIFY2(QDir().mkpath(outDir), qPrintable(QStringLiteral("建不出输出目录 %1").arg(outDir)));
 
-    qInfo("MOOD calibration: model=%s frame=%dx%d figure=%d,%d %dx%d roi=%d,%d %dx%d outDir=%s",
-          qPrintable(modelName), neutralFrame.width(), neutralFrame.height(),
-          figureBounds.x(), figureBounds.y(), figureBounds.width(), figureBounds.height(), roi.x(),
-          roi.y(), roi.width(), roi.height(), qPrintable(outDir));
+    /*拼总表用的行：每个模型一行（同一模型内所有裁切图同尺寸，所以行内能对齐）。
+       不同模型之间尺寸不同 —— 拼的时候按各自尺寸居中摆放，不做缩放（缩放会改变像素，
+       而"这些图是给人做像素级判读的"这一点比"总表整齐"重要得多）。*/
+    QStringList rowModels;
+    QVector<QVector<QImage>> rows;
+    QVector<QStringList> rowLabels;
 
-    QStringList savedPaths;
-    int mismatchedParams = 0;
-    for (const QString &archetype : preset.archetypeNames())
+    for (const MappedModel &model : models)
     {
-        const QString moodName = preset.representativeMoodForArchetype(archetype);
-        QVERIFY2(!moodName.isEmpty(),
-                 qPrintable(QStringLiteral("原型 %1 没有别名，出不了这一格").arg(archetype)));
-
-        window.reloadContent(moodName);
-        /*等过渡走完再出这一格：这 14 张图是给人做**目视校准**的素材，
-           半路帧（上一个原型 → 这个原型）会让校准结论完全错掉。
-           代价是每格多等约 0.2s（过渡时长），14 格多约 3s，可以接受。*/
-        QVERIFY2(waitForMoodSettle(&window),
-                 qPrintable(QStringLiteral("原型 %1 的过渡没走完").arg(archetype)));
-        QVERIFY2(window.renderFrameNow(), qPrintable(QStringLiteral("原型 %1 渲染失败").arg(archetype)));
-        const QImage frame = window.renderedImage();
-        QVERIFY2(!frame.isNull(), "渲染帧为空");
-        // 同一模型、同一画布：尺寸必须完全一致，裁切区才能共用
-        QCOMPARE(frame.size(), neutralFrame.size());
-        const QImage crop = frame.copy(roi);
-        QCOMPARE(crop.size(), roi.size());
-
-        const QString path =
-            QDir(outDir).absoluteFilePath(QStringLiteral("mood-%1.png").arg(archetype));
-        QVERIFY2(crop.save(path), qPrintable(QStringLiteral("写不出 %1").arg(path)));
-        savedPaths.append(path);
-
-        /*预设值 vs 读回：把"被驱动器/范围盖掉的参数"暴露出来
-          （目视校准时必须知道哪几项其实不是他写的那个数）。
-
-          ⚠️ 眼睛的睁闭**排除在偏差清单外**：它们是"乘数 × 眨眼进度"的合成值，
-          这一帧恰好眨眼（0~0.05 而不是 0.05）是**正确行为**，不是没落地。
-          拿它当偏差会让人误以为 sleepy 坏了 —— 眼睛的真实性由
-          moodEyeOpennessComposesWithBlink 用帧像素证明，这里不再重复判断。
-          （被 Core 夹取的值仍然会出现在清单里：夹取是"你写的数没生效"的另一种形态。）*/
-        const QHash<QString, float> expected = preset.parametersForMood(moodName);
-        const QString eyeLId = preset.parameters().value(QStringLiteral("eyeLOpen")).id;
-        const QString eyeRId = preset.parameters().value(QStringLiteral("eyeROpen")).id;
-        QStringList deviations;
-        for (auto it = expected.constBegin(); it != expected.constEnd(); ++it)
+        Live2DMoodPreset preset;
+        if (!preset.load(model.name))
         {
-            if (it.key() == eyeLId || it.key() == eyeRId)
-                continue;
-            const float actual = window.parameterValue(it.key());
-            if (qAbs(actual - it.value()) > 0.05f)
-            {
-                deviations.append(QStringLiteral("%1=%2(want %3)")
-                                      .arg(it.key())
-                                      .arg(double(actual), 0, 'f', 2)
-                                      .arg(double(it.value()), 0, 'f', 2));
-                ++mismatchedParams;
-            }
+            qWarning("MOOD calibration[%s]: 预设装载失败，跳过这个模型", qPrintable(model.name));
+            continue;
         }
-        qInfo("MOOD archetype=%s alias=%s crop=%dx%d file=%s deviations=%s", qPrintable(archetype),
-              qPrintable(moodName), crop.width(), crop.height(), qPrintable(path),
-              deviations.isEmpty() ? "none" : qPrintable(deviations.join(QStringLiteral(", "))));
+        /*⚠️ 这里**不能**用 openModelByName 的返回值判断"本机有没有模型"：
+           那个函数必须拿到一个 renderer 才能试装载，传 nullptr 只会恒返回 false ——
+           实测代价就是整条用例一格都出不来（而且日志看着像"模型不存在"）。
+           真正的装载由下面的窗口自己做，判据是 isModelLoaded()。*/
+        Live2DCharacterWindow window;        window.loadModel(model.name);
+        if (!window.isModelLoaded() || !window.isMoodPresetEnabled())
+        {
+            qWarning("MOOD calibration[%s]: 窗口装载失败（模型=%d 预设=%d），跳过",
+                     qPrintable(model.name), int(window.isModelLoaded()),
+                     int(window.isMoodPresetEnabled()));
+            continue;
+        }
+
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        QCoreApplication::processEvents();
+        // 冻住帧循环：14 张图之间不再有定时器插进来的任意时间推进（只留每次渲染自身的一帧）
+        window.hide();
+        QCoreApplication::processEvents();
+
+        // 先用 neutral 出一帧，从它的**人物包围盒**定脸部裁切区；同一模型的 14 张图共用它
+        const QString neutralMood = preset.representativeMoodForArchetype(QStringLiteral("neutral"));
+        if (neutralMood.isEmpty())
+        {
+            qWarning("MOOD calibration[%s]: neutral 没有别名，跳过", qPrintable(model.name));
+            continue;
+        }
+        window.reloadContent(neutralMood);
+        // 等过渡走完：这张帧要用来定裁切区，不能是"上一个心情 → neutral"的半路帧
+        QVERIFY2(waitForMoodSettle(&window),
+                 qPrintable(QStringLiteral("[%1] neutral 过渡没走完").arg(model.name)));
+        QVERIFY2(window.renderFrameNow(),
+                 qPrintable(QStringLiteral("[%1] neutral 帧渲染失败").arg(model.name)));
+        const QImage neutralFrame = window.renderedImage();
+        QVERIFY2(!neutralFrame.isNull(), "neutral 帧为空");
+        QRect figureBounds;
+        QVERIFY2(opaqueBounds(neutralFrame, 32, &figureBounds),
+                 qPrintable(QStringLiteral("[%1] neutral 帧里量不到人物").arg(model.name)));
+        const QRect roi = faceRegionOfInterest(figureBounds).intersected(neutralFrame.rect());
+        QVERIFY2(!roi.isEmpty(), "脸部裁切区是空的");
+
+        qInfo("MOOD calibration: model=%s frame=%dx%d figure=%d,%d %dx%d roi=%d,%d %dx%d outDir=%s",
+              qPrintable(model.name), neutralFrame.width(), neutralFrame.height(),
+              figureBounds.x(), figureBounds.y(), figureBounds.width(), figureBounds.height(),
+              roi.x(), roi.y(), roi.width(), roi.height(), qPrintable(outDir));
+
+        QStringList labels;
+        QVector<QImage> crops;
+        int mismatchedParams = 0;
+        for (const QString &archetype : preset.archetypeNames())
+        {
+            const QString moodName = preset.representativeMoodForArchetype(archetype);
+            QVERIFY2(!moodName.isEmpty(), qPrintable(QStringLiteral("原型 %1 没有别名，出不了这一格")
+                                                         .arg(archetype)));
+
+            window.reloadContent(moodName);
+            /*等过渡走完再出这一格：这些图是给人做**目视校准**的素材，
+               半路帧（上一个原型 → 这个原型）会让校准结论完全错掉。*/
+            QVERIFY2(waitForMoodSettle(&window),
+                     qPrintable(QStringLiteral("[%1] 原型 %2 的过渡没走完")
+                                    .arg(model.name, archetype)));
+            QVERIFY2(window.renderFrameNow(),
+                     qPrintable(QStringLiteral("[%1] 原型 %2 渲染失败").arg(model.name, archetype)));
+            const QImage frame = window.renderedImage();
+            QVERIFY2(!frame.isNull(), "渲染帧为空");
+            // 同一模型、同一画布：尺寸必须完全一致，裁切区才能共用
+            QCOMPARE(frame.size(), neutralFrame.size());
+            const QImage crop = frame.copy(roi);
+            QCOMPARE(crop.size(), roi.size());
+
+            const QString path = QDir(outDir).absoluteFilePath(
+                QStringLiteral("mood-%1-%2.png").arg(model.name, archetype));
+            QVERIFY2(crop.save(path), qPrintable(QStringLiteral("写不出 %1").arg(path)));
+            labels.append(archetype);
+            crops.append(crop);
+
+            /*预设值 vs 读回：把"被驱动器/范围盖掉的参数"暴露出来
+              （目视校准时必须知道哪几项其实不是他写的那个数）。
+
+              ⚠️ 眼睛的睁闭**排除在偏差清单外**：它们是"乘数 × 眨眼进度"的合成值，
+              这一帧恰好眨眼是**正确行为**，不是没落地。*/
+            const QHash<QString, float> expected = preset.parametersForMood(moodName);
+            const QString eyeLId = preset.parameters().value(QStringLiteral("eyeLOpen")).id;
+            const QString eyeRId = preset.parameters().value(QStringLiteral("eyeROpen")).id;
+            QStringList deviations;
+            for (auto it = expected.constBegin(); it != expected.constEnd(); ++it)
+            {
+                if (it.key() == eyeLId || it.key() == eyeRId)
+                    continue;
+                const float actual = window.parameterValue(it.key());
+                if (qAbs(actual - it.value()) > 0.05f)
+                {
+                    deviations.append(QStringLiteral("%1=%2(want %3)")
+                                          .arg(it.key())
+                                          .arg(double(actual), 0, 'f', 2)
+                                          .arg(double(it.value()), 0, 'f', 2));
+                    ++mismatchedParams;
+                }
+            }
+            qInfo("MOOD archetype[%s] archetype=%s alias=%s crop=%dx%d file=%s deviations=%s",
+                  qPrintable(model.name), qPrintable(archetype), qPrintable(moodName), crop.width(),
+                  crop.height(), qPrintable(path),
+                  deviations.isEmpty() ? "none"
+                                       : qPrintable(deviations.join(QStringLiteral(", "))));
+        }
+
+        QVERIFY2(crops.size() == preset.archetypeNames().size(),
+                 qPrintable(QStringLiteral("[%1] 只出了 %2 张图，原型有 %3 个")
+                                .arg(model.name)
+                                .arg(crops.size())
+                                .arg(preset.archetypeNames().size())));
+        qInfo("MOOD calibration summary[%s]: %d files, roi=%d,%d %dx%d (identical region), "
+              "requested-vs-actual deviations=%d entries",
+              qPrintable(model.name), crops.size(), roi.x(), roi.y(), roi.width(), roi.height(),
+              mismatchedParams);
+
+        rowModels.append(model.name);
+        rows.append(crops);
+        rowLabels.append(labels);
     }
 
-    QVERIFY2(savedPaths.size() == preset.archetypeNames().size(),
-             qPrintable(QStringLiteral("只出了 %1 张图，原型有 %2 个")
-                            .arg(savedPaths.size())
-                            .arg(preset.archetypeNames().size())));
-    qInfo("MOOD calibration summary: %d files, roi=%d,%d %dx%d (identical region), "
-          "requested-vs-actual deviations=%d entries (see per-archetype lines above)",
-          savedPaths.size(), roi.x(), roi.y(), roi.width(), roi.height(), mismatchedParams);
+    QVERIFY2(!rowModels.isEmpty(), "一个模型的校准图都没出成（数据/模型都在吗？）");
+
+    //跨模型总表：14 列 × N 行，左边写模型名与原型名
+    QStringList flatLabels;
+    QVector<QImage> flatImages;
+    for (int row = 0; row < rows.size(); ++row)
+    {
+        const QString &modelName = rowModels.at(row);
+        for (int column = 0; column < rows.at(row).size(); ++column)
+        {
+            flatLabels.append(QStringLiteral("%1/%2").arg(modelName, rowLabels.at(row).at(column)));
+            flatImages.append(rows.at(row).at(column));
+        }
+    }
+    const QString sheetPath =
+        QDir(outDir).absoluteFilePath(QStringLiteral("_mood-sheet-%1.png")
+                                          .arg(rowModels.join(QStringLiteral("-"))));
+    QString composeError;
+    if (!composeContactSheet(flatLabels, flatImages, sheetPath, &composeError))
+        qWarning("MOOD calibration: 总表没拼出来：%s", qPrintable(composeError));
+    else
+        qInfo("MOOD calibration: 跨模型总表已保存 %s（%d 格）", qPrintable(sheetPath),
+              flatImages.size());
+}
+
+/*把一组同尺寸或异尺寸的图拼成一张总表（每格左侧留一条放标签，不做任何缩放）。
+
+  为什么不做缩放：这些图的用途是**像素级判读**（表情数值是否达到了设计意图），
+  缩放会引入重采样 —— 一个"嘴巴只动了一个像素"的结论就会被抹掉。
+  异尺寸（不同模型）时按最大格居中摆放，多出来的地方保持透明。*/
+bool TestLive2DWindow::composeContactSheet(const QStringList &labels,
+                                           const QVector<QImage> &images, const QString &outPath,
+                                           QString *error)
+{
+    if (images.isEmpty() || labels.size() != images.size())
+    {
+        if (error != nullptr)
+            *error = QStringLiteral("图与标签数量不一致（%1 vs %2）")
+                         .arg(images.size())
+                         .arg(labels.size());
+        return false;
+    }
+
+    constexpr int kLabelWidth = 150;
+    constexpr int kGap = 4;
+    int cellWidth = 1;
+    int cellHeight = 1;
+    for (const QImage &image : images)
+    {
+        cellWidth = std::max(cellWidth, image.width());
+        cellHeight = std::max(cellHeight, image.height());
+    }
+
+    //原型顺序（每个模型的 archetypeNames() 都是字典序）就是列数；行数 = 模型数
+    const int columns =
+        images.size() >= 14 ? 14 : std::max(1, static_cast<int>(images.size()));
+    const int rowCount = (labels.size() + columns - 1) / columns;
+    const QSize sheetSize(kLabelWidth + columns * (cellWidth + kGap),
+                          rowCount * (cellHeight + kGap) + kGap);
+
+    QImage sheet(sheetSize, QImage::Format_RGBA8888);
+    sheet.fill(Qt::transparent);
+    QPainter painter(&sheet);
+    /*标签用**透明底 + 黑字**：总表本身是 RGBA，铺白底会让"这一格是不是真的什么都没有"
+       变得看不出来（全透明格与白底格在视觉上完全一样）。*/
+    painter.setPen(Qt::black);
+    QFont font = painter.font();
+    font.setPixelSize(11);
+    painter.setFont(font);
+
+    for (int index = 0; index < images.size(); ++index)
+    {
+        const int column = index % columns;
+        const int row = index / columns;
+        const int x = kLabelWidth + column * (cellWidth + kGap);
+        const int y = kGap + row * (cellHeight + kGap);
+        painter.drawText(QRect(0, y, kLabelWidth - kGap, cellHeight), Qt::AlignRight | Qt::AlignTop,
+                         labels.at(index));
+        /*居中摆放（异尺寸时），不缩放 —— 见上面的说明。*/
+        const QImage &image = images.at(index);
+        const int offsetX = (cellWidth - image.width()) / 2;
+        const int offsetY = (cellHeight - image.height()) / 2;
+        painter.drawImage(QPoint(x + offsetX, y + offsetY), image);
+    }
+    painter.end();
+
+    if (!sheet.save(outPath))
+    {
+        if (error != nullptr)
+            *error = QStringLiteral("写不出 %1").arg(outPath);
+        return false;
+    }
+    return true;
 }
 
 /*[配置键] character/live2dMoodBlendMs 必须真的被读出来，并且被夹到安全范围。

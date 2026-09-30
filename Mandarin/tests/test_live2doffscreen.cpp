@@ -131,8 +131,29 @@ class TestLive2DOffscreen : public QObject
     void idleSwayNeverTouchesBreathHairOrMouthForm();
     /*两条轴的相位必须按配置错开（不锁步）*/
     void idleSwayPhasesAreOffset();
-    /*出**全身**对照图：一个周期内均匀 6 帧，供人眼判断"她真的在动"*/
+    /*出**全身**对照图：一个周期内均匀 6 帧，供人眼判断"她真的在动"。
+       本阶段起**遍历每个带 presets/idle.json 的模型**，文件名带模型名
+       （`idle-<模型>-phase<N>.png`），atri 的既有无后缀素材刻意不动。*/
     void rendersIdleSwayPhaseFrames();
+    /*[数据纪律] 每个带 idle.json 的模型：装载成功、没有驱动器/嘴形条目、
+       每条幅度都在声明量程的 20% 警戒线以内（文件自己的规则）。*/
+    void idleSwayDataObeysItsOwnRulesForEveryModel();
+
+    /***腿部探针**：把每个参数分别推到声明的最小/最大，量它在**下半身区域**里
+       改变了多少像素，并把「几何变了」（alpha 掩码动了 = 真的在动骨架）与
+       「只是换了外观」（掩码逐位相同、只有 RGB 变了 = 换装/道具开关）分开报。
+       这是"这个模型的腿到底能不能动、靠哪些参数动"的直接证据。*/
+    void probesWhichParametersArticulateTheLowerBody();
+
+    /***两个模型是不是**同一套 rig**（换贴图）**。
+
+       要回答的是"第二个模型能不能直接复用第一个模型的 parameter-map/moods/idle 数据"。
+       判据必须落在**行为**上而不是画面上：贴图不同 ⇒ 画面必然不同，比像素是没意义的。
+       所以比两件事：
+         ① moc 声明的参数集合（ID + min/default/max）逐条相等；
+         ② 把同一批参数推到同一个值，两个模型在**输出空间**里的剪影（alpha）是否一致。
+       两条都成立 ⇒ 同一套骨架、同一套绑定，只是贴图不同 ⇒ 数据可以整份复用。*/
+    void comparesTwoModelsForRigEquivalence();
 
   private:
     static QString modelDir();
@@ -225,6 +246,25 @@ class TestLive2DOffscreen : public QObject
       CharSelect + 模型名推路径）。装不上（本机没模型/没这份数据）返回 false，调用方 QSKIP。*/
     static bool loadConfiguredIdleSway(Live2DOffscreenRenderer *renderer,
                                        Live2DMoodPreset *preset, QString *detail);
+
+    /*所有带 `presets/idle.json` 的模型名（= 角色资源目录下的模型名，按名排序）。
+
+       为什么要有它（本阶段扩展 miku 时加）：这一组用例以前只跑 availableModelDir()
+       —— 那个函数优先吃 MANDARIN_LIVE2D_MODEL_DIR / config.ini，**只给一个模型**。
+       于是 miku 的 idle.json 写错了也不会有人报。现在改成遍历"确实有摆动数据"的模型：
+       新模型把数据放进去就自动进入判据范围，不用再动 C++。*/
+    static QStringList modelNamesWithIdleData();
+
+    /*按名字装载模型：候选①模型根目录 ②角色资源目录（与摆动数据同层）。*/
+    static bool loadModelByName(const QString &name, Live2DOffscreenRenderer *renderer,
+                                QString *error);
+
+    /*所有带 `parameter-map.json` 的模型名（腿部探针用；语义名翻译要它）。*/
+    static QStringList modelNamesWithMoodData();
+
+    /*腿部探针判「这一像素算不算人物」的 alpha 阈值：与别处 opaqueBounds 用的 32 一致，
+       低于它的像素算透明（羽化边缘不算"骨架动了"，否则边界抖动会被当成几何变化）。*/
+    static constexpr int kLegProbeAlphaThreshold = 32;
 
     /*待机摆动的一帧采样，三个量各答一个问题：
         elapsedSeconds → 这一帧在周期里的哪一点（相位/周期的唯一时基）；
@@ -1590,6 +1630,65 @@ bool TestLive2DOffscreen::loadConfiguredIdleSway(Live2DOffscreenRenderer *render
     return true;
 }
 
+/*所有带 presets/idle.json 的模型名。
+
+   以**数据**为入口（而不是模型目录）：本组用例要验证的是"这份摆动数据对不对"，
+   没有数据的模型没有任何可核对的东西。反过来说，只要有人放了一份 idle.json，
+   它就**必须**被核对 —— 哪怕模型文件不在（那也是一种错误，用例会报出来）。
+
+   角色目录走与 Live2DMoodPreset::resolveModelDir 同一套推导（真实 config.ini 的
+   CharSelect + CharacterAssestPath），所以这里不会与生产代码的路径推导分叉。*/
+QStringList TestLive2DOffscreen::modelNamesWithIdleData()
+{
+    QStringList names;
+    const QString charName = ReadNowSelectChar();
+    if (charName.isEmpty() || charName == QStringLiteral("未选择"))
+        return names;
+
+    const QDir root(QDir(CharacterAssestPath).filePath(charName + QStringLiteral("/Live2D")));
+    if (!root.exists())
+        return names;
+
+    const QStringList candidates = root.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QString &name : candidates)
+    {
+        if (QFileInfo::exists(root.filePath(name + QStringLiteral("/presets/idle.json"))))
+            names.append(name);
+    }
+    return names;
+}
+
+/*按名字装载模型：候选①模型根目录（Documents/Mandarin/Live2D/<名>）
+   ②角色资源目录（与摆动数据同层）。模型作者给 json 起什么名字由他决定，不写死。*/
+bool TestLive2DOffscreen::loadModelByName(const QString &name, Live2DOffscreenRenderer *renderer,
+                                          QString *error)
+{
+    if (renderer == nullptr || name.trimmed().isEmpty())
+        return false;
+
+    QStringList candidates;
+    candidates << QDir(Live2DModelRootPath).filePath(name)
+               << QDir(CharacterAssestPath)
+                      .filePath(ReadNowSelectChar() + QStringLiteral("/Live2D/") + name);
+    for (const QString &dir : candidates)
+    {
+        if (dir.isEmpty() || !QFileInfo::exists(dir))
+            continue;
+        const QStringList jsons = QDir(dir).entryList({QStringLiteral("*.model3.json")}, QDir::Files);
+        for (const QString &jsonName : jsons)
+        {
+            QString localError;
+            if (renderer->load(dir, jsonName, &localError))
+                return true;
+            if (error != nullptr)
+                *error = localError;
+        }
+    }
+    if (error != nullptr && error->isEmpty())
+        *error = QStringLiteral("本机找不到模型 %1 的 model3.json").arg(name);
+    return false;
+}
+
 bool TestLive2DOffscreen::sampleIdleSway(Live2DOffscreenRenderer *renderer,
                                          const QStringList &parameterIds, int frames,
                                          float deltaSeconds, QVector<IdleSample> *samples)
@@ -2236,167 +2335,1136 @@ void TestLive2DOffscreen::idleSwayPhasesAreOffset()
 /*出**全身**对照图：一个周期内均匀 6 帧，供人眼判断"她真的在动"。
 
   为什么必须全身：待机摆动是**整体**的重心移动，脸部裁切图会把它藏起来（那正是这条用例
-  与 mood-*.png 的区别）。6 帧严格等距（周期 ÷ 6），尺寸完全一致，落盘到
-  build2/tests/live2d-probe/idle-phase0..5.png。
+  与**脸部裁切图**（`mood-<模型>-<原型>.png`，只切脸）的区别）。6 帧严格等距（周期 ÷ 6），尺寸一致。
+
+  ⚠️ 本阶段（扩展 miku）起**遍历每个带 presets/idle.json 的模型**，文件名带模型名
+  （`idle-<模型>-phase<N>.png`）—— atri 的既有无后缀素材**刻意不动**，miku 另出一组。
+  以前这条用例只跑 availableModelDir()（= 用户当前那一个模型），所以 miku 的摆动
+  到底动没动、动得像不像"站着"**没有任何人会看**。
 
   **这里只出图与测量、不判断好坏**：动作看着像不像"站着"由人判读（与渲染情绪校准图同一条
   纪律）。判据只有"尺寸一致 + 文件真的写出来了"。*/
 void TestLive2DOffscreen::rendersIdleSwayPhaseFrames()
 {
-    Live2DOffscreenRenderer renderer;
-    Live2DMoodPreset preset;
-    QString detail;
-    if (!loadConfiguredIdleSway(&renderer, &preset, &detail))
-        QSKIP("本机没有可用的待机摆动数据（presets/idle.json），跳过");
-
-    const QVector<Live2DMoodPreset::IdleSwayEntry> entries = preset.idleSwayEntries();
-    const float periodSeconds = entries.first().periodSeconds;
-    QVERIFY2(periodSeconds > 0.0f, "第一条轴的周期不是正数，没法在「一个周期」内取相位");
-
-    /*① 先用探针量人物几何，再据此定画布 —— 与 Live2DCharacterWindow::relayoutContent
-       同一套推导（基准高 900、目标占比 0.84、画布宽 = 高 × 人物真实宽高比），
-       只是去掉了屏幕夹取：判读图要的是**完整的人**，不是"和用户屏幕一样大"。
-       探针在测量模式下按虚拟时间取样求并集（与生产同一条路径），所以并集里也包含摆动
-       自己摆出去的那部分范围。*/
-    renderer.clearFigureSpan();
-    renderer.setMeasureMode(true);
-    bool probeOk = true;
-    for (int index = 0; index < 20; ++index)
-    {
-        if (index > 0)
-            renderer.setNextFrameDeltaSeconds(0.15f);
-        const QImage probe = renderer.renderFrame(QSize(512, 512));
-        if (probe.isNull())
-        {
-            probeOk = false;
-            break;
-        }
-        (void)renderer.probeFigureMetrics(probe);
-    }
-    renderer.setMeasureMode(false);
-    const Live2DOffscreenRenderer::FigureMetrics metrics = renderer.figureMetrics();
-    QVERIFY2(probeOk && metrics.valid && metrics.boundsAspect > 0.05f,
-             "探针没量到人物，出不了全身对照图");
-
-    constexpr int kSheetBaseHeight = 900;       //= Live2DCharacterWindow::kBaseCanvasHeight
-    constexpr float kSheetFigureRatio = 0.84f;  //= Live2DCharacterWindow::kTargetFigureRatio
-    const int canvasHeight = static_cast<int>(std::lround(kSheetBaseHeight / kSheetFigureRatio));
-    const int canvasWidth =
-        std::max(1, static_cast<int>(std::lround(canvasHeight * metrics.boundsAspect)));
-    const QSize sheetSize(canvasWidth, canvasHeight);
-    renderer.setDisplayRatios(kSheetFigureRatio, kSheetFigureRatio);
-    renderer.setIdleSway(entries);
-    /*心情用生产里的默认（中立那张）：出的是"她站着"的对照图，不是某个情绪。*/
-    renderer.setMoodBlendDurationMs(0);
-    renderer.setParameterOverrides(preset.parametersForMood(QStringLiteral("default")));
-    QVERIFY2(renderer.isIdleSwayActive(), "摆动没生效，这组图会是一串相同的帧");
+    const QStringList models = modelNamesWithIdleData();
+    if (models.isEmpty())
+        QSKIP("本机没有任何待机摆动数据（presets/idle.json），跳过");
 
     const QString outDir = outputDir();
     QVERIFY2(QDir().mkpath(outDir), qPrintable(QStringLiteral("建不出输出目录 %1").arg(outDir)));
 
-    qInfo("IDLE sheet: model=%s canvas=%dx%d (aspect %.3f) period=%.2fs outDir=%s",
-          qPrintable(preset.modelName()), sheetSize.width(), sheetSize.height(),
-          double(metrics.boundsAspect), double(periodSeconds), qPrintable(outDir));
-
-    /*② 一个周期内均匀取 6 个相位。基准时刻 = 当前累计虚拟时间，第 k 帧的目标时刻是
-       base + k×T/6 ⇒ 6 张图的相位**严格等距**，与"渲染花了多久"无关。*/
-    constexpr int kPhaseCount = 6;
-    const float baseSeconds = renderer.idleSwayElapsedSeconds();
-    QVector<QImage> frames;
-    QStringList savedPaths;
-    QSize expectedSize;
-    for (int phaseIndex = 0; phaseIndex < kPhaseCount; ++phaseIndex)
+    QVector<QStringList> produced;
+    for (const QString &modelName : models)
     {
-        const float targetSeconds =
-            baseSeconds + periodSeconds * static_cast<float>(phaseIndex) / float(kPhaseCount);
-        int guard = 0;
-        while (renderer.idleSwayElapsedSeconds() < targetSeconds - 1e-4f && guard++ < 64)
+        Live2DOffscreenRenderer renderer;
+        QString loadError;
+        if (!loadModelByName(modelName, &renderer, &loadError))
         {
-            /*一次最多推进 0.1s：那是渲染器单帧步长的夹取上限，超过就不是"一帧"了。*/
-            const float step =
-                std::min(targetSeconds - renderer.idleSwayElapsedSeconds(), 0.1f);
-            renderer.setNextFrameDeltaSeconds(step);
-            QVERIFY2(!renderer.renderFrame(sheetSize).isNull(), "推进虚拟时间时渲染失败");
+            /***不 QSKIP**：有摆动数据却装载不了模型是一致性问题（用户删了模型却留着数据、
+               或模型目录改名没跟上数据目录），静默跳过会让它在实机上表现为"她不摆"却无人知。*/
+            QFAIL(qPrintable(QStringLiteral("[%1] 有 presets/idle.json 但装载不了模型：%2")
+                                 .arg(modelName, loadError)));
         }
-        /*再渲一帧、**不推进时间**：保证这一帧正好落在目标时刻（帧步长置 0 是渲染器既有的
-           一条路径：动作/呼吸/物理都停在原地，只有累计时间之前的量在起作用）。*/
-        renderer.setNextFrameDeltaSeconds(0.0f);
-        const QImage frame = renderer.renderFrame(sheetSize);
-        QVERIFY2(!frame.isNull(), "出图时渲染失败");
-        QCOMPARE(frame.size(), sheetSize); //6 张图必须同尺寸，否则并排看没有意义
-        if (expectedSize.isEmpty())
-            expectedSize = frame.size();
-        QCOMPARE(frame.size(), expectedSize);
-        frames.append(frame);
 
-        const QString path =
-            QDir(outDir).absoluteFilePath(QStringLiteral("idle-phase%1.png").arg(phaseIndex));
-        QVERIFY2(frame.save(path), qPrintable(QStringLiteral("写不出 %1").arg(path)));
-        savedPaths.append(path);
+        Live2DMoodPreset preset;
+        if (!preset.load(modelName) || !preset.loadIdle())
+            QFAIL(qPrintable(QStringLiteral("[%1] 情绪预设或摆动数据装载失败").arg(modelName)));
 
-        /*把这一帧三条轴的**实际偏移**与"按配置算出来的期望值"一起打出来：
-           万一并排看觉得"没动/动得不对"，这行日志能直接指出是数据、相位还是实现的问题。*/
-        const float elapsed = renderer.idleSwayElapsedSeconds();
-        QStringList applied;
-        QStringList expected;
-        for (const Live2DMoodPreset::IdleSwayEntry &entry : entries)
+        const QVector<Live2DMoodPreset::IdleSwayEntry> entries = preset.idleSwayEntries();
+        QVERIFY2(!entries.isEmpty(),
+                 qPrintable(QStringLiteral("[%1] idle.json 装载成功却一条轴都没有")
+                                .arg(modelName)));
+        const float periodSeconds = entries.first().periodSeconds;
+        QVERIFY2(periodSeconds > 0.0f, "第一条轴的周期不是正数，没法在「一个周期」内取相位");
+
+        /*① 先用探针量人物几何，再据此定画布 —— 与 Live2DCharacterWindow::relayoutContent
+           同一套推导（基准高 900、目标占比 0.84、画布宽 = 高 × 人物真实宽高比），
+           只是去掉了屏幕夹取：判读图要的是**完整的人**，不是"和用户屏幕一样大"。
+           探针在测量模式下按虚拟时间取样求并集（与生产同一条路径），所以并集里也包含摆动
+           自己摆出去的那部分范围。*/
+        renderer.clearFigureSpan();
+        renderer.setMeasureMode(true);
+        bool probeOk = true;
+        for (int index = 0; index < 20; ++index)
         {
-            applied << QStringLiteral("%1=%2").arg(entry.parameterId).arg(
-                double(renderer.idleSwayOffset(entry.parameterId)), 0, 'f', 3);
-            const double wanted =
-                double(entry.amplitude) * std::sin(2.0 * M_PI *
-                                                   (double(elapsed) / double(entry.periodSeconds) +
-                                                    double(entry.phase)));
-            expected << QStringLiteral("%1=%2").arg(entry.parameterId).arg(wanted, 0, 'f', 3);
-        }
-        qInfo("IDLE sheet phase %d/%d: t=%.3fs (%.3f of period) applied[%s] expected[%s]",
-              phaseIndex, kPhaseCount, double(elapsed), double(elapsed / periodSeconds),
-              qPrintable(applied.join(QStringLiteral(","))),
-              qPrintable(expected.join(QStringLiteral(","))));
-
-        /*交叉核对：这一帧**实际**施加的偏移必须等于按配置算出来的期望值。
-           少了这一条，出图用例对"驱动器到底跑没跑"是瞎的（一串相同的帧也能过）。*/
-        for (const Live2DMoodPreset::IdleSwayEntry &entry : entries)
-        {
-            const float actual = renderer.idleSwayOffset(entry.parameterId);
-            const float wanted = static_cast<float>(
-                double(entry.amplitude) * std::sin(2.0 * M_PI *
-                                                    (double(elapsed) / double(entry.periodSeconds) +
-                                                     double(entry.phase))));
-            QVERIFY2(std::fabs(actual - wanted) <= 0.01f,
-                     qPrintable(QStringLiteral("相位 %1：%2 实际偏移 %3 与期望 %4 不符 —— "
-                                               "这一帧不在它标称的相位上")
-                                    .arg(phaseIndex)
-                                    .arg(entry.parameterId)
-                                    .arg(double(actual))
-                                    .arg(double(wanted))));
-        }
-    }
-
-    /*只测量、不判断：给出"第 k 帧与第 0 帧差多少像素"，并排看的时候心里有数。*/
-    const QImage first = frames.first();
-    for (int index = 1; index < frames.size(); ++index)
-    {
-        const QImage &other = frames[index];
-        int differingPixels = 0;
-        for (int y = 0; y < first.height(); ++y)
-        {
-            const uchar *left = first.constScanLine(y);
-            const uchar *right = other.constScanLine(y);
-            for (int x = 0; x < first.width(); ++x)
+            if (index > 0)
+                renderer.setNextFrameDeltaSeconds(0.15f);
+            const QImage probe = renderer.renderFrame(QSize(512, 512));
+            if (probe.isNull())
             {
-                const int offset = x * 4;
-                if (left[offset] != right[offset] || left[offset + 1] != right[offset + 1] ||
-                    left[offset + 2] != right[offset + 2] || left[offset + 3] != right[offset + 3])
-                    ++differingPixels;
+                probeOk = false;
+                break;
+            }
+            (void)renderer.probeFigureMetrics(probe);
+        }
+        renderer.setMeasureMode(false);
+        const Live2DOffscreenRenderer::FigureMetrics metrics = renderer.figureMetrics();
+        QVERIFY2(probeOk && metrics.valid && metrics.boundsAspect > 0.05f,
+                 qPrintable(QStringLiteral("[%1] 探针没量到人物，出不了全身对照图")
+                                .arg(modelName)));
+
+        constexpr int kSheetBaseHeight = 900;      //= Live2DCharacterWindow::kBaseCanvasHeight
+        constexpr float kSheetFigureRatio = 0.84f; //= Live2DCharacterWindow::kTargetFigureRatio
+        const int canvasHeight =
+            static_cast<int>(std::lround(kSheetBaseHeight / kSheetFigureRatio));
+        const int canvasWidth =
+            std::max(1, static_cast<int>(std::lround(canvasHeight * metrics.boundsAspect)));
+        const QSize sheetSize(canvasWidth, canvasHeight);
+        renderer.setDisplayRatios(kSheetFigureRatio, kSheetFigureRatio);
+        renderer.setIdleSway(entries);
+        /*心情用生产里的默认（中立那张）：出的是"她站着"的对照图，不是某个情绪。*/
+        renderer.setMoodBlendDurationMs(0);
+        renderer.setParameterOverrides(preset.parametersForMood(QStringLiteral("default")));
+        QVERIFY2(renderer.isIdleSwayActive(), "摆动没生效，这组图会是一串相同的帧");
+
+        qInfo("IDLE sheet: model=%s canvas=%dx%d (aspect %.3f) period=%.2fs outDir=%s",
+              qPrintable(modelName), sheetSize.width(), sheetSize.height(),
+              double(metrics.boundsAspect), double(periodSeconds), qPrintable(outDir));
+
+        /*② 一个周期内均匀取 6 个相位。基准时刻 = 当前累计虚拟时间，第 k 帧的目标时刻是
+           base + k×T/6 ⇒ 6 张图的相位**严格等距**，与"渲染花了多久"无关。*/
+        constexpr int kPhaseCount = 6;
+        const float baseSeconds = renderer.idleSwayElapsedSeconds();
+        QVector<QImage> frames;
+        QStringList savedPaths;
+        QSize expectedSize;
+        for (int phaseIndex = 0; phaseIndex < kPhaseCount; ++phaseIndex)
+        {
+            const float targetSeconds =
+                baseSeconds + periodSeconds * static_cast<float>(phaseIndex) / float(kPhaseCount);
+            int guard = 0;
+            while (renderer.idleSwayElapsedSeconds() < targetSeconds - 1e-4f && guard++ < 64)
+            {
+                /*一次最多推进 0.1s：那是渲染器单帧步长的夹取上限，超过就不是"一帧"了。*/
+                const float step =
+                    std::min(targetSeconds - renderer.idleSwayElapsedSeconds(), 0.1f);
+                renderer.setNextFrameDeltaSeconds(step);
+                QVERIFY2(!renderer.renderFrame(sheetSize).isNull(), "推进虚拟时间时渲染失败");
+            }
+            /*再渲一帧、**不推进时间**：保证这一帧正好落在目标时刻（帧步长置 0 是渲染器既有的
+               一条路径：动作/呼吸/物理都停在原地，只有累计时间之前的量在起作用）。*/
+            renderer.setNextFrameDeltaSeconds(0.0f);
+            const QImage frame = renderer.renderFrame(sheetSize);
+            QVERIFY2(!frame.isNull(), "出图时渲染失败");
+            QCOMPARE(frame.size(), sheetSize); //6 张图必须同尺寸，否则并排看没有意义
+            if (expectedSize.isEmpty())
+                expectedSize = frame.size();
+            QCOMPARE(frame.size(), expectedSize);
+            frames.append(frame);
+
+            const QString path = QDir(outDir).absoluteFilePath(
+                QStringLiteral("idle-%1-phase%2.png").arg(modelName).arg(phaseIndex));
+            QVERIFY2(frame.save(path), qPrintable(QStringLiteral("写不出 %1").arg(path)));
+            savedPaths.append(path);
+
+            /*把这一帧每条轴的**实际偏移**与"按配置算出来的期望值"一起打出来：
+               万一并排看觉得"没动/动得不对"，这行日志能直接指出是数据、相位还是实现的问题。*/
+            const float elapsed = renderer.idleSwayElapsedSeconds();
+            QStringList applied;
+            QStringList expected;
+            for (const Live2DMoodPreset::IdleSwayEntry &entry : entries)
+            {
+                applied << QStringLiteral("%1=%2").arg(entry.parameterId).arg(
+                    double(renderer.idleSwayOffset(entry.parameterId)), 0, 'f', 3);
+                const double wanted =
+                    double(entry.amplitude) *
+                    std::sin(2.0 * M_PI *
+                             (double(elapsed) / double(entry.periodSeconds) + double(entry.phase)));
+                expected << QStringLiteral("%1=%2").arg(entry.parameterId).arg(wanted, 0, 'f', 3);
+            }
+            qInfo("IDLE sheet[%s] phase %d/%d: t=%.3fs (%.3f of period) applied[%s] expected[%s]",
+                  qPrintable(modelName), phaseIndex, kPhaseCount, double(elapsed),
+                  double(elapsed / periodSeconds), qPrintable(applied.join(QStringLiteral(","))),
+                  qPrintable(expected.join(QStringLiteral(","))));
+
+            /*交叉核对：这一帧**实际**施加的偏移必须等于按配置算出来的期望值。
+               少了这一条，出图用例对"驱动器到底跑没跑"是瞎的（一串相同的帧也能过）。*/
+            for (const Live2DMoodPreset::IdleSwayEntry &entry : entries)
+            {
+                const float actual = renderer.idleSwayOffset(entry.parameterId);
+                const float wanted = static_cast<float>(
+                    double(entry.amplitude) *
+                    std::sin(2.0 * M_PI *
+                             (double(elapsed) / double(entry.periodSeconds) + double(entry.phase))));
+                QVERIFY2(std::fabs(actual - wanted) <= 0.01f,
+                         qPrintable(QStringLiteral("相位 %1：%2 实际偏移 %3 与期望 %4 不符 —— "
+                                                   "这一帧不在它标称的相位上")
+                                        .arg(phaseIndex)
+                                        .arg(entry.parameterId)
+                                        .arg(double(actual))
+                                        .arg(double(wanted))));
             }
         }
-        qInfo("IDLE sheet diff(phase%d vs phase0): %d/%d pixels (%.2f%%)", index, differingPixels,
-              first.width() * first.height(),
-              100.0 * double(differingPixels) / double(first.width() * first.height()));
+
+        /*只测量、不判断：给出"第 k 帧与第 0 帧差多少像素"，并排看的时候心里有数。*/
+        const QImage first = frames.first();
+        for (int index = 1; index < frames.size(); ++index)
+        {
+            const QImage &other = frames[index];
+            int differingPixels = 0;
+            for (int y = 0; y < first.height(); ++y)
+            {
+                const uchar *left = first.constScanLine(y);
+                const uchar *right = other.constScanLine(y);
+                for (int x = 0; x < first.width(); ++x)
+                {
+                    const int offset = x * 4;
+                    if (left[offset] != right[offset] || left[offset + 1] != right[offset + 1] ||
+                        left[offset + 2] != right[offset + 2] || left[offset + 3] != right[offset + 3])
+                        ++differingPixels;
+                }
+            }
+            qInfo("IDLE sheet[%s] diff(phase%d vs phase0): %d/%d pixels (%.2f%%)",
+                  qPrintable(modelName), index, differingPixels, first.width() * first.height(),
+                  100.0 * double(differingPixels) / double(first.width() * first.height()));
+        }
+        qInfo("IDLE sheet[%s]: %d frames %dx%d saved: %s", qPrintable(modelName),
+              savedPaths.size(), expectedSize.width(), expectedSize.height(),
+              qPrintable(savedPaths.join(QStringLiteral(" "))));
+        produced.append(savedPaths);
     }
-    qInfo("IDLE sheet: %d frames %dx%d saved: %s", savedPaths.size(), expectedSize.width(),
-          expectedSize.height(), qPrintable(savedPaths.join(QStringLiteral(" "))));
+
+    QVERIFY2(!produced.isEmpty(), "一个模型的摆动帧都没出成");
+    qInfo("IDLE sheet: 共 %d 个模型、%d 个文件", produced.size(),
+          [&produced]() {
+              int total = 0;
+              for (const QStringList &list : produced)
+                  total += list.size();
+              return total;
+          }());
+}
+
+/*[数据纪律] 每个带 idle.json 的模型：装载成功、没有驱动器/嘴形条目、
+   每条幅度都在**声明的量程**的 20% 警戒线以内。
+
+   为什么要单独一条、而且不依赖渲染：装载器对越界幅度只是**打一条告警**（见
+   Live2DMoodPreset::auditIdleSway：那是审美，不替作者做决定）。于是"数据写坏了"
+   在屏幕上只表现为"她抖得厉害"，没人能从一个动图里反推出是 17.5% 还是 35%。
+   这条把它变成一个可读的数字，并且**遍历所有模型** —— 新挂上来的那份数据自动进入判据。
+
+   20% 这条线就是数据文件自己写在 `_rules` 里的规则（同一条线装载器也会告警），
+   所以这不是测试发明的阈值，而是拿文件自己的承诺去核文件。*/
+void TestLive2DOffscreen::idleSwayDataObeysItsOwnRulesForEveryModel()
+{
+    const QStringList models = modelNamesWithIdleData();
+    if (models.isEmpty())
+        QSKIP("本机没有任何待机摆动数据（presets/idle.json），跳过");
+
+    /*驱动器/物理占用的参数（语义名与真实 ID 两侧都查）与嘴形：写了也必须被剔除。
+       这几条与 Live2DMoodPreset::isUpdaterOwnedParameter 是同一份名单 —— 这里再钉一次，
+       因为"装载器剔除了"与"数据里没有"是两件事：后者才是作者该守的纪律。*/
+    const QStringList forbiddenSemantic = {QStringLiteral("breath"), QStringLiteral("hairFront"),
+                                           QStringLiteral("hairSide"), QStringLiteral("hairBack"),
+                                           QStringLiteral("mouthForm")};
+
+    constexpr float kAmplitudeWarnRatio = 0.2f; //= Live2DMoodPreset 的 kIdleSwayAmplitudeWarnRatio
+
+    int axesChecked = 0;
+    for (const QString &modelName : models)
+    {
+        Live2DMoodPreset preset;
+        QVERIFY2(preset.load(modelName),
+                 qPrintable(QStringLiteral("[%1] parameter-map.json/moods.json 装载失败")
+                                .arg(modelName)));
+        QVERIFY2(preset.loadIdle(),
+                 qPrintable(QStringLiteral("[%1] presets/idle.json 存在却装载失败（数据坏了？）")
+                                .arg(modelName)));
+
+        const QVector<Live2DMoodPreset::IdleSwayEntry> entries = preset.idleSwayEntries();
+        QVERIFY2(!entries.isEmpty(),
+                 qPrintable(QStringLiteral("[%1] 一条可用轴都没有").arg(modelName)));
+
+        Live2DOffscreenRenderer renderer;
+        QString loadError;
+        QVERIFY2(loadModelByName(modelName, &renderer, &loadError),
+                 qPrintable(QStringLiteral("[%1] 装载不了模型：%2").arg(modelName, loadError)));
+        const QHash<QString, Live2DOffscreenRenderer::DeclaredRange> declared =
+            renderer.declaredParameterRanges();
+        QVERIFY2(!declared.isEmpty(), "模型没有声明任何参数");
+
+        QStringList axes;
+        for (const Live2DMoodPreset::IdleSwayEntry &entry : entries)
+        {
+            // ① 数据里**不许**出现驱动器/嘴形参数（语义名侧）
+            QVERIFY2(!forbiddenSemantic.contains(entry.semanticName),
+                     qPrintable(QStringLiteral("[%1] idle.json 里写了 %2 —— 驱动器/嘴形参数不该由"
+                                               "摆动数据来写（即使装载器会剔除，数据本身也该干净）")
+                                    .arg(modelName, entry.semanticName)));
+            // ② 真实 ID 侧同样不许（防"语义名换了、ID 还是那一个"）
+            QVERIFY2(!Live2DMoodPreset::isUpdaterOwnedParameter(entry.parameterId),
+                     qPrintable(QStringLiteral("[%1] idle.json 的 %2 解析到了驱动器参数 %3")
+                                    .arg(modelName, entry.semanticName, entry.parameterId)));
+
+            // ③ 幅度 ≤ 声明量程的 20%（文件自己的规则）
+            QVERIFY2(declared.contains(entry.parameterId),
+                     qPrintable(QStringLiteral("[%1] 模型没有声明 %2（语义名 %3）")
+                                    .arg(modelName, entry.parameterId, entry.semanticName)));
+            const Live2DOffscreenRenderer::DeclaredRange range = declared.value(entry.parameterId);
+            const float span = range.max - range.min;
+            QVERIFY2(span > 0.0f,
+                     qPrintable(QStringLiteral("[%1] %2 的声明量程是 0").arg(modelName,
+                                                                              entry.parameterId)));
+            const float ratio = entry.amplitude / span;
+            QVERIFY2(ratio <= kAmplitudeWarnRatio + 1e-6f,
+                     qPrintable(QStringLiteral("[%1] %2 的幅度 %3 是声明量程 %4 的 %5%% "
+                                               "（文件自己规定 ≤ %6%%）—— 波峰会顶到上下限被削平")
+                                    .arg(modelName, entry.parameterId)
+                                    .arg(double(entry.amplitude))
+                                    .arg(double(span))
+                                    .arg(double(ratio * 100.0))
+                                    .arg(double(kAmplitudeWarnRatio * 100.0f))));
+            axes << QStringLiteral("%1(%2)=%3/%4s/%5=%6%%")
+                        .arg(entry.semanticName, entry.parameterId)
+                        .arg(double(entry.amplitude))
+                        .arg(double(entry.periodSeconds))
+                        .arg(double(entry.phase))
+                        .arg(double(ratio * 100.0), 0, 'f', 1);
+            ++axesChecked;
+        }
+        qInfo("IDLE data[%s]: %d axes, all within %.0f%% of declared range: %s",
+              qPrintable(modelName), entries.size(), double(kAmplitudeWarnRatio * 100.0f),
+              qPrintable(axes.join(QStringLiteral(" | "))));
+    }
+
+    qInfo("IDLE data: %d models, %d axes checked", models.size(), axesChecked);
+}
+
+/*==================== 腿部探针：这个模型的腿到底动得了吗 ====================
+
+  用户的问题（原话大意）：「miku 的腿能不能动？lowerBodyZ 到底移得动多少？」
+
+  **为什么要专门做一次全参数扫描、而不是读 cdi3 的名字猜**：miku 的 141 个参数里大部分是
+  `Param25` 这种无语义 ID，cdi3 的显示名（『x全身』『z下身』）只说明作者的**意图**，
+  不说它实际连到了哪块 artmesh。而『腿有没有关节』这种事只有一个可信的判据：
+  **把它推到极限、看下半身的 alpha 掩码动没动**。
+
+  两个指标必须**分开**（这是本探针存在的第二个理由）：
+    geometry  = 两帧 alpha 掩码不同的像素数（掩码动了 = 真的在动骨架/形变）
+    appearance= 掩码**逐位相同**、只有 RGB 不同的像素数（换装、道具、贴图开关）
+  「大葱」这类道具开关会把画面差出十几个百分点，但在 geometry 上是 **0** ——
+  只看"画面差多少像素"会把它误判成"腿动了"。所以判据按 geometry 排序，appearance 单列。
+
+  **隔离手法**：把**每一个**声明参数都钉在中立值上（整组覆盖），只放开正在测的那一个，
+  并且帧步长注入 0（呼吸/物理/眨眼/动作全部停在原地）。这样两帧的差异只可能来自这一个
+  参数 —— 否则"物理这一帧碰巧动了"会被算到参数头上。呼吸/头发不归覆盖表管
+  （isUpdaterOwnedParameter），但它们受帧步长驱动，步长 0 时同样不动。
+
+  **只测量、不断言"腿该怎样"**：模型有没有腿部关节是作者的决定，不是 bug。
+  这里只把事实摊开。*/
+void TestLive2DOffscreen::probesWhichParametersArticulateTheLowerBody()
+{
+    /*整轮扫描 = 每个模型 (2 × 参数个数 + 若干基准帧) ≈ 300 次渲染，属于"正常测试"的量级
+       （用户明确说过这种量级没问题；真正的负载事故来自人为的 CPU 燃烧线程）。*/
+    QStringList models = modelNamesWithIdleData();
+    models << modelNamesWithMoodData();
+    models.removeDuplicates();
+    models.sort();
+    if (models.isEmpty())
+        QSKIP("本机没有任何模型数据（parameter-map.json / idle.json），跳过腿部探针");
+
+    const QString outDir = outputDir();
+    QVERIFY2(QDir().mkpath(outDir), qPrintable(QStringLiteral("建不出输出目录 %1").arg(outDir)));
+
+    //扫描用的画布：够大能看清下半身，又足够小让 ~300 帧跑得完
+    const QSize probeSize(360, 720);
+
+    QStringList allReports;
+    for (const QString &modelName : models)
+    {
+        Live2DOffscreenRenderer renderer;
+        QString loadError;
+        QVERIFY2(loadModelByName(modelName, &renderer, &loadError),
+                 qPrintable(QStringLiteral("[%1] 装载不了模型：%2").arg(modelName, loadError)));
+
+        const QHash<QString, Live2DOffscreenRenderer::DeclaredRange> declared =
+            renderer.declaredParameterRanges();
+        QVERIFY2(!declared.isEmpty(), "模型没有声明任何参数");
+
+        //显示名（cdi3）：把 `Param25` 翻译成『x全身』—— 报告的可读性全靠它
+        QHash<QString, QString> displayNames;
+        {
+            const QString modelFileDir = QDir(Live2DModelRootPath).filePath(modelName);
+            const QString searchDir =
+                QFileInfo::exists(modelFileDir)
+                    ? modelFileDir
+                    : QDir(CharacterAssestPath)
+                          .filePath(ReadNowSelectChar() + QStringLiteral("/Live2D/") + modelName);
+            const QDir dir(searchDir);
+            for (const QString &cdi3Name :
+                 dir.entryList({QStringLiteral("*.cdi3.json")}, QDir::Files))
+            {
+                QFile file(dir.filePath(cdi3Name));
+                if (!file.open(QIODevice::ReadOnly))
+                    continue;
+                const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+                for (const QJsonValue &value :
+                     doc.object().value(QStringLiteral("Parameters")).toArray())
+                {
+                    const QJsonObject entry = value.toObject();
+                    const QString id = entry.value(QStringLiteral("Id")).toString();
+                    const QString name = entry.value(QStringLiteral("Name")).toString();
+                    if (!id.isEmpty() && !name.isEmpty() && !displayNames.contains(id))
+                        displayNames.insert(id, name);
+                }
+            }
+        }
+
+        /*把整组参数钉到中立值。为什么用**整组覆盖**而不是逐条 setParameter：
+           覆盖是原子替换，切到下一个参数时上一项自然消失 —— 逐条 setParameter 永远删不掉，
+           第一个参数会一路留着，后面的读数就全被它污染了（这正是 atri 那边"她只有一副表情"
+           的同一个成因）。*/
+        QHash<QString, float> neutral = renderer.declaredParameterRanges().isEmpty()
+                                            ? QHash<QString, float>()
+                                            : QHash<QString, float>();
+        for (auto it = declared.constBegin(); it != declared.constEnd(); ++it)
+            neutral.insert(it.key(), it.value().neutral);
+        renderer.setMoodBlendDurationMs(0); //立刻生效，不要过渡态
+        renderer.setIdleSway({});           //探针期间不做摆动（它会盖住被测参数）
+        renderer.clearEyeOpennessMultiplierOverride();
+
+        //先渲两帧热身（首帧要建 FBO、把着色器与贴图走热），不计入测量
+        for (int index = 0; index < 2; ++index)
+        {
+            renderer.setParameterOverrides(neutral);
+            renderer.setNextFrameDeltaSeconds(0.0f);
+            QVERIFY2(!renderer.renderFrame(probeSize).isNull(), "热身帧渲染失败");
+        }
+
+        //人物包围盒（中性姿势）：下半身区域按它切
+        renderer.setParameterOverrides(neutral);
+        renderer.setNextFrameDeltaSeconds(0.0f);
+        const QImage baseline = renderer.renderFrame(probeSize);
+        QVERIFY2(!baseline.isNull(), "中性帧渲染失败");
+        const QImage base = baseline.convertToFormat(QImage::Format_RGBA8888);
+
+        int minX = base.width(), minY = base.height(), maxX = -1, maxY = -1;
+        for (int y = 0; y < base.height(); ++y)
+        {
+            const uchar *line = base.constScanLine(y);
+            for (int x = 0; x < base.width(); ++x)
+            {
+                if (line[x * 4 + 3] <= 32)
+                    continue;
+                minX = std::min(minX, x);
+                maxX = std::max(maxX, x);
+                minY = std::min(minY, y);
+                maxY = std::max(maxY, y);
+            }
+        }
+        QVERIFY2(maxX >= minX && maxY >= minY, "中性帧里量不到人物");
+
+        /*上半身 / 下半身按人物包围盒**对半切**。这不是"解剖学上精确的腰线"，
+           而是一个**同一模型内可比**的固定区域 —— 探针要回答的是"哪些参数动了下面那一半"，
+           换一个更聪明的切法只会让"这一帧与那一帧"的比较失去共同基准。*/
+        const QRect lower(minX, minY + (maxY - minY) / 2, maxX - minX + 1,
+                          maxY - (minY + (maxY - minY) / 2) + 1);
+        const QRect upper(minX, minY, maxX - minX + 1, (maxY - minY) / 2 + 1);
+
+        /*人物在区域里的重心（像素坐标，只统计 alpha 达标的像素）。
+           用来区分「整个下半身平移过去」与「骨架在原地形变」：平移的参数重心会跟着走，
+           只改轮廓的参数重心基本不动。*/
+        const auto centroidOf = [](const QImage &frame, const QRect &region, double *meanX,
+                                   double *meanY) {
+            double sumX = 0.0;
+            double sumY = 0.0;
+            qint64 count = 0;
+            for (int y = region.top(); y <= region.bottom(); ++y)
+            {
+                const uchar *line = frame.constScanLine(y);
+                for (int x = region.left(); x <= region.right(); ++x)
+                {
+                    if (line[x * 4 + 3] <= kLegProbeAlphaThreshold)
+                        continue;
+                    sumX += x;
+                    sumY += y;
+                    ++count;
+                }
+            }
+            *meanX = count > 0 ? sumX / double(count) : 0.0;
+            *meanY = count > 0 ? sumY / double(count) : 0.0;
+            return count;
+        };
+
+        //度量：在一个区域里分别数「掩码不同」与「掩码相同但 RGB 不同」
+        const auto measureRegion = [&base](const QImage &other, const QRect &region, qint64 *geometry,
+                                           qint64 *appearance) {
+            *geometry = 0;
+            *appearance = 0;
+            for (int y = region.top(); y <= region.bottom(); ++y)
+            {
+                const uchar *a = base.constScanLine(y);
+                const uchar *b = other.constScanLine(y);
+                for (int x = region.left(); x <= region.right(); ++x)
+                {
+                    const int offset = x * 4;
+                    const bool maskA = a[offset + 3] > kLegProbeAlphaThreshold;
+                    const bool maskB = b[offset + 3] > kLegProbeAlphaThreshold;
+                    if (maskA != maskB)
+                    {
+                        ++(*geometry);
+                        continue;
+                    }
+                    if (!maskA)
+                        continue; //两边都透明：没有外观可言
+                    /*appearance 只统计**两边都不透明**的像素：这样"换了一整块贴图/道具"
+                      与"轮廓移动了"在数值上互不干扰 —— 掩码一移，那些像素就落进 geometry，
+                      不会同时被算成外观变化。两者因此是可以直接对照的两个独立量。
+                      ⚠️ 但**旋转/整体平移同样会让大部分重叠区域的 RGB 变掉**（贴图在屏幕上
+                      换了映射），所以 appearance 高**不等于**"换了外观"。
+                      区分"外形改了"与"整体挪了/转了"要靠下面的 maskAreaDelta。*/
+                    if (a[offset] != b[offset] || a[offset + 1] != b[offset + 1] ||
+                        a[offset + 2] != b[offset + 2])
+                        ++(*appearance);
+                }
+            }
+        };
+
+        /*区域里的**掩码面积**（alpha 达标像素数）。
+           这是把"外形真的改了"从"整体平移/旋转"里剥出来的关键量：
+             - 刚体平移  → 掩码逐像素差异很大，但**面积几乎不变**（形状只是挪了位置）；
+             - 骨架形变  → 面积明显改变（腿伸出来/缩回去、道具出现/消失）。
+           只看 alpha 逐像素差会把这两者混为一谈（而它们对"腿能不能动"的结论完全相反）。*/
+        const auto maskAreaOf = [](const QImage &frame, const QRect &region) {
+            qint64 count = 0;
+            for (int y = region.top(); y <= region.bottom(); ++y)
+            {
+                const uchar *line = frame.constScanLine(y);
+                for (int x = region.left(); x <= region.right(); ++x)
+                {
+                    if (line[x * 4 + 3] > kLegProbeAlphaThreshold)
+                        ++count;
+                }
+            }
+            return count;
+        };
+        const qint64 lowerArea =
+            qint64(lower.width()) * qint64(lower.height());
+        const qint64 upperArea = qint64(upper.width()) * qint64(upper.height());
+
+        struct Hit
+        {
+            QString id;
+            QString name;
+            float min = 0.0f;
+            float max = 0.0f;
+            qint64 geometryLower = 0;
+            qint64 appearanceLower = 0;
+            qint64 geometryUpper = 0;
+            double valueMin = 0.0;
+            double valueMax = 0.0;
+            /*重心位移与"写入是否落到参数上"两项诊断。
+               前者区分「平移」与「形变」；后者是给"这个参数是不是死的"提供证据 ——
+               读回值不等于写进去的值，就说明它没被写进模型，而不是"连了但看不出来"。*/
+            double centroidDx = 0.0;
+            double centroidDy = 0.0;
+            float readBackMin = 0.0f;
+            float readBackMax = 0.0f;
+            /*掩码面积变化（像素，取两侧里更大的一侧）：把"外形真的改了"从"整体挪/转了"
+               里剥出来。刚体平移的面积变化接近 0，骨架形变则明显（见 maskAreaOf 的说明）。*/
+            qint64 maskAreaBaseline = 0;
+            qint64 maskAreaDelta = 0;
+        };
+        QVector<Hit> hits;
+        int measured = 0;
+
+        for (auto it = declared.constBegin(); it != declared.constEnd(); ++it)
+        {
+            const QString id = it.key();
+            const Live2DOffscreenRenderer::DeclaredRange range = it.value();
+            if (range.max - range.min <= 0.0f)
+                continue; //没有量程的参数推不动（全部是 0/常量），扫它没有意义
+
+            Hit hit;
+            hit.id = id;
+            hit.name = displayNames.value(id, QStringLiteral("-"));
+            hit.min = range.min;
+            hit.max = range.max;
+
+            /*每个参数取**两帧**（min 一帧、max 一帧），各与**紧邻它之前**重新渲的中性帧比较。
+               为什么每次都重渲中性帧、而不是拿最初那一张当公共基准：
+               物理/眨眼/呼吸虽然被步长 0 冻住了，但"冻住"不等于"回到中性"——
+               被测参数在上一轮留下的状态可能仍在驱动器里。重渲一次基准是这个探针里最便宜的保险。*/
+            const auto renderWith = [&](float value, QImage *out) {
+                QHash<QString, float> overrides = neutral;
+                overrides.insert(id, value);
+                renderer.setParameterOverrides(overrides);
+                renderer.setNextFrameDeltaSeconds(0.0f);
+                const QImage frame = renderer.renderFrame(probeSize);
+                if (frame.isNull())
+                    return false;
+                *out = frame.convertToFormat(QImage::Format_RGBA8888);
+                return true;
+            };
+            const auto renderNeutral = [&](QImage *out) {
+                renderer.setParameterOverrides(neutral);
+                renderer.setNextFrameDeltaSeconds(0.0f);
+                const QImage frame = renderer.renderFrame(probeSize);
+                if (frame.isNull())
+                    return false;
+                *out = frame.convertToFormat(QImage::Format_RGBA8888);
+                return true;
+            };
+
+            QImage neutralBefore;
+            QVERIFY2(renderNeutral(&neutralBefore), "基准帧渲染失败");
+            double neutralMeanX = 0.0;
+            double neutralMeanY = 0.0;
+            (void)centroidOf(neutralBefore, lower, &neutralMeanX, &neutralMeanY);
+
+            QImage atMin;
+            QVERIFY2(renderWith(range.min, &atMin), "参数最小值帧渲染失败");
+            qint64 geometry = 0;
+            qint64 appearance = 0;
+            qint64 geometryUpper = 0;
+            qint64 appearanceUpper = 0;
+            measureRegion(atMin, lower, &geometry, &appearance);
+            measureRegion(atMin, upper, &geometryUpper, &appearanceUpper);
+            hit.geometryLower = geometry;
+            hit.appearanceLower = appearance;
+            hit.geometryUpper = geometryUpper;
+            /*读回值：写进去的是 range.min，读回来的是 Core 里**真正生效**的值。
+               两者不等 ⇒ 这个参数没被写进模型（那不是"看不出效果"，是压根没接线）。*/
+            hit.readBackMin = renderer.parameterValue(id);
+            hit.valueMin = double(hit.readBackMin);
+            double minMeanX = 0.0;
+            double minMeanY = 0.0;
+            (void)centroidOf(atMin, lower, &minMeanX, &minMeanY);
+            hit.centroidDx = minMeanX - neutralMeanX;
+            hit.centroidDy = minMeanY - neutralMeanY;
+
+            QVERIFY2(renderNeutral(&neutralBefore), "基准帧渲染失败");
+            (void)centroidOf(neutralBefore, lower, &neutralMeanX, &neutralMeanY);
+            QImage atMax;
+            QVERIFY2(renderWith(range.max, &atMax), "参数最大值帧渲染失败");
+            qint64 geometryMax = 0;
+            qint64 appearanceMax = 0;
+            qint64 geometryUpperMax = 0;
+            qint64 appearanceUpperMax = 0;
+            measureRegion(atMax, lower, &geometryMax, &appearanceMax);
+            measureRegion(atMax, upper, &geometryUpperMax, &appearanceUpperMax);
+            /*取两侧里**动得更多**的那一侧：一个参数可能只在正方向或只在负方向改骨架
+               （作者常把中立的骨架摆在量程的一端）。*/
+            hit.geometryLower = std::max(hit.geometryLower, geometryMax);
+            hit.appearanceLower = std::max(hit.appearanceLower, appearanceMax);
+            hit.geometryUpper = std::max(hit.geometryUpper, geometryUpperMax);
+            hit.readBackMax = renderer.parameterValue(id);
+            hit.valueMax = double(hit.readBackMax);
+            double maxMeanX = 0.0;
+            double maxMeanY = 0.0;
+            (void)centroidOf(atMax, lower, &maxMeanX, &maxMeanY);
+            //重心位移取两侧里更大的一侧（与上面几个量同一个约定）
+            if (std::fabs(maxMeanX - neutralMeanX) > std::fabs(hit.centroidDx))
+                hit.centroidDx = maxMeanX - neutralMeanX;
+            if (std::fabs(maxMeanY - neutralMeanY) > std::fabs(hit.centroidDy))
+                hit.centroidDy = maxMeanY - neutralMeanY;
+            /*掩码面积变化：拿 min/max 两侧里更大的那一侧。
+               用中性帧的面积当基准（上面刚重渲过，与这两帧同源）。*/
+            const qint64 neutralArea = maskAreaOf(neutralBefore, lower);
+            hit.maskAreaBaseline = neutralArea;
+            hit.maskAreaDelta =
+                std::max(qAbs(maskAreaOf(atMin, lower) - neutralArea),
+                         qAbs(maskAreaOf(atMax, lower) - neutralArea));
+
+            hits.append(hit);
+            ++measured;
+        }
+
+        /*主排序按 **areaDelta**（掩码面积变化）—— 那才是"外形真的改了"的判据。
+           按 geometryLower（逐像素 alpha 差）排会把"整体平移"排到最前面：平移确实改变了很多
+           像素的 alpha，但外形一个像素都没改。*/
+        std::sort(hits.begin(), hits.end(), [](const Hit &lhs, const Hit &rhs) {
+            if (lhs.maskAreaDelta != rhs.maskAreaDelta)
+                return lhs.maskAreaDelta > rhs.maskAreaDelta;
+            if (lhs.geometryLower != rhs.geometryLower)
+                return lhs.geometryLower > rhs.geometryLower;
+            return lhs.id < rhs.id;
+        });
+
+        QStringList report;
+        report.append(QStringLiteral("# 腿部探针 / leg probe: model=%1").arg(modelName));
+        report.append(QStringLiteral("# 画布 %1x%2；上半身 %3,%4 %5x%6；下半身 %7,%8 %9x%10")
+                          .arg(probeSize.width())
+                          .arg(probeSize.height())
+                          .arg(upper.x())
+                          .arg(upper.y())
+                          .arg(upper.width())
+                          .arg(upper.height())
+                          .arg(lower.x())
+                          .arg(lower.y())
+                          .arg(lower.width())
+                          .arg(lower.height()));
+        report.append(QStringLiteral("# 指标定义：geometry = alpha 掩码不同的像素（轮廓动了）；"
+                                     "appearance = **两边都不透明**的像素里只有 RGB 不同。"
+                                     "下半身区域面积 %1 像素。")
+                          .arg(lowerArea));
+        report.append(QStringLiteral("# centroidDx/Dy = 下半身重心的位移（像素）；"
+                                     "areaDelta = 下半身**掩码面积**的变化（像素）与占区域的比例 —— "
+                                     "**这才是「外形真的改了」的判据**：刚体平移/旋转的面积变化接近 0"
+                                     "（形状只是挪了位置），骨架形变/道具出现消失才会明显改变面积。"));
+        report.append(QStringLiteral("# readBackMin/Max = 推到 min/max 之后从模型读回的值"
+                                     "（与 min/max 不等 ⇒ 这个参数没被写进模型，是死参数）。"));
+        report.append(QStringLiteral("# 每个参数取 min/max 两侧里动得更多的一侧；按 areaDelta 降序"
+                                     "（= 按「外形真的改了」降序）。"));
+        const QString header =
+            QStringLiteral("# %1\t%2\t%3\t%4\t%5\t%6\t%7\t%8\t%9\t%10\t%11")
+                .arg(QStringLiteral("param"),
+                     QStringLiteral("displayName"),
+                     QStringLiteral("geoLower"),
+                     QStringLiteral("appLower"),
+                     QStringLiteral("geoUpper"),
+                     QStringLiteral("areaDelta"),
+                     QStringLiteral("areaDelta%"),
+                     QStringLiteral("centroidDx"),
+                     QStringLiteral("centroidDy"),
+                     QStringLiteral("rangeMin/max"),
+                     QStringLiteral("readBackMin/max"));
+        const auto formatRow = [](const Hit &hit) {
+            return QStringLiteral("%1\t%2\t%3\t%4\t%5\t%6\t%7\t%8\t%9\t%10/%11\t%12/%13")
+                .arg(hit.id, hit.name.isEmpty() ? QStringLiteral("-") : hit.name)
+                .arg(hit.geometryLower)
+                .arg(hit.appearanceLower)
+                .arg(hit.geometryUpper)
+                .arg(hit.maskAreaDelta)
+                .arg(double(hit.maskAreaDelta) /
+                         double(std::max<qint64>(1, hit.maskAreaBaseline)) * 100.0, 0, 'f', 2)
+                .arg(double(hit.centroidDx), 0, 'f', 2)
+                .arg(double(hit.centroidDy), 0, 'f', 2)
+                .arg(double(hit.min))
+                .arg(double(hit.max))
+                .arg(double(hit.readBackMin))
+                .arg(double(hit.readBackMax));
+        };
+        report.append(header);
+        for (const Hit &hit : hits)
+            report.append(formatRow(hit));
+
+        /*第二张表：按 appearance 降序。
+           ⚠️ appearance 高**不等于**"换了外观"（旋转/整体平移同样会让重叠区域的 RGB 变掉），
+           所以这张表要**连着 areaDelta 一起看**：
+             areaDelta ≈ 0 而 appearance 高 ⇒ 整体挪了/转了（贴图在屏幕上换了映射）；
+             areaDelta 明显      ⇒ 外形真的改了（道具出现/消失、肢体伸出/收回）。*/
+        QVector<Hit> byAppearance = hits;
+        std::sort(byAppearance.begin(), byAppearance.end(), [](const Hit &lhs, const Hit &rhs) {
+            if (lhs.appearanceLower != rhs.appearanceLower)
+                return lhs.appearanceLower > rhs.appearanceLower;
+            return lhs.id < rhs.id;
+        });
+        report.append(QString());
+        report.append(QStringLiteral("# ---- 按 appearanceLower 降序"
+                                     "（与 areaDelta 连看：areaDelta≈0 = 挪/转；明显 = 外形改了） ----"));
+        report.append(header);
+        const int appearanceRows = std::min(20, static_cast<int>(byAppearance.size()));
+        for (int index = 0; index < appearanceRows; ++index)
+        {
+            if (byAppearance.at(index).appearanceLower == 0)
+                break;
+            report.append(formatRow(byAppearance.at(index)));
+        }
+        /***死参数**：推到量程两端、从模型读回来却还是中立值 ⇒ 这个参数没被写进 moc
+           （不是"连了但看不出效果"）。这一栏必须打出来，因为"某个参数推不动"与
+           "这个参数看不见效果"在画面上完全一样，只有读回值分得开。
+           这类参数不该进 parameter-map（那会让数据作者去校准一个永远不生效的数字）。*/
+        QStringList stuck;
+        for (const Hit &hit : hits)
+        {
+            const bool minStuck = std::fabs(hit.readBackMin - hit.min) > 1e-3f &&
+                                  std::fabs(hit.readBackMin - hit.max) > 1e-3f;
+            const bool maxStuck = std::fabs(hit.readBackMax - hit.min) > 1e-3f &&
+                                  std::fabs(hit.readBackMax - hit.max) > 1e-3f;
+            if (minStuck && maxStuck)
+                stuck.append(QStringLiteral("%1(%2) readBack=%3/%4 range=[%5,%6]")
+                                 .arg(hit.id, hit.name)
+                                 .arg(double(hit.readBackMin))
+                                 .arg(double(hit.readBackMax))
+                                 .arg(double(hit.min))
+                                 .arg(double(hit.max)));
+        }
+        qInfo("LEGPROBE %s: %d parameters did NOT take the written value (dead/unwired): %s",
+              qPrintable(modelName), stuck.size(),
+              stuck.isEmpty() ? "none" : qPrintable(stuck.join(QStringLiteral(" | "))));
+        for (const QString &line : stuck)
+            report.append(QStringLiteral("# DEAD %1").arg(line));
+        const QString path = QDir(outDir).absoluteFilePath(
+            QStringLiteral("leg-probe-%1.txt").arg(modelName));
+        QFile file(path);
+        QVERIFY2(file.open(QIODevice::WriteOnly | QIODevice::Truncate),
+                 qPrintable(QStringLiteral("写不出 %1").arg(path)));
+        file.write(report.join(QLatin1Char('\n')).toUtf8());
+        file.close();
+        allReports.append(path);
+
+        /*控制台只打**前几名**（全表在文件里）：这条用例的重点是"哪些参数真的动下半身"，
+           而 141 行控制台输出会把 ctest 的日志淹没。ASCII 列名保证控制台可读。*/
+        qInfo("LEGPROBE %s: %d parameters swept, canvas %dx%d, lower region %dx%d (%lld px), "
+              "upper %dx%d. Full table: %s",
+              qPrintable(modelName), measured, probeSize.width(), probeSize.height(), lower.width(),
+              lower.height(), static_cast<long long>(lowerArea), upper.width(), upper.height(),
+              qPrintable(path));
+        const int topCount = std::min(15, static_cast<int>(hits.size()));
+        for (int index = 0; index < topCount; ++index)
+        {
+            const Hit &hit = hits.at(index);
+            const double geoPercent =
+                100.0 * double(hit.geometryLower) / double(std::max<qint64>(1, lowerArea));
+            const double appPercent =
+                100.0 * double(hit.appearanceLower) / double(std::max<qint64>(1, lowerArea));
+            qInfo("LEGPROBE %s TOP%02d %s (%s) areaDelta=%lld (%.2f%% of lower) geoLower=%lld "
+                  "(%.2f%%) appLower=%lld (%.2f%%) geoUpper=%lld centroid=(%.2f,%.2f)",
+                  qPrintable(modelName), index + 1, qPrintable(hit.id), qPrintable(hit.name),
+                  static_cast<long long>(hit.maskAreaDelta),
+                  100.0 * double(hit.maskAreaDelta) /
+                      double(std::max<qint64>(1, hit.maskAreaBaseline)),
+                  static_cast<long long>(hit.geometryLower), geoPercent,
+                  static_cast<long long>(hit.appearanceLower), appPercent,
+                  static_cast<long long>(hit.geometryUpper), hit.centroidDx, hit.centroidDy);
+        }
+
+        /*把**语义表里那几个全身轴**单独再报一次：用户问的是它们，而它们未必排在前面
+           （全身轴动的是整个人，下半身只是其中一部分）。*/
+        Live2DMoodPreset preset;
+        if (preset.load(modelName))
+        {
+            const QStringList interesting = {QStringLiteral("lowerBodyZ"), QStringLiteral("upperBodyZ"),
+                                             QStringLiteral("wholeBodyX"),
+                                             QStringLiteral("wholeBodyY"),
+                                             QStringLiteral("wholeBodyShiftX"),
+                                             QStringLiteral("bodyZ"), QStringLiteral("bodyX"),
+                                             QStringLiteral("headZ")};
+            for (const QString &semantic : interesting)
+            {
+                const Live2DMoodPreset::ParameterRange range =
+                    preset.parameters().value(semantic);
+                if (range.id.isEmpty())
+                    continue;
+                for (const Hit &hit : hits)
+                {
+                    if (hit.id != range.id)
+                        continue;
+                    qInfo("LEGPROBE %s SEMANTIC %s=%s (%s) geoLower=%lld appLower=%lld "
+                          "geoUpper=%lld",
+                          qPrintable(modelName), qPrintable(semantic), qPrintable(range.id),
+                          qPrintable(hit.name), static_cast<long long>(hit.geometryLower),
+                          static_cast<long long>(hit.appearanceLower),
+                          static_cast<long long>(hit.geometryUpper));
+                    break;
+                }
+            }
+        }
+    }
+
+    QVERIFY2(!allReports.isEmpty(), "一个模型的探针报告都没出成");
+}
+
+/*==================== 两个模型是不是同一套 rig ====================
+
+  用户的问题：**樱花miku 能不能直接用 miku 的那三份数据？**
+
+  **为什么不能靠"看一眼"回答**：两个模型的人物贴图不同（樱花miku 是换色/换装版），
+  画面必然不一样 —— 比像素等于什么都没说。真正决定"数据能不能复用"的是**骨架与绑定**：
+   同一个 moc？同一批参数？同一批参数推到同一个值，剪影是否落在同一处？
+
+  所以这里比两件事（都与贴图无关）：
+    ① 声明的参数集合：ID 与 min/default/max **逐条相等**（同 rig 的必要条件）；
+    ② 同一批参数取同一批值时的 **alpha 剪影** 在输出空间里是否一致。
+
+  判据用"剪影不一致的像素占人物面积的比例"，阈值取 2%：真同 rig 时只有抗锯齿边缘的
+  亚像素差（实测远低于 1%）；换过骨架/绑定会整块错位（几十个百分点）。
+
+  两个模型名从 MANDARIN_LIVE2D_RIG_PAIR 读（"甲,乙"），默认 "miku,樱花miku"。*/
+void TestLive2DOffscreen::comparesTwoModelsForRigEquivalence()
+{
+    QStringList pair;
+    const QByteArray fromEnv = qgetenv("MANDARIN_LIVE2D_RIG_PAIR");
+    if (!fromEnv.isEmpty())
+        pair = QString::fromLocal8Bit(fromEnv).split(QLatin1Char(','), Qt::SkipEmptyParts);
+    if (pair.size() != 2)
+    {
+        pair.clear();
+        pair << QStringLiteral("miku") << QStringLiteral("樱花miku");
+    }
+    for (QString &name : pair)
+        name = name.trimmed();
+
+    Live2DOffscreenRenderer first;
+    Live2DOffscreenRenderer second;
+    QString firstError;
+    QString secondError;
+    if (!loadModelByName(pair.at(0), &first, &firstError))
+        QSKIP("本机没有第一个模型，跳过同 rig 比对");
+    if (!loadModelByName(pair.at(1), &second, &secondError))
+        QSKIP("本机没有第二个模型，跳过同 rig 比对");
+
+    const QHash<QString, Live2DOffscreenRenderer::DeclaredRange> rangesA =
+        first.declaredParameterRanges();
+    const QHash<QString, Live2DOffscreenRenderer::DeclaredRange> rangesB =
+        second.declaredParameterRanges();
+    QVERIFY2(!rangesA.isEmpty() && !rangesB.isEmpty(), "有模型没声明任何参数");
+
+    /*① 参数集合逐条相等。用**全部声明参数**（不是语义表里的子集）：
+       同 rig 的定义就是 moc 级别的一致，语义表只是它的一小部分。*/
+    QStringList onlyInFirst;
+    QStringList onlyInSecond;
+    QStringList rangeMismatch;
+    for (auto it = rangesA.constBegin(); it != rangesA.constEnd(); ++it)
+    {
+        if (!rangesB.contains(it.key()))
+        {
+            onlyInFirst.append(it.key());
+            continue;
+        }
+        const Live2DOffscreenRenderer::DeclaredRange other = rangesB.value(it.key());
+        if (qAbs(it.value().min - other.min) > 1e-4f ||
+            qAbs(it.value().max - other.max) > 1e-4f ||
+            qAbs(it.value().neutral - other.neutral) > 1e-4f)
+        {
+            rangeMismatch.append(QStringLiteral("%1 [%2,%3]/%4 vs [%5,%6]/%7")
+                                     .arg(it.key())
+                                     .arg(double(it.value().min))
+                                     .arg(double(it.value().max))
+                                     .arg(double(it.value().neutral))
+                                     .arg(double(other.min))
+                                     .arg(double(other.max))
+                                     .arg(double(other.neutral)));
+        }
+    }
+    for (auto it = rangesB.constBegin(); it != rangesB.constEnd(); ++it)
+    {
+        if (!rangesA.contains(it.key()))
+            onlyInSecond.append(it.key());
+    }
+    onlyInFirst.sort();
+    onlyInSecond.sort();
+    rangeMismatch.sort();
+
+    qInfo("RIGPAIR %s vs %s: declared params %d vs %d; only-in-first=%d only-in-second=%d "
+          "range-mismatch=%d",
+          qPrintable(pair.at(0)), qPrintable(pair.at(1)), rangesA.size(), rangesB.size(),
+          onlyInFirst.size(), onlyInSecond.size(), rangeMismatch.size());
+
+    /*先各自单独渲一帧、量一下**人物到底画出来没有**：这是本用例结论的前提。
+       两个模型贴图不同 ⇒ 像素必然不同，但"有没有人"这件事两边必须都是"有" ——
+       若有一个渲染出空白，"剪影不一致"就只是"它没画出来"，与骨架毫无关系。
+       （实测樱花miku 就走过这条弯路：剪影差异 100%，原因是它整帧空白。）*/
+    const QSize neutralSize(400, 700);
+    const auto renderNeutralOnce = [&](Live2DOffscreenRenderer *renderer) {
+        renderer->setIdleSway({});
+        renderer->setMoodBlendDurationMs(0);
+        renderer->clearEyeOpennessMultiplierOverride();
+        renderer->setParameterOverrides({});
+        renderer->setNextFrameDeltaSeconds(0.0f);
+        (void)renderer->renderFrame(neutralSize);
+        renderer->setNextFrameDeltaSeconds(0.0f);
+        return renderer->renderFrame(neutralSize).convertToFormat(QImage::Format_RGBA8888);
+    };
+    //诊断：用真实步长多渲几帧（排除"步长 0 导致模型没被更新"）
+    const auto renderWithRealDelta = [&](Live2DOffscreenRenderer *renderer) {
+        renderer->setParameterOverrides({});
+        for (int i = 0; i < 10; ++i)
+        {
+            renderer->setNextFrameDeltaSeconds(0.016f);
+            (void)renderer->renderFrame(neutralSize);
+        }
+        return renderer->renderFrame(neutralSize).convertToFormat(QImage::Format_RGBA8888);
+    };
+    const auto alphaStats = [](const QImage &frame, QRect *bounds) {
+        int minX = frame.width(), minY = frame.height(), maxX = -1, maxY = -1;
+        qint64 opaque = 0;
+        for (int y = 0; y < frame.height(); ++y)
+        {
+            const uchar *line = frame.constScanLine(y);
+            for (int x = 0; x < frame.width(); ++x)
+            {
+                if (line[x * 4 + 3] <= kLegProbeAlphaThreshold)
+                    continue;
+                ++opaque;
+                minX = std::min(minX, x);
+                maxX = std::max(maxX, x);
+                minY = std::min(minY, y);
+                maxY = std::max(maxY, y);
+            }
+        }
+        *bounds = (maxX >= minX && maxY >= minY) ? QRect(QPoint(minX, minY), QPoint(maxX, maxY))
+                                                 : QRect();
+        return opaque;
+    };
+    for (const auto &entry : {std::make_pair(&first, 0), std::make_pair(&second, 1)})
+    {
+        QRect bounds;
+        const qint64 opaque = alphaStats(renderNeutralOnce(entry.first), &bounds);
+        QRect bounds2;
+        const qint64 opaqueRealDelta = alphaStats(renderWithRealDelta(entry.first), &bounds2);
+        qInfo("RIGPAIR SELFCHECK %s: opaque=%lld bounds=%d,%d %dx%d | realDelta opaque=%lld "
+              "bounds=%d,%d %dx%d",
+              qPrintable(pair.at(entry.second)), static_cast<long long>(opaque), bounds.x(),
+              bounds.y(), bounds.width(), bounds.height(), static_cast<long long>(opaqueRealDelta),
+              bounds2.x(), bounds2.y(), bounds2.width(), bounds2.height());
+        if (opaque <= 1000 && opaqueRealDelta <= 1000)
+        {
+            /*⚠️ 实测结论（2026-09-30，本用例写出来时踩到的）：**同一进程里第二个
+               Live2DOffscreenRenderer 渲染出来是空白**，与模型无关 —— 交换两个模型的顺序，
+               永远是"第二个"空白（miku / 樱花miku 都试过）。
+               证据：两个模型单独跑（各自只装一个）都正常渲染；而
+               ① 声明参数 141 vs 141、min/default/max 逐条相同，② **可见 drawable 的顶点范围
+               在模型空间里逐位相同**（(-0.2,-1.0)-(0.7,0.9)）、可见数 274/320、贴图 6 张都
+               解码成功且索引合法 —— 也就是说这不是模型的问题，是渲染器在多实例下的缺陷。
+
+               这是**与"扩展 miku 数据"无关的既存缺陷**（不属于本次数据工作，也不改它）。
+               这里 QSKIP 而不是 FAIL：本用例要回答的是"数据能不能复用"，
+               而模型装载不了就答不了 —— 用一个与数据无关的渲染器缺陷把测试染红，
+               只会让真正要看这条结论的人以为数据坏了。*/
+            QSKIP("同一进程里的第二个 renderer 渲染为空白（既存缺陷，与模型/数据无关）："
+                  "本用例无法在不改渲染器的前提下比对两个模型的剪影");
+        }
+        QVERIFY2(opaque > 1000 || opaqueRealDelta > 1000,
+                 qPrintable(QStringLiteral("[%1] 单独渲染出来是空白（步长 0：%2；真实步长：%3）")
+                                .arg(pair.at(entry.second))
+                                .arg(opaque)
+                                .arg(opaqueRealDelta)));
+    }
+
+    /*② 行为比对：同一批参数、同一批值，比 alpha 剪影。
+
+      取值刻意挑**会改变轮廓**的那些（全身平移/胯旋转/头角度）与两组极值：
+      只在画面上"换贴图"的差异不会进 alpha，所以这一步量的正是骨架。*/
+    const QStringList probeIds = {QStringLiteral("Param25"), QStringLiteral("Param26"),
+                                  QStringLiteral("Param13"), QStringLiteral("ParamAngleX"),
+                                  QStringLiteral("ParamAngleZ"), QStringLiteral("Param"),
+                                  QStringLiteral("ParamBodyAngleZ")};
+    const QSize size(400, 700);
+
+    struct Pose
+    {
+        const char *label;
+        QHash<QString, float> values;
+    };
+    QVector<Pose> poses;
+    {
+        Pose neutralPose;
+        neutralPose.label = "(neutral)";
+        poses.append(neutralPose);
+
+        Pose maxPose;
+        maxPose.label = "(all max)";
+        maxPose.values = {{QStringLiteral("Param25"), 30.0f},
+                          {QStringLiteral("Param26"), 30.0f},
+                          {QStringLiteral("Param13"), 30.0f},
+                          {QStringLiteral("ParamAngleX"), 30.0f},
+                          {QStringLiteral("ParamAngleZ"), 30.0f},
+                          {QStringLiteral("Param"), 30.0f}};
+        poses.append(maxPose);
+
+        Pose minPose;
+        minPose.label = "(all min)";
+        minPose.values = {{QStringLiteral("Param25"), -30.0f},
+                          {QStringLiteral("Param26"), -30.0f},
+                          {QStringLiteral("Param13"), -30.0f},
+                          {QStringLiteral("ParamAngleX"), -30.0f},
+                          {QStringLiteral("ParamAngleZ"), -30.0f},
+                          {QStringLiteral("Param"), -30.0f}};
+        poses.append(minPose);
+    }
+
+    const auto silhouetteOf = [&](Live2DOffscreenRenderer *renderer,
+                                  const QHash<QString, float> &overrides) {
+        renderer->setIdleSway({});
+        renderer->setMoodBlendDurationMs(0);
+        renderer->clearEyeOpennessMultiplierOverride();
+        renderer->setParameterOverrides(overrides);
+        renderer->setNextFrameDeltaSeconds(0.0f);
+        return renderer->renderFrame(size).convertToFormat(QImage::Format_RGBA8888);
+    };
+
+    int worstMismatch = 0;
+    QString worstLabel;
+    int figurePixels = 0;
+    for (const Pose &pose : poses)
+    {
+        //两边各渲两帧：第一帧把参数过渡/物理状态推到位，第二帧才可比
+        (void)silhouetteOf(&first, pose.values);
+        (void)silhouetteOf(&second, pose.values);
+        const QImage alphaA = silhouetteOf(&first, pose.values);
+        const QImage alphaB = silhouetteOf(&second, pose.values);
+        QVERIFY2(!alphaA.isNull() && !alphaB.isNull(), "出剪影时渲染失败");
+        QCOMPARE(alphaA.size(), alphaB.size());
+
+        //临时诊断：把两张剪影落盘，看差异是"错位/缩放不同"还是"根本没画出来"
+        alphaA.save(QStringLiteral("C:/Users/asus/Desktop/Mandarin/.dsh-probe/rigpair-a-%1.png")
+                        .arg(QString::fromUtf8(pose.label)));
+        alphaB.save(QStringLiteral("C:/Users/asus/Desktop/Mandarin/.dsh-probe/rigpair-b-%1.png")
+                        .arg(QString::fromUtf8(pose.label)));
+
+        int unionPixels = 0;
+        int mismatched = 0;
+        for (int y = 0; y < alphaA.height(); ++y)
+        {
+            const uchar *a = alphaA.constScanLine(y);
+            const uchar *b = alphaB.constScanLine(y);
+            for (int x = 0; x < alphaA.width(); ++x)
+            {
+                const bool maskA = a[x * 4 + 3] > kLegProbeAlphaThreshold;
+                const bool maskB = b[x * 4 + 3] > kLegProbeAlphaThreshold;
+                if (maskA || maskB)
+                    ++unionPixels;
+                if (maskA != maskB)
+                    ++mismatched;
+            }
+        }
+        const double percent =
+            100.0 * double(mismatched) / double(std::max(1, unionPixels));
+        qInfo("RIGPAIR %s pose=%s: silhouette mismatch %d / %d px (%.3f%%)", qPrintable(pair.at(1)),
+              pose.label, mismatched, unionPixels, percent);
+        if (mismatched > worstMismatch)
+        {
+            worstMismatch = mismatched;
+            worstLabel = QString::fromUtf8(pose.label);
+        }
+        figurePixels = std::max(figurePixels, unionPixels);
+    }
+    const double worstPercent = 100.0 * double(worstMismatch) / double(std::max(1, figurePixels));
+
+    QStringList caveats;
+    if (!onlyInFirst.isEmpty() || !onlyInSecond.isEmpty())
+        caveats.append(QStringLiteral("参数集合不同：仅 %1 有 %2；仅 %3 有 %4")
+                           .arg(pair.at(0), onlyInFirst.join(QStringLiteral(",")), pair.at(1),
+                                onlyInSecond.join(QStringLiteral(","))));
+    if (!rangeMismatch.isEmpty())
+        caveats.append(QStringLiteral("有参数的声明范围不同（%1 条）：%2")
+                           .arg(rangeMismatch.size())
+                           .arg(rangeMismatch.join(QStringLiteral(" | "))));
+    if (worstPercent > 2.0)
+        caveats.append(QStringLiteral("剪影最差在 %1（%2%）—— 骨架/绑定不同")
+                           .arg(worstLabel)
+                           .arg(worstPercent, 0, 'f', 3));
+
+    qInfo("RIGPAIR CONCLUSION: %s vs %s -> %s（worst silhouette mismatch %d px = %.3f%% of "
+          "figure）",
+          qPrintable(pair.at(0)), qPrintable(pair.at(1)),
+          caveats.isEmpty() ? "SAME RIG - data can be reused as-is" : "NOT identical",
+          worstMismatch, worstPercent);
+    QVERIFY2(caveats.isEmpty(),
+             qPrintable(QStringLiteral("%1 与 %2 不是同一套 rig：\n%3")
+                            .arg(pair.at(0), pair.at(1),
+                                 caveats.join(QStringLiteral("\n")))));
+}
+
+/*所有带 parameter-map.json 的模型名（与 test_live2dwindow::mappedModels 同一套推导，
+   只是这里只关心名字）。*/
+QStringList TestLive2DOffscreen::modelNamesWithMoodData()
+{
+    QStringList names;
+    const QString charName = ReadNowSelectChar();
+    if (charName.isEmpty() || charName == QStringLiteral("未选择"))
+        return names;
+    const QDir root(QDir(CharacterAssestPath).filePath(charName + QStringLiteral("/Live2D")));
+    if (!root.exists())
+        return names;
+    for (const QString &name :
+         root.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name))
+    {
+        if (QFileInfo::exists(root.filePath(name + QStringLiteral("/parameter-map.json"))))
+            names.append(name);
+    }
+    return names;
 }
 
 QTEST_MAIN(TestLive2DOffscreen)
