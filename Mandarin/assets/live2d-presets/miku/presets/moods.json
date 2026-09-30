@@ -3,7 +3,7 @@
     "_status": "⚠️ **未校准的初稿**（由 AI 按 miku 自己的语义与声明范围写出，2026-09-30）。数值没有经过任何目视校准 —— 校准方式：跑 test_live2dwindow 的 rendersMoodArchetypeCalibrationSheet()，它会给每个模型出 14 张固定区域的**脸部裁切图**（build2/tests/live2d-probe/mood-miku-<原型>.png）外加一张跨模型总表，人工判读后回来改本文件。",
     "_differsFromAtri": [
         "【嘴形可以笑】atri 的 ParamMouthForm 声明范围是 [-1, 0]、默认 -0.5（正数会被 Core 夹掉），所以那份数据里 happy/excited 只能写 0.0 并把『笑』全押在 eye*Smile 上。miku 的 ParamMouthForm 是**完整双向 [-1, +1]、默认 0.0** —— 正数真的会把嘴角拉起来，所以这里 happy/excited 直接给正值，eye*Smile 只作辅助。",
-        "【多了全身轴】miku 有 atri 没有的 wholeBodyX / wholeBodyY / upperBodyZ / lowerBodyZ / wholeBodyShiftX（parameter-map.json 里有说明）。『吃惊整个人往后一仰』『失落整个塌下去』这类表达在这一份里靠它们做，atri 那份做不到 —— 这是本份数据与 atri 数值不能互相抄的根本原因。",
+        "【多了全身轴】miku 有 atri 没有的 wholeBodyX / wholeBodyY / upperBodyZ / lowerBodyZ（parameter-map.json 里有说明）。『吃惊整个人往后一仰』『失落整个塌下去』这类表达在这一份里靠它们做，atri 那份做不到 —— 这是本份数据与 atri 数值不能互相抄的根本原因。⚠️ 曾经还写过 wholeBodyShiftX，但 parameter-map.json **刻意没有收录它**（腿部探针实测推到满量程零像素变化），于是装载器每次都打一条『parameter-map has no such semantic name』告警并忽略它 —— 现已从本文件里删干净，别再写回来。",
         "【幅度用了全身轴但都很小】全身平移/旋转只给 ±2~±6（声明范围 ±30）：它们动的是**整个人**，幅度一大就从『表情』变成『位移』，用户会以为桌宠在自己跑。"
     ],
     "_calibrationNotes": [
@@ -65,8 +65,7 @@
             "browLY": -0.35, "browRY": 0.1,
             "mouthForm": -0.45,
             "gazeX": -0.5, "gazeY": 0.15,
-            "headY": 3.0, "headZ": -5.0,
-            "wholeBodyShiftX": -2.0
+            "headY": 3.0, "headZ": -5.0
         },
 
         "sad": {
@@ -102,7 +101,7 @@
             "browLY": 0.3, "browRY": 0.1,
             "gazeX": 0.5,
             "headY": 2.0, "headZ": -8.0,
-            "upperBodyZ": -4.0, "wholeBodyShiftX": 2.0
+            "upperBodyZ": -4.0
         },
 
         "embarrassed": {
@@ -112,7 +111,7 @@
             "browLY": 0.25, "browRY": -0.15,
             "mouthForm": -0.3,
             "headY": -6.0, "headZ": 3.0,
-            "wholeBodyY": -2.0, "wholeBodyShiftX": -2.0
+            "wholeBodyY": -2.0
         },
 
         "worried": {

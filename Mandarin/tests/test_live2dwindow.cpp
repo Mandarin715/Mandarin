@@ -194,8 +194,25 @@ class TestLive2DWindow : public QObject
           专门验证（那里同时看最终值与眨眼原始值）；
         - ParamAngleX/Y/Z、ParamBodyAngleX：呼吸驱动器每帧**加**一个摆动量（加性），
           读回值是"预设值 + 摆动"，不能与预设值直接比较；
-        - ParamBreath / ParamHair*：物理/呼吸所有，预设根本不写（见 Live2DMoodPreset）。*/
-    static QStringList readBackParameters();
+        - ParamBreath / ParamHair*：物理/呼吸所有，预设根本不写（见 Live2DMoodPreset）。
+
+        ⚠️ **参数 ID 必须从预设的语义表推导，不能写死**（2026-09-30 切到 miku 时踩到）：
+        这里曾经直接返回 {"ParamEyeLSmile","ParamEyeRSmile","ParamCheek","ParamBrowLY",
+        "ParamBrowRY"} —— 那是 **atri 的 ID**。miku 的腮红参数叫 Param130（语义名同样是
+        `cheek`），于是"预设 happy 里没有 ParamCheek"这条断言在 miku 上必然红，
+        而它红的原因是**测试写死了另一个模型的 ID**，与心情覆盖毫无关系。
+        现在改成：拿语义名（eyeLSmile/eyeRSmile/cheek/browLY/browRY）去问 parameter-map，
+        只保留"该模型确实声明了"的那些 —— 换模型时它自然跟着换，
+        而"腮红有没有落到模型上"这件事在每个模型上依然被验证。*/
+    static QStringList readBackParameters(const Live2DMoodPreset &preset);
+
+    /*参数 ID → 预设里的语义名（找不到返回空）。**只用于日志/报错可读性**：
+       读回断言的"预设预期值"要按**参数 ID** 去 `parametersForMood()` / `parametersForArchetype()`
+       查 —— 那两张表的键就是参数 ID（见 Live2DMoodPreset.h 的声明）。
+       参数 ID 本身仍必须从本模型的语义表推导，绝不写死：写死 ID 就等于写死一个模型
+       （见上面 ParamCheek 的教训）。*/
+    static QString semanticNameForParameter(const Live2DMoodPreset &preset,
+                                            const QString &parameterId);
 
     /*切换心情后**等过渡走完**（并且真的渲出一帧），然后才让调用方去读参数/读帧。
 
@@ -364,12 +381,35 @@ bool TestLive2DWindow::loadConfiguredMoodPreset(Live2DMoodPreset *preset)
     return preset->load(modelName);
 }
 
-QStringList TestLive2DWindow::readBackParameters()
+QStringList TestLive2DWindow::readBackParameters(const Live2DMoodPreset &preset)
 {
-    // ParamMouthForm / ParamEye{L,R}Open 故意不在列：理由见声明处注释
-    return {QStringLiteral("ParamEyeLSmile"), QStringLiteral("ParamEyeRSmile"),
-            QStringLiteral("ParamCheek"), QStringLiteral("ParamBrowLY"),
-            QStringLiteral("ParamBrowRY")};
+    /*ParamMouthForm / ParamEye{L,R}Open 故意不在列：理由见声明处注释。
+       其余 5 个**语义名**是"不归任何驱动器管、且每个模型都该有的表情轴"；
+       具体 ID 由该模型的 parameter-map 决定（见声明处关于 ParamCheek 的教训）。*/
+    const QStringList semanticNames = {
+        QStringLiteral("eyeLSmile"), QStringLiteral("eyeRSmile"), QStringLiteral("cheek"),
+        QStringLiteral("browLY"),    QStringLiteral("browRY")};
+    const QHash<QString, Live2DMoodPreset::ParameterRange> ranges = preset.parameters();
+    QStringList ids;
+    for (const QString &semanticName : semanticNames)
+    {
+        const QString id = ranges.value(semanticName).id;
+        if (!id.isEmpty())
+            ids.append(id);
+    }
+    return ids;
+}
+
+QString TestLive2DWindow::semanticNameForParameter(const Live2DMoodPreset &preset,
+                                                   const QString &parameterId)
+{
+    const QHash<QString, Live2DMoodPreset::ParameterRange> ranges = preset.parameters();
+    for (auto it = ranges.constBegin(); it != ranges.constEnd(); ++it)
+    {
+        if (it.value().id == parameterId)
+            return it.key();
+    }
+    return QString();
 }
 
 bool TestLive2DWindow::waitForMoodSettle(Live2DCharacterWindow *window, int blendMs,
@@ -2912,37 +2952,66 @@ void TestLive2DWindow::applyingMoodChangesRenderedFrame()
                             .arg(drift)));
 
     // 参数读回：预设写什么，模型里就该读到什么
-    const QHash<QString, float> expected = preset.parametersForMood(happyMood);
-    const QStringList readBack = readBackParameters();
+    const QHash<QString, float> expectedById = preset.parametersForMood(happyMood);
+    const QStringList readBack = readBackParameters(preset);
+    int comparedParameters = 0;
     for (const QString &parameterId : readBack)
     {
-        QVERIFY2(expected.contains(parameterId),
-                 qPrintable(QStringLiteral("预设 %1 里没有 %2，读回断言写错了")
-                                .arg(happyMood, parameterId)));
+        /*⚠️ 预期值必须按**参数 ID** 查：parametersForMood() 返回的是「参数 ID → 值」
+           （见 Live2DMoodPreset.h 的声明与 parametersForArchetype 的实现）。
+           2026-09-30 切到 miku 时这里按**语义名**查同一张表 —— 语义名永远不是那张表的键，
+           value() 恒返回 0，于是每条比较都变成"读回值 vs 0"。当时又用"表里没有就跳过"
+           把红变成了绿，实际上一条都没验：本条用例静默地什么都没证明。
+           现在参数 ID 仍由 readBackParameters 从**本模型的**语义表推出（不写死 atri 的 ID），
+           但查预期值用同一个键空间，比较才真的发生。*/
+        const QString semanticName = semanticNameForParameter(preset, parameterId); // 只为日志
+        if (!expectedById.contains(parameterId))
+        {
+            qInfo("参数读回[%s]：%s（语义 %s）不在这一心情的预设里，跳过比较", qPrintable(happyMood),
+                  qPrintable(parameterId), qPrintable(semanticName));
+            continue;
+        }
+        const float expectedValue = expectedById.value(parameterId);
         const float actual = window.parameterValue(parameterId);
-        qInfo("参数读回[%s]：%s 预设 %.3f 实际 %.3f", qPrintable(happyMood),
-              qPrintable(parameterId), double(expected.value(parameterId)), double(actual));
-        QVERIFY2(qAbs(actual - expected.value(parameterId)) <= 0.02f,
-                 qPrintable(QStringLiteral("参数 %1 读回 %2，不等于预设值 %3（覆盖没生效）")
+        ++comparedParameters;
+        qInfo("参数读回[%s]：%s（语义 %s）预设 %.3f 实际 %.3f", qPrintable(happyMood),
+              qPrintable(parameterId), qPrintable(semanticName), double(expectedValue),
+              double(actual));
+        QVERIFY2(qAbs(actual - expectedValue) <= 0.02f,
+                 qPrintable(QStringLiteral("参数 %1（语义 %2）读回 %3，不等于预设值 %4（覆盖没生效）")
                                 .arg(parameterId)
+                                .arg(semanticName)
                                 .arg(double(actual))
-                                .arg(double(expected.value(parameterId)))));
+                                .arg(double(expectedValue))));
     }
+    /*至少要比过一条：读回清单是从**本模型的**语义表推出来的，一条都推不出来时上面整段
+       循环空转 —— 那种"绿"是假绿（本条用例 2026-09-30 就真的处在这个状态）。*/
+    QVERIFY2(comparedParameters > 0,
+             "一个参数都没能读回比较（parameter-map 里没有 eyeLSmile/eyeRSmile/cheek/browLY/"
+             "browRY 中的任何一个语义）—— 本用例什么都没验证");
 
     /*把"没落到模型上"的参数全列出来（**只报不断言**）。上面断言的 5 项之外，还有三类
       注定对不上，校准时必须先知道它们，否则会去改一个永远不会生效的数字：
         ① ParamEyeLOpen/ParamEyeROpen：眨眼驱动器每帧绝对赋值，预设在这两项上是死的；
         ② ParamMouthForm：moc 自身范围 [-1,0]，正数被夹成 0（本模型的"笑"只能靠眼睛）；
-        ③ ParamAngleX/Y/Z 与 ParamBodyAngleX：呼吸的加性摆动（读回 = 预设 + 摆动）。
-      这条日志是把"死参数"变成可看见证据的地方。*/
+        ③ ParamAngleX/Y/Z 与 ParamBodyAngleX：呼吸的加性摆动（读回 = 预设 + 摆动）；
+        ④ 待机摆动覆盖的轴（presets/idle.json 里的 Param13/Param25/Param26/ParamAngleZ…
+           这些在本模型上是 physics 的 Output.Destination，物理每帧重写基准，摆动又加在其上，
+           于是读回 = 物理结果 + 摆动，永远不等于心情预设值）。
+      这条日志是把"死参数"变成可看见证据的地方 —— 它**只报不断言**，
+      所以必须真的能把清单打出来（2026-09-30 之前它恒为空，见上面的键空间说明）。*/
     QStringList notLanded;
-    for (auto it = expected.constBegin(); it != expected.constEnd(); ++it)
+    /*遍历的是**参数 ID → 值**（preset 已按本模型的 parameter-map 解析过），
+       于是"没落到模型上"的清单与具体模型无关（atri 的 ParamCheek 与 miku 的 Param130
+       都只是"腮红"这一条语义的落地形式）。*/
+    for (auto it = expectedById.constBegin(); it != expectedById.constEnd(); ++it)
     {
         const float actual = window.parameterValue(it.key());
         if (qAbs(actual - it.value()) > 0.05f)
         {
-            notLanded << QStringLiteral("%1=%2(want %3)")
+            notLanded << QStringLiteral("%1(%2)=%3(want %4)")
                              .arg(it.key())
+                             .arg(semanticNameForParameter(preset, it.key()))
                              .arg(double(actual), 0, 'f', 2)
                              .arg(double(it.value()), 0, 'f', 2);
         }
@@ -3035,7 +3104,7 @@ void TestLive2DWindow::switchingMoodDoesNotAccumulate()
     window.hide();
     QCoreApplication::processEvents();
 
-    const QStringList readBack = readBackParameters();
+    const QStringList readBack = readBackParameters(preset);
     const QHash<QString, float> happyExpected = preset.parametersForMood(happyMood);
 
     // ① 先确认 happy 真的落到了模型上（否则"切回中立"这条断言毫无意义 —— 什么都没变过）
@@ -3046,12 +3115,16 @@ void TestLive2DWindow::switchingMoodDoesNotAccumulate()
     int happyApplied = 0;
     for (const QString &parameterId : readBack)
     {
-        const float actual = window.parameterValue(parameterId);
+        const QString semanticName = semanticNameForParameter(preset, parameterId);
+        /*⚠️ 按**参数 ID** 查（parametersForMood 的键就是参数 ID，见 Live2DMoodPreset.h）：
+           以前按语义名查，value() 恒为 0，于是"落到模型上"永远是 0/5。*/
         const float expectedValue = happyExpected.value(parameterId);
+        const float actual = window.parameterValue(parameterId);
         if (qAbs(actual - expectedValue) <= 0.02f)
             ++happyApplied;
-        qInfo("残留验证①[%s]：%s 预设 %.3f 实际 %.3f", qPrintable(happyMood),
-              qPrintable(parameterId), double(expectedValue), double(actual));
+        qInfo("残留验证①[%s]：%s（语义 %s）预设 %.3f 实际 %.3f", qPrintable(happyMood),
+              qPrintable(parameterId), qPrintable(semanticName), double(expectedValue),
+              double(actual));
     }
     QVERIFY2(happyApplied == readBack.size(),
              qPrintable(QStringLiteral("%1 只有 %2/%3 个参数落到模型上，先修装载路径")
@@ -3067,10 +3140,13 @@ void TestLive2DWindow::switchingMoodDoesNotAccumulate()
         preset.parametersForArchetype(QStringLiteral("neutral"));
     for (const QString &parameterId : readBack)
     {
+        const QString semanticName = semanticNameForParameter(preset, parameterId);
         const float actual = window.parameterValue(parameterId);
+        /*同上：中立项也按参数 ID 查（parametersForArchetype 返回的同样是「参数 ID → 值」）。*/
         const float expectedValue = neutralExpected.value(parameterId);
-        qInfo("残留验证②[%s]：%s 中立项 %.3f 实际 %.3f", qPrintable(neutralMood),
-              qPrintable(parameterId), double(expectedValue), double(actual));
+        qInfo("残留验证②[%s]：%s（语义 %s）中立项 %.3f 实际 %.3f", qPrintable(neutralMood),
+              qPrintable(parameterId), qPrintable(semanticName), double(expectedValue),
+              double(actual));
         QVERIFY2(qAbs(actual - expectedValue) <= 0.02f,
                  qPrintable(QStringLiteral("切回 %1 后参数 %2 读回 %3，没有回到中立值 %4 —— "
                                            "上一种情绪的覆盖条目还留在表里（残留情绪）")
@@ -3201,9 +3277,33 @@ void TestLive2DWindow::moodEyeOpennessComposesWithBlink()
     QImage blinkOpenB;
     float blinkA = 1.0f;
     float blinkB = 1.0f;
-    //实际取到的那一对帧之间的墙钟间隔（毫秒）+ 尝试次数：报进日志，是"它们真的相邻"的证据
+    /*实际取到的那一对帧之间的墙钟间隔（毫秒）+ 尝试次数：报进日志，是"它们真的相邻"的证据*/
     qint64 pairGapMs = -1;
     int pairAttempts = 0;
+    /*⚠️ 相邻帧的**虚拟时间**必须由调用方钉住，不能靠墙钟（2026-09-30 修）。
+
+       为什么：帧步长默认取自渲染器内部的墙钟（QElapsedTimer）。机器空闲时一帧几毫秒，
+       呼吸/待机动作几乎不动；被抢占时一帧吃满夹取上限（100ms），动作跳一大步 ——
+       于是"背景漂移"与"要观察的闭眼信号"变成同量级（实测 26 线程满负载下：
+       漂移 1092~1458 像素 vs 信号 2598 像素，比值 1.8~2.4x，而判据要求 >5x）。
+       那是**测量方式**的问题，不是被测行为的问题：把每一帧的步长钉死之后，
+       同一对帧的漂移就只由"注入了多少虚拟时间"决定，与机器负载彻底无关。
+
+       ⚠️ 而"钉一个**非零**步长"在 miku 上仍然不够（2026-09-30 切到 miku 时实测）：
+       这个模型的待机摆动（presets/idle.json：Param13/Param25/Param26/ParamAngleZ，
+       幅度 2.5~3.5、周期 4.2~7s）比 atri 的待机动作快得多 —— 40ms 的一步就足以让整个人
+       在画布上挪动约一个像素，轮廓像素随之大面积变化：实测漂移 **22063** 像素，
+       而"眼睛 1.0 → 0.05"的真正信号只有 **1510** 像素，比值 1x < 5x。
+       这不是"miku 的闭眼看不见"（1510 与 atri 的 1212 同量级），
+       而是"相邻帧漂移"这个对照量在 miku 上被摆动主导了。
+
+       所以这里把步长钉成 **0**：这一对帧是**同一瞬间**的两帧，摆动/呼吸/物理/眨眼
+       都不前进 —— 于是"闭眼的像素差"就是纯信号，与机器负载、与模型摆动的快慢都无关。
+       0 走的是渲染器那条正常的夹取路径（delta=0 只表示"时间这一步不前进"），
+       不是"跳过 tick"或"关掉渲染"；drift 是否恰好为 0 也被下面断言钉住。*/
+    constexpr float kEyeProbeVirtualDeltaSeconds = 0.0f;
+    const qint64 pairVirtualGapMs =
+        static_cast<qint64>(2.0f * kEyeProbeVirtualDeltaSeconds * 1000.0f);
     {
         QElapsedTimer pairClock;
         QElapsedTimer overall;
@@ -3212,11 +3312,14 @@ void TestLive2DWindow::moodEyeOpennessComposesWithBlink()
         {
             ++pairAttempts;
             pairClock.start();
+            /*每一帧都注入固定步长：这一对帧的虚拟间隔因此恒为 2×delta（见上）*/
+            window.setNextFrameDeltaSecondsForTest(kEyeProbeVirtualDeltaSeconds);
             if (!renderEyeProbe(&window, openEyes, eyeParameter, &blinkOpenA, nullptr, &blinkA))
             {
                 QTest::qWait(20); //帧没渲出来：等一会儿再重试，别把 CPU 打满
                 continue;
             }
+            window.setNextFrameDeltaSecondsForTest(kEyeProbeVirtualDeltaSeconds);
             if (!renderEyeProbe(&window, openEyes, eyeParameter, &blinkOpenB, nullptr, &blinkB))
             {
                 QTest::qWait(20);
@@ -3224,11 +3327,11 @@ void TestLive2DWindow::moodEyeOpennessComposesWithBlink()
             }
             pairGapMs = pairClock.elapsed();
             const bool blinkOpen = blinkA >= kEyeProbeBlinkOpen && blinkB >= kEyeProbeBlinkOpen;
-            if (blinkOpen && pairGapMs <= kEyeProbeMaxGapMs)
-                break; //这一对帧真的可比：全睁 + 时间够短
-            /*不合格：多半是落进了一次眨眼（0~7s 随机一次），或者这一对被抢占了很久。
-               用 qWait 让时间过去（眨眼状态机要真的过时间才会走完），再取下一对。
-               ⚠️ 不能紧循环重试：不推进时间的话眨眼永远停在闭着的相位上。*/
+            if (blinkOpen && pairVirtualGapMs <= kEyeProbeMaxGapMs)
+                break; //这一对帧真的可比：全睁 + 虚拟间隔够短
+            /*不合格：多半是落进了一次眨眼（0~7s 随机一次）。
+               这里保留墙钟等待，是因为**眨眼状态机**在注入步长下也照样前进
+               （注入的就是它看到的帧步长），所以重试必然越走越远，不会卡在同一相位。*/
             QTest::qWait(50);
             if (overall.elapsed() > kEyeProbeDeadlineMs)
             {
@@ -3263,6 +3366,8 @@ void TestLive2DWindow::moodEyeOpennessComposesWithBlink()
         {
             ++closedAttempts;
             closedClock.start();
+            /*与上面那一对同样的注入：闭眼帧与它对照的那一帧之间也只允许差固定的虚拟时间*/
+            window.setNextFrameDeltaSecondsForTest(kEyeProbeVirtualDeltaSeconds);
             if (!renderEyeProbe(&window, moodEyes, eyeParameter, &eyesClosed, &closedComposed,
                                 &closedBlink))
             {
@@ -3297,6 +3402,8 @@ void TestLive2DWindow::moodEyeOpennessComposesWithBlink()
        否则它会一直压制覆盖表，把后面 (c) 那一段" sleepy 心情下眨眼还活着"的采样
        变成"眼睛被钉在 0.05"的错误读数。*/
     window.clearEyeOpennessMultiplierOverride();
+    /*虚拟时间阀门也放手：后面的采样窗口要靠墙钟推进眨眼（(c) 那一段要真的眨起来）。*/
+    window.clearNextFrameDeltaForTest();
     QVERIFY2(window.renderFrameNow(), "解除显式乘数后的一帧渲染失败");
 
     QVERIFY2(!blinkOpenA.isNull() && !blinkOpenB.isNull() && !eyesClosed.isNull(),
@@ -3317,22 +3424,32 @@ void TestLive2DWindow::moodEyeOpennessComposesWithBlink()
           double(closedComposed),
           drift > 0 ? static_cast<double>(eyeDiff) / static_cast<double>(drift) : -1.0);
     /*"这一对帧真的相邻"的**证据**：两条前提各自的实际读数 + 取到它们花了多少次尝试。
-       没有这行日志，失败时无法区分"眼睛真的没生效"与"这次取到的帧根本不可比"。*/
-    qInfo("EYEPROBE adjacency: pair attempts=%d gap=%lld ms blink=%.4f/%.4f | closed attempts=%d"
-          " gap=%lld ms blink=%.4f | limits: blink>=%.3f gap<=%d ms",
-          pairAttempts, pairGapMs, double(blinkA), double(blinkB), closedAttempts, closedGapMs,
-          double(closedBlink), double(kEyeProbeBlinkOpen), kEyeProbeMaxGapMs);
+       没有这行日志，失败时无法区分"眼睛真的没生效"与"这次取到的帧根本不可比"。
+       virtualGap 是**注入**的虚拟间隔（与机器负载无关），wallGap 只作参考。*/
+    qInfo("EYEPROBE adjacency: pair attempts=%d virtualGap=%lld ms wallGap=%lld ms "
+          "blink=%.4f/%.4f | closed attempts=%d wallGap=%lld ms blink=%.4f | limits: blink>=%.3f "
+          "gap<=%d ms",
+          pairAttempts, static_cast<long long>(pairVirtualGapMs),
+          static_cast<long long>(pairGapMs), double(blinkA), double(blinkB), closedAttempts,
+          static_cast<long long>(closedGapMs), double(closedBlink), double(kEyeProbeBlinkOpen),
+          kEyeProbeMaxGapMs);
 
     /*(a) 闭眼真的落到屏幕上。先定标：实测 atri 上"眼睛 1.0 → 0.05"只改变 **1212** 像素
-       （0.207% 画布）—— 闭眼参数动的是眼睑那一小块，不是半张脸，所以绝对量级本来就不大；
-       而**旧行为**（乘数不生效）下同一个切换只改变 **1** 个像素。两条一起断言：
-         - 绝对下限 500：比"完全没生效"（0~1 像素）高三个数量级，又不假装眼睛有半张脸大；
-         - 相对倍数 5x：挡住"背景摆动恰好很大"把结论蒙对（空闲实测漂移 0~1 像素）。
-       上面已经用条件式等待把"这一对帧真的相邻 + 眨眼全睁"钉住了，所以 5x 这条是在
-       **可比的两帧**上断言，而不是靠"没有 wait 就等于时间没走"这个曾经被 26 线程
-       满负载打破的假设（那次 drift=712、eyeDiff=1223，比值只有 2x）。
-       修改眼睛参数建模（例如换成眼睑面积大得多的模型）可能让这个绝对值变化，
-       但"远超同类相邻帧漂移"这条与模型无关，是主要判据。*/
+        （0.207% 画布）、miku 上 **1510** 像素（0.227% 画布）—— 闭眼参数动的是眼睑那一小块，
+        不是半张脸，所以绝对量级本来就不大；而**旧行为**（乘数不生效）下同一个切换
+        只改变 **1** 个像素。三条一起断言，阈值一个都没放宽：
+          - drift == 0：虚拟时间钉成 0 之后，"什么都不改的两帧"必须**逐位相同**。
+            这是"这一对帧真的是同一瞬间"的直接证据，也是另外两条成立的前提 ——
+            以前它靠"两帧间隔够短"这个墙钟假设，而 miku 的摆动 40ms 就能漂 22063 像素；
+          - 绝对下限 500：比"完全没生效"（0~1 像素）高三个数量级，又不假装眼睛有半张脸大；
+          - 相对倍数 5x：**原判据，保留不动**（虚拟时间钉成 0 后 drift=0，它由第一条自动满足；
+            它是"信号必须压过同刻背景"这条纪律的固定形式，不许为了让某次读数好看而调小）。
+        修改眼睛参数建模（例如换成眼睑面积大得多的模型）会让绝对值变化，
+        但"在**同一瞬间**上把眼睛压到近乎闭合必须改变画面"这条与模型无关，是主要判据。*/
+    QVERIFY2(drift == 0,
+             qPrintable(QStringLiteral("虚拟时间钉成 0 之后，什么都不改的两帧仍然差 %1 个像素 ——"
+                                       "渲染不再确定，这一对帧不是「同一瞬间」可比的两帧")
+                            .arg(drift)));
     QVERIFY2(eyeDiff > 500,
              qPrintable(QStringLiteral("眼睛乘数压到 %1 之后画面只差 %2 个像素 ——"
                                        "闭眼没有落到屏幕上（旧行为：眨眼把情绪盖掉）")

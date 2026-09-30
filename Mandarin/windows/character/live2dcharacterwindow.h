@@ -79,6 +79,21 @@ class Live2DCharacterWindow : public CharacterWindowBase
     /*实际提交给渲染器的分辨率（逻辑尺寸 × 有效 dpr）*/
     QSize renderSize() const;
 
+    /***把**下一帧**的时间步长钉死（秒）——只生效一帧，走渲染器同一条夹取路径。
+
+       ⚠️ 这是给**测试**用的确定性阀门，不是生产路径（生产路径的探针也用它，
+       见 renderer.setNextFrameDeltaSeconds 的三条说明）。它存在的理由：
+
+       相邻帧对比（moodEyeOpennessComposesWithBlink）量的是"两帧之间背景动了多少"，
+       而帧步长默认取自**墙钟**：机器一被抢占，一帧就吃掉几十毫秒，呼吸/待机动作随之
+       跳一大步，于是"背景漂移"与"要观察的信号"变成同量级 —— 实测负载下漂移从 0~5 像素
+       涨到四位数，用例必然红，而那是测量方式的问题，不是被测行为的问题。
+       钉住步长之后，同一对帧的漂移只由"注入的 2×delta"决定，与被抢占与否无关。*/
+    void setNextFrameDeltaSecondsForTest(float seconds);
+
+    /*回到墙钟路径（并重置时间基准，免得"钉住的这一段"被算进解冻后的第一帧）。*/
+    void clearNextFrameDeltaForTest();
+
   public slots:
     /*按**心情名**应用情绪预设（基类契约：PNG 路径用同一个入口按名切换内容）。
       心情名 = 角色 Tachie/ 下 PNG 的文件名；经 moods.json 映射成一组参数覆盖值。

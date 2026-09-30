@@ -305,6 +305,50 @@ class Live2DOffscreenRenderer
 
     bool isLoaded() const;
 
+    /***诊断快照：把"GL 侧到底发生了什么"从渲染器里读出来。
+
+      为什么需要它（而不是只看渲染结果）：多个渲染器共处一个进程时，画面症状只有
+      一个"空白"，但它可能是上下文没切过去、FBO 不完整、贴图落在了别的上下文里，
+      或者着色器/离屏单例那类**进程级**状态被另一个实例改写。这些原因在像素上长得
+      一模一样，只有把每一层各自的标志读出来才能区分。所以这里把四件事一次性交出去：
+        - 上下文是否真的是**本实例的**（contextCurrent 与 contextId）；
+        - 本帧画到哪张 FBO 上、读回又从哪张读（frameBufferId / readBackFboId）；
+        - 贴图 ID 列表（上传到了哪个上下文，由 ID 与当前上下文对照判定）；
+        - 由框架着色器单例交出去的着色器程序（shaderProgramIds，前 4 个）。
+
+      **只用于诊断**，不参与渲染路径，运行时开销为零。*/
+    struct DebugState
+    {
+        unsigned long long contextId = 0;   // 本实例的 QOpenGLContext 指针（身份）
+        unsigned long long currentContextId = 0; // 调用时真正 current 的上下文
+        bool contextCurrent = false;        // 上两者是否一致
+        unsigned int frameBufferId = 0;     // 本帧真正绑定的那张 FBO（渲染目标）
+        unsigned int readBackFboId = 0;     // 读回时绑定着的 FBO
+        unsigned int colorBufferId = 0;     // 渲染目标的颜色附件贴图
+        QVector<unsigned int> textureIds;   // 模型贴图（上传时所在的上下文即创建它的上下文）
+        /*本帧真正用过的着色器程序名（去重，最多几条）与"它们在当前上下文里存不存在"。
+           为什么必须查 glIsProgram 而不是只看非零：GL 的程序名是**按上下文**命名的，
+           同一个数字在另一个上下文里可能完全不存在 —— 那正是"画不出来但不报错"的形态。*/
+        QVector<unsigned int> shaderProgramIds;
+        QVector<unsigned int> shaderProgramMissing; // 在当前上下文里**不存在**的程序名
+        QVector<unsigned int> textureMissing;       // 在当前上下文里**不存在**的贴图名
+        unsigned int frameBufferStatus = 0;         // glCheckFramebufferStatus 的原样返回值
+        bool targetValid = false;
+        /*"这一帧有没有真的发出去绘制"的逐 drawable 计数（见 .cpp 里 DrawDiagnostics 的说明）：
+           CPU 侧数据正常但 GPU 侧一条三角形都没画时，这两个数会在两个实例之间分道扬镳。*/
+        struct DrawDiagnostics
+        {
+            int drawableCount = 0;
+            int visibleCount = 0;
+            int visibleWithTexture = 0;
+            int visibleWithIndices = 0;
+            int unbindableTextureCount = 0;
+            int maskCount = 0;
+        };
+        DrawDiagnostics drawDiagnostics;
+    };
+    DebugState debugState() const;
+
   private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;

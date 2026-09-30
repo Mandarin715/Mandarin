@@ -824,6 +824,18 @@ QSize Live2DCharacterWindow::renderSize() const
     return m_scaledImg.isNull() ? QSize() : m_scaledImg.size();
 }
 
+/*见头文件：测试用的确定性阀门，直接把下一帧的步长转给渲染器
+   （仍然过渲染器自己的 kMaxFrameDeltaSeconds 夹取 —— 与生产路径同一把尺子）。*/
+void Live2DCharacterWindow::setNextFrameDeltaSecondsForTest(float seconds)
+{
+    m_renderer.setNextFrameDeltaSeconds(seconds);
+}
+
+void Live2DCharacterWindow::clearNextFrameDeltaForTest()
+{
+    m_renderer.clearNextFrameDelta();
+}
+
 /*公开的「立刻走一遍完整帧管线」：配置变更后强制重绘，也让测试能量真实全链路成本*/
 bool Live2DCharacterWindow::renderFrameNow()
 {

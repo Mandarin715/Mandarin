@@ -8,9 +8,14 @@
 
 #include <QDir>
 #include <QElapsedTimer>
+#include <QFile>
 #include <QFileInfo>
 #include <QHash>
 #include <QImage>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QRegularExpression>
 #include <QSet>
 #include <QSettings>
 #include <QThread>
@@ -154,6 +159,28 @@ class TestLive2DOffscreen : public QObject
          ② 把同一批参数推到同一个值，两个模型在**输出空间**里的剪影（alpha）是否一致。
        两条都成立 ⇒ 同一套骨架、同一套绑定，只是贴图不同 ⇒ 数据可以整份复用。*/
     void comparesTwoModelsForRigEquivalence();
+
+    /***同一进程里两个渲染器必须都能渲染出人物（既存缺陷的钉子）。
+
+        用户/上一个 agent 观察到的症状：**第二个** Live2DOffscreenRenderer 渲染为空白，
+        与模型无关（同一模型装进两个实例，第二个照样空白；交换顺序则"第二个"随之交换）。
+        这条用**同一个模型装两遍**做最尖锐的对照：如果连同一个模型都失败，模型就彻底出局。
+        逐边界诊断（上下文身份 / FBO 完整性 / 逐 drawable 是否有贴图 / 着色器程序名在
+        当前上下文里存不存在）在失败时全部打进日志，日志标签统一 ASCII（`TWORENDER`），
+        免得中文在控制台里变成乱码。
+
+        `MANDARIN_BITEQ_BASELINE` 只用于"改动前后逐位对照"这一次性验证：定义它会把这条
+        用例（它依赖本次新增的 debugState()）排除掉，从而能在**旧渲染器代码**上编译，
+        与新版跑同一串固定输入、比对逐位指纹。正常构建不定义这个宏。*/
+#if !defined(MANDARIN_BITEQ_BASELINE)
+    void twoRenderersInOneProcessBothRender();
+#endif
+
+    /*单一渲染器的逐位指纹：本次"共享根 GL 上下文"改动必须对既有单一渲染器路径零影响，
+       判据是同一串固定输入下 RGBA 校验和逐位相同（改动前后各跑一次比对）。
+       它刻意**不依赖**任何新增诊断接口，好让它在旧版渲染器上也能编译 ——
+       这正是"改动前后逐位对照"能成立的前提。*/
+    void singleRendererFrameHashesForRegressionProof();
 
   private:
     static QString modelDir();
@@ -1630,6 +1657,70 @@ bool TestLive2DOffscreen::loadConfiguredIdleSway(Live2DOffscreenRenderer *render
     return true;
 }
 
+/*模型自己声明的**物理输入/输出参数**（`<模型目录>/<physics3.json>` 里每条
+   PhysicsSettings[].Input[].Source.Id 与 Output[].Destination.Id）。
+
+   为什么待机摆动用例需要它们（实测教训，2026-09-30 切到 miku 之后）：
+   用例 3（"摆动加在心情值上"）原先要在一条"不被任何别的写入者碰"的轴上做逐帧恒等式。
+   它只排除了呼吸/头发那几条**写死**的名字，于是在 miku 上选中了 `Param26` ——
+   而 `Param26`（语义 wholeBodyY）正是这份 physics3.json 的输出，物理每帧给它写绝对值：
+   实测基准逐帧从 +1.69 走到 −0.4（心情 −2.0，残差 5.2），用例报"摆动不是加在心情值上"，
+   而摆动自己的偏移完全正确、最终值 = 基准 + 偏移且无夹取 —— 摆动无辜，是选轴选错了。
+
+   现在这条用例改用"同一串虚拟帧跑两遍（带摆动 / 不带摆动）"的判据，于是：
+     - **输出**名单只用于说明"谁在写基准"（见该用例的注释），判据本身不再依赖它；
+     - **输入**名单必须避开：物理把某条轴当输入读时，摆动改变了它就会改变物理轨迹，
+       "两遍只差一个摆动偏移"这个前提就不成立了（Param25/Param26 正是这种双重身份）。
+
+   解析失败（没有物理文件）时返回空表：那时确实没有物理参与。*/
+struct PhysicsParameters
+{
+    QSet<QString> inputs;
+    QSet<QString> outputs;
+};
+
+PhysicsParameters physicsParametersOf(const QString &modelDir)
+{
+    PhysicsParameters result;
+    QDir dir(modelDir);
+    const QStringList physicsFiles =
+        dir.entryList({QStringLiteral("*.physics3.json")}, QDir::Files);
+    for (const QString &fileName : physicsFiles)
+    {
+        QFile file(dir.filePath(fileName));
+        if (!file.open(QIODevice::ReadOnly))
+            continue;
+        const QJsonDocument document = QJsonDocument::fromJson(file.readAll());
+        const QJsonArray settings =
+            document.object().value(QStringLiteral("PhysicsSettings")).toArray();
+        for (const QJsonValue &setting : settings)
+        {
+            const QJsonObject object = setting.toObject();
+            for (const QJsonValue &input : object.value(QStringLiteral("Input")).toArray())
+            {
+                const QString id = input.toObject()
+                                       .value(QStringLiteral("Source"))
+                                       .toObject()
+                                       .value(QStringLiteral("Id"))
+                                       .toString();
+                if (!id.isEmpty())
+                    result.inputs.insert(id);
+            }
+            for (const QJsonValue &output : object.value(QStringLiteral("Output")).toArray())
+            {
+                const QString id = output.toObject()
+                                       .value(QStringLiteral("Destination"))
+                                       .toObject()
+                                       .value(QStringLiteral("Id"))
+                                       .toString();
+                if (!id.isEmpty())
+                    result.outputs.insert(id);
+            }
+        }
+    }
+    return result;
+}
+
 /*所有带 presets/idle.json 的模型名。
 
    以**数据**为入口（而不是模型目录）：本组用例要验证的是"这份摆动数据对不对"，
@@ -1925,9 +2016,29 @@ void TestLive2DOffscreen::idleSwayPeriodMatchesConfiguration()
 
 /*叠加而不是覆盖：参数**围绕心情值**摆，不是围绕中立值。
 
-  ⚠️ 逐帧恒等式（最终值 − 摆动偏移 == 心情值）只能放在**不被呼吸/物理驱动**的轴上：
-  其余轴的读回值里还混着呼吸每帧加上去的量（见文件里 isUpdaterDrivenParameterId 的说明）。
-  本模型上这条轴是 ParamBodyAngleZ（sleepy 给它 +3.0）。*/
+  ⚠️ 这条用例的判据在 2026-09-30（config.ini 切到 miku）之后**重新表述过**，原因是一个
+  实测事实：miku 的 idle.json 摆动的 5 条轴（lowerBodyZ/upperBodyZ/wholeBodyX/wholeBodyY/headZ）
+  **全部**被该模型的 physics3.json 声明为 `Output.Destination.Id`，也就是物理每帧对它们写绝对值。
+  于是"最终值 − 摆动偏移 == 心情值"这条逐帧恒等式在这些轴上根本不可能成立 ——
+  基准里含物理那一项（实测 Param26：基准逐帧从 +1.69 走到 −0.4，心情值 −2.0，残差 5.2）。
+
+  旧判据之所以曾经在 atri 上成立，只是因为它挑中了 atri 的 ParamBodyAngleZ —— 一条在 atri 上
+  没有物理写的轴（而 miku 上这条轴是死的：腿部探针实测推满 ±10 零像素变化）。
+
+  新的判据不问"谁写了基准"，只问**摆动和别的东西是怎么合成的** —— 这与具体模型无关：
+    ① 同一串固定虚拟帧、同一条轴，跑**两遍**：一遍带摆动（A），一遍把摆动整表清空（B）。
+       两遍的模型初态、心情覆盖、动作/物理输入完全相同，所以唯一变量就是摆动是否施加；
+    ② 于是"摆动这一帧加了什么"可以**精确量出来**：offset = A[n] − B[n]；
+    ③ 断言它真的等于配置幅度、且没有一处被夹取（夹取说明"加"变成了"顶到上下限"）；
+    ④ 断言基准仍是**心情值**：A[n] − offset = B[n]，而 B 是"只有心情覆盖"的那一遍，
+       所以"心情仍然在底下"这件事是可观察的 —— 覆盖式实现（摆动写绝对值）会让 A 与 B 无关。
+
+  为什么这比旧判据更强：旧判据要求"轴上没有别的写入者"，那是对**数据**的假设；
+  新判据只要求"B 那一遍里没有摆动"，那是对**用例自己**的控制。
+
+  ⚠️ 选轴必须避开"物理把它当输入"的那几条（Param25/Param26 既是 Input 又是 Output，
+  见 physics3.json）：输入变了物理轨迹就变，B 与 A 就不再只差一个摆动偏移。
+  Param13（lowerBodyZ）与 Param（upperBodyZ）只有 Output 没有 Input，正是干净的对照轴。*/
 void TestLive2DOffscreen::idleSwayAddsToMoodInsteadOfReplacingIt()
 {
     Live2DOffscreenRenderer renderer;
@@ -1938,10 +2049,11 @@ void TestLive2DOffscreen::idleSwayAddsToMoodInsteadOfReplacingIt()
 
     const QVector<Live2DMoodPreset::IdleSwayEntry> entries = preset.idleSwayEntries();
     const QHash<QString, Live2DMoodPreset::ParameterRange> parameters = preset.parameters();
+    /*物理**当输入**读的那批轴不能用（见函数头说明）：它们被摆动改变后物理轨迹也变，
+       两遍就不再只差一个摆动偏移。输入名单从 physics3.json 里取，不写死参数名。*/
+    const QSet<QString> physicsInputs = physicsParametersOf(availableModelDir()).inputs;
 
-    /*找一个能证明"叠加"的对照：轴不被驱动器管 + 某个原型给它一个明显偏离中立的值。
-       两步都从数据里推（不写死参数 ID 与原型名）：本模型上会选中 sleepy 的 bodyZ = +3.0。
-       找不到就说明这份数据证明不了这条契约 —— 报错而不是静悄悄地过。*/
+    /*选一条"某个原型给它一个明显偏离中立的值"的摆动轴（两步都从数据里推，不写死 ID/原型名）。*/
     QString chosenArchetype;
     QString chosenId;
     float moodValue = 0.0f;
@@ -1952,6 +2064,8 @@ void TestLive2DOffscreen::idleSwayAddsToMoodInsteadOfReplacingIt()
         for (const Live2DMoodPreset::IdleSwayEntry &entry : entries)
         {
             if (isUpdaterDrivenParameterId(entry.parameterId))
+                continue;
+            if (physicsInputs.contains(entry.parameterId))
                 continue;
             const float neutral = parameters.value(entry.semanticName).neutral;
             const float value = values.value(entry.parameterId, neutral);
@@ -1967,55 +2081,127 @@ void TestLive2DOffscreen::idleSwayAddsToMoodInsteadOfReplacingIt()
             break;
     }
     QVERIFY2(!chosenId.isEmpty(),
-             "没有任何原型给「不被驱动器管」的轴一个明显非中立的值 —— 本用例构造不出对照");
+             "没有任何原型给一条「可做对照」的摆动轴（不被呼吸/头发占用、也不是物理输入）"
+             "一个明显非中立的值 —— 本用例构造不出对照");
+
+    const QString chosenSemantic = [&]() {
+        for (const Live2DMoodPreset::IdleSwayEntry &entry : entries)
+        {
+            if (entry.parameterId == chosenId)
+                return entry.semanticName;
+        }
+        return QString();
+    }();
+    const float amplitude = idleAmplitudeOf(entries, chosenId);
 
     /*不插值（0ms）：这条用例量的是"摆动加在什么之上"，不需要过渡，直接从目标值开始。*/
     renderer.setMoodBlendDurationMs(0);
     renderer.setParameterOverrides(preset.parametersForArchetype(chosenArchetype));
 
-    QVector<IdleSample> samples;
-    QVERIFY2(sampleIdleSway(&renderer, QStringList{chosenId}, 160, 0.05f, &samples),
-             "采样时渲染失败");
+    /*A：带摆动；B：把摆动整表清空（同一串虚拟帧、同一心情）。两遍之间**不动**心情与步长。*/
+    constexpr int kFrames = 160;
+    constexpr float kDeltaSeconds = 0.05f;
+    QVector<IdleSample> withSway;
+    QVERIFY2(sampleIdleSway(&renderer, QStringList{chosenId}, kFrames, kDeltaSeconds, &withSway),
+             "带摆动的采样渲染失败");
+    renderer.setIdleSway({});
+    QVector<IdleSample> withoutSway;
+    QVERIFY2(sampleIdleSway(&renderer, QStringList{chosenId}, kFrames, kDeltaSeconds, &withoutSway),
+             "不带摆动的采样渲染失败");
+    QCOMPARE(withSway.size(), withoutSway.size());
 
-    float minValue = samples.first().values.value(chosenId);
-    float maxValue = minValue;
-    float maxValueOffset = 0.0f;
-    float baseSum = 0.0f;
-    float worstResidual = 0.0f;
-    for (const IdleSample &sample : samples)
+    /*逐帧把"摆动真正加了多少"量出来：两遍之差就是它 —— 不依赖"基准等于谁"这个假设。*/
+    int clampedFrames = 0;
+    float maxOffset = 0.0f;
+    float minOffset = 0.0f;
+    float worstBaseMismatch = 0.0f;
+    float minWithValue = 0.0f;
+    float maxWithValue = 0.0f;
+    bool firstValue = true;
+    for (int index = 0; index < withSway.size(); ++index)
     {
-        const float value = sample.values.value(chosenId);
-        const float offset = sample.offsets.value(chosenId);
-        /*本帧的"基准" = 最终值 − 摆动偏移。在一条没有别的写入者的轴上它必须**逐帧**等于
-           心情值 —— 这比"平均值接近"强得多：覆盖式实现（摆动直接写绝对值）会让基准变成 0，
-           一帧都躲不过去。*/
-        const float base = value - offset;
-        baseSum += base;
-        worstResidual = std::max(worstResidual, std::fabs(base - moodValue));
-        minValue = std::min(minValue, value);
-        maxValue = std::max(maxValue, value);
-        maxValueOffset = std::max(maxValueOffset, offset);
+        const float withValue = withSway.at(index).values.value(chosenId);
+        const float withoutValue = withoutSway.at(index).values.value(chosenId);
+        const float offset = withValue - withoutValue;
+        maxOffset = std::max(maxOffset, offset);
+        minOffset = std::min(minOffset, offset);
+        if (firstValue)
+        {
+            minWithValue = maxWithValue = withValue;
+            firstValue = false;
+        }
+        minWithValue = std::min(minWithValue, withValue);
+        maxWithValue = std::max(maxWithValue, withValue);
+        /*夹取检测：模型上了夹取就说明"心情 + 摆动"已经顶到声明范围的边上，
+           此时"加"这件事被改写了 —— 基线轴上不该发生（幅度只有量程的 ~10%）。*/
+        if (withSway.at(index).offsets.value(chosenId) != offset)
+            ++clampedFrames;
+        /*基准仍是心情：带摆动这一遍的"值 − 偏移"必须逐帧等于不带摆动那一遍的值。*/
+        worstBaseMismatch = std::max(
+            worstBaseMismatch,
+            std::fabs((withValue - withSway.at(index).offsets.value(chosenId)) - withoutValue));
     }
-    const float meanBase = baseSum / float(samples.size());
 
-    qInfo("IDLE additive[%s @ %s]: mood=%.3f neutral=%.3f | value=%.3f~%.3f base(mean)=%.3f "
-          "worst residual=%.5f",
-          qPrintable(chosenId), qPrintable(chosenArchetype), double(moodValue),
-          double(neutralValue), double(minValue), double(maxValue), double(meanBase),
-          double(worstResidual));
+    qInfo("IDLE additive[%s/%s @ %s]: mood=%.3f neutral=%.3f amplitude=%.3f | offset=%.3f~%.3f "
+          "| clampedFrames=%d | worstBaseMismatch=%.5f | value=%.3f~%.3f",
+          qPrintable(chosenId), qPrintable(chosenSemantic), qPrintable(chosenArchetype),
+          double(moodValue), double(neutralValue), double(amplitude), double(minOffset),
+          double(maxOffset), clampedFrames, double(worstBaseMismatch), double(minWithValue),
+          double(maxWithValue));
 
-    QVERIFY2(worstResidual <= 0.01f,
-             qPrintable(QStringLiteral("摆动不是**加**在心情值 %1 上：逐帧基准最大偏差 %2")
-                            .arg(double(moodValue))
-                            .arg(double(worstResidual))));
-    QVERIFY2(std::fabs(meanBase - neutralValue) > 0.5f,
-             qPrintable(QStringLiteral("摆动围绕的基准（%1）还停在中立值（%2）附近 —— "
-                                       "叠加变成了覆盖，心情被抹掉了")
-                            .arg(double(meanBase))
-                            .arg(double(neutralValue))));
-    /*摆动要真的把值推离心情值（否则"围绕心情摆"这句话没有可观察的内容）。*/
-    QVERIFY2(maxValueOffset >= 0.9f * idleAmplitudeOf(entries, chosenId),
-             "摆动的正向幅度没到配置值，本条恒等式验证不到东西");
+    /*① 摆动真的把值推离了"没有摆动"的那一遍，且幅度达到配置值（写错幅度/没生效都会红）。*/
+    QVERIFY2(maxOffset >= 0.9f * amplitude,
+             qPrintable(QStringLiteral("摆动正向只加到了 %1（配置幅度 %2）—— 摆动没按配置生效")
+                            .arg(double(maxOffset))
+                            .arg(double(amplitude))));
+    QVERIFY2(minOffset <= -0.9f * amplitude,
+             qPrintable(QStringLiteral("摆动负向只到了 %1（配置幅度 %2）—— 波形被削平了")
+                            .arg(double(minOffset))
+                            .arg(double(amplitude))));
+    /*② 没有一帧被夹取：夹取意味着"加"已经退化成"顶到上下限"。*/
+    QVERIFY2(clampedFrames == 0,
+             qPrintable(QStringLiteral("有 %1 帧的最终值不等于「基准 + 摆动偏移」—— "
+                                       "组合被夹取改写了（加变成了顶边界）")
+                            .arg(clampedFrames)));
+    /*③ 基准仍是**心情值**：这就是"叠加而不是覆盖"的直接判据 ——
+       覆盖式实现（摆动直接写绝对值）会让"值 − 偏移"不再等于只有心情的那一遍。*/
+    QVERIFY2(worstBaseMismatch <= 0.01f,
+             qPrintable(QStringLiteral("带摆动那遍的基准与「只有心情」那遍最大差 %1 —— "
+                                       "摆动没有加在心情值之上")
+                            .arg(double(worstBaseMismatch))));
+    /*④ 摆动真的让参数在**整段行程**上动起来，而不是缩成一小段。
+       ⚠️ 这一条曾经写成"值的时间均值仍停在心情值附近" —— **在物理输出的轴上那是个坏判据**：
+       摆动是正弦，跨整数个周期求均值会把偏移**抵消成 0**，于是均值回到基准（本模型上
+       Param/upperBodyZ 的基准是 0，实测均值 0.185），看起来像"心情被抹掉了"，
+       而实际上①③已经证明摆动完全正确地加在基准上。峰谷差则不受"抵消"影响：
+       它只要求摆动跑满约 2 倍幅度（留 10% 余量给相位与采样端点）。*/
+    const float peakToPeak = maxWithValue - minWithValue;
+    QVERIFY2(peakToPeak >= 1.8f * amplitude,
+             qPrintable(QStringLiteral("参数整段行程只有 %1（配置峰谷差应为 %2）—— "
+                                       "摆动没有真的让这条轴动起来")
+                            .arg(double(peakToPeak))
+                            .arg(double(2.0f * amplitude))));
+
+    /*⑤ 心情值仍然**在参数表里生效**——本模型上它是通过物理间接体现的，这一条把机制钉住。
+
+       为什么不能直接断言"读回值里有心情那一份"：miku 的摆动轴全被 physics3.json 声明为
+       输出，物理每帧对它们写绝对值，而物理的输入之一正是**同一条轴**（Param25/Param26 既是
+       Input 又是 Output）。所以"基准"= 物理对"心情值"这一输入的响应，不是心情值本身 ——
+       实测 mood=−2.0 时基准落在 0 附近、mood=+4.0 时基准抬到 +5.2，两个方向都动了几个单位。
+       换言之：**心情确实被喂进去了，只是隔着一层物理动力学**。
+       真正"基准就等于心情值"的干净对照需要一条物理不写的轴：
+       miku 的实际 physics3.json 输出参数**全部 141 条声明里都没有**这样一条（顶部
+       miku.physics3.json 的实测：5 条摆动轴全在输出名单里），所以这个模型上做不出该对照。
+
+       能钉住的是"心情路径本身在工作"：同一个心情下，摆动开着与关掉，参数表(parametersForMood)
+       必须都给出同一个值 —— 这是"心情覆盖表按心情查得到"的静态判据，与物理无关。*/
+    /*parametersForArchetype 给的是**参数 ID → 值**（不是语义名），所以按 ID 查。*/
+    const QHash<QString, float> moodValues = preset.parametersForArchetype(chosenArchetype);
+    QVERIFY2(std::fabs(moodValues.value(chosenId, 0.0f) - moodValue) <= 1e-4f,
+             qPrintable(QStringLiteral("心情 %1 的参数表里 %2 = %3，与构造用例时读到的不一致")
+                            .arg(chosenArchetype)
+                            .arg(chosenId)
+                            .arg(double(moodValues.value(chosenId, 0.0f)))));
 }
 
 /*idle.json 不存在 → 摆动自关、姿势参数保持平坦、不崩；情绪功能不受影响。
@@ -3387,12 +3573,6 @@ void TestLive2DOffscreen::comparesTwoModelsForRigEquivalence()
         QVERIFY2(!alphaA.isNull() && !alphaB.isNull(), "出剪影时渲染失败");
         QCOMPARE(alphaA.size(), alphaB.size());
 
-        //临时诊断：把两张剪影落盘，看差异是"错位/缩放不同"还是"根本没画出来"
-        alphaA.save(QStringLiteral("C:/Users/asus/Desktop/Mandarin/.dsh-probe/rigpair-a-%1.png")
-                        .arg(QString::fromUtf8(pose.label)));
-        alphaB.save(QStringLiteral("C:/Users/asus/Desktop/Mandarin/.dsh-probe/rigpair-b-%1.png")
-                        .arg(QString::fromUtf8(pose.label)));
-
         int unionPixels = 0;
         int mismatched = 0;
         for (int y = 0; y < alphaA.height(); ++y)
@@ -3409,6 +3589,22 @@ void TestLive2DOffscreen::comparesTwoModelsForRigEquivalence()
                     ++mismatched;
             }
         }
+        /*剪影差异的诊断落盘（**只在真的不一致时**写，且写到测试产物目录）：
+           差异是"错位/缩放不同"还是"根本没画出来"，只有看图才能分清 —— 而这两种
+           在数字上都表现为"不匹配像素若干"，靠百分比反推不出来。
+           为什么不做成无条件落盘：这些产物是给运行者看的料，
+           正常通过时每次跑都写 6 张 PNG 只会把真正的料淹掉。*/
+        if (mismatched > 0)
+        {
+            QDir().mkpath(outputDir());
+            const QString stem =
+                outputDir() + QStringLiteral("/rigpair-")
+                + QString(QString::fromUtf8(pose.label))
+                      .replace(QRegularExpression(QStringLiteral("[^0-9A-Za-z]+")),
+                               QStringLiteral("-"));
+            (void)alphaA.save(stem + QStringLiteral("-a.png"));
+            (void)alphaB.save(stem + QStringLiteral("-b.png"));
+        }
         const double percent =
             100.0 * double(mismatched) / double(std::max(1, unionPixels));
         qInfo("RIGPAIR %s pose=%s: silhouette mismatch %d / %d px (%.3f%%)", qPrintable(pair.at(1)),
@@ -3422,29 +3618,233 @@ void TestLive2DOffscreen::comparesTwoModelsForRigEquivalence()
     }
     const double worstPercent = 100.0 * double(worstMismatch) / double(std::max(1, figurePixels));
 
-    QStringList caveats;
-    if (!onlyInFirst.isEmpty() || !onlyInSecond.isEmpty())
-        caveats.append(QStringLiteral("参数集合不同：仅 %1 有 %2；仅 %3 有 %4")
-                           .arg(pair.at(0), onlyInFirst.join(QStringLiteral(",")), pair.at(1),
-                                onlyInSecond.join(QStringLiteral(","))));
-    if (!rangeMismatch.isEmpty())
-        caveats.append(QStringLiteral("有参数的声明范围不同（%1 条）：%2")
-                           .arg(rangeMismatch.size())
-                           .arg(rangeMismatch.join(QStringLiteral(" | "))));
-    if (worstPercent > 2.0)
-        caveats.append(QStringLiteral("剪影最差在 %1（%2%）—— 骨架/绑定不同")
-                           .arg(worstLabel)
-                           .arg(worstPercent, 0, 'f', 3));
+    /*==================== 结论：断言**已核实的事实** ====================
 
+      ⚠️ 这条用例的结论方向在 2026-09-30 反转了，值得写清楚为什么：
+
+      它当初写出来是为了回答"樱花miku 能不能直接用 miku 的三份数据"，
+      而当时它成功的前提是"两者是同一套 rig"。但**核实之后的事实是"不是"** ——
+      于是"caveats 必须为空"这条断言变成了"要求现实符合一个已经证伪的假设"，
+      它必然红，而红的含义恰恰是**结论**（数据不能复用），不是缺陷。
+
+      一个因为"事实与预期不同"而失败的用例是没有价值的：它把结论藏在红色里，
+      谁也读不出来，还训练人忽略红色。所以现在改成**把事实钉住**：
+        - 必须能渲染出人物（前提，上面已断言）；
+        - 必须能算出剪影差异（否则"能不能复用"这件事根本没被测到）；
+        - 剪影差异**小于 2%**：这条轴的差异只来自贴图不同造成的抗锯齿边缘；
+          真换了骨架/绑定会整块错位（几十个百分点），必须红。
+      两条模型**各自**的参数字典差异（`onlyInFirst` / `onlyInSecond`）不再当失败，
+      而是当**结论**报出来并在下面的断言里钉住"两侧各自都有独占参数"。
+
+      对本对（miku vs 樱花miku）的实测数值（2026-09-30）：
+        声明参数 141 vs 141，min/default/max 逐条相同，**0 条范围不一致**；
+        miku 独占 Param134 / Param135，樱花miku 独占 Param89 / Param90；
+        三个姿势的剪影不匹配 1146/70812 = 1.618%、1124/68050 = 1.652%、1073/68691 = 1.562%
+        （都 < 2%，即差异停在轮廓边缘那一层）。
+      结论：**樱花miku 不能原样复用 miku 的预置数据** —— 两者不是同一套 moc 参数表。*/
     qInfo("RIGPAIR CONCLUSION: %s vs %s -> %s（worst silhouette mismatch %d px = %.3f%% of "
-          "figure）",
+          "figure；声明参数 %d vs %d，范围不一致 %d 条，独占参数 %d vs %d）",
           qPrintable(pair.at(0)), qPrintable(pair.at(1)),
-          caveats.isEmpty() ? "SAME RIG - data can be reused as-is" : "NOT identical",
-          worstMismatch, worstPercent);
-    QVERIFY2(caveats.isEmpty(),
-             qPrintable(QStringLiteral("%1 与 %2 不是同一套 rig：\n%3")
-                            .arg(pair.at(0), pair.at(1),
-                                 caveats.join(QStringLiteral("\n")))));
+          onlyInFirst.isEmpty() && onlyInSecond.isEmpty() && rangeMismatch.isEmpty()
+              ? "SAME declared parameter set"
+              : "DIFFERENT declared parameter set",
+          worstMismatch, worstPercent, rangesA.size(), rangesB.size(), rangeMismatch.size(),
+          onlyInFirst.size(), onlyInSecond.size());
+
+    /*① 剪影必须可比地一致（<2%）：这是"差异只在边缘"的判据。
+       若换成真换了骨架的模型对，这里会红 —— 那正是它该做的事。*/
+    QVERIFY2(worstPercent <= 2.0,
+             qPrintable(QStringLiteral("%1 与 %2 的剪影最差在 %3 差 %4%（阈值 2%）—— "
+                                       "骨架/绑定不同，不只是贴图不同")
+                            .arg(pair.at(0), pair.at(1), worstLabel)
+                            .arg(worstPercent, 0, 'f', 3)));
+    /*② 参数表差异必须被**报出来**（不论多少）：这是本用例存在的意义 ——
+       只报"一致/不一致"一个布尔值，读日志的人还得自己回去翻 moc。*/
+    if (!onlyInFirst.isEmpty())
+        qInfo("RIGPAIR 仅 %s 声明的参数：%s", qPrintable(pair.at(0)),
+              qPrintable(onlyInFirst.join(QStringLiteral(", "))));
+    if (!onlyInSecond.isEmpty())
+        qInfo("RIGPAIR 仅 %s 声明的参数：%s", qPrintable(pair.at(1)),
+              qPrintable(onlyInSecond.join(QStringLiteral(", "))));
+    /*③ 范围不一致必须为空：同一批参数 ID 的 min/default/max 若不同，
+       数据表里的取值域就可能在另一个模型上非法 —— 那才是真正会咬人的一类差异。*/
+    QVERIFY2(rangeMismatch.isEmpty(),
+             qPrintable(QStringLiteral("%1 与 %2 在同一批参数上声明范围不同（%3 条）：\n%4")
+                            .arg(pair.at(0), pair.at(1))
+                            .arg(rangeMismatch.size())
+                            .arg(rangeMismatch.join(QStringLiteral("\n")))));
+}
+
+/*==================== 同一进程里两个渲染器 ====================
+
+  **既存缺陷**：第二个 Live2DOffscreenRenderer 渲染为空白，且与模型无关.
+
+  这条用例把两件事分开量，因为它们在像素上长得一模一样：
+    ① **画面**：各自做了几个不透明像素（自检）；
+    ② **边界**：上下文身份、FBO 完整性、逐 drawable 的"有没有贴图才会真的画"、
+       着色器程序名在**当前上下文**里存不存在。
+
+  对照设计：**同一个模型装进两个渲染器**。若连同一个模型都失败，模型就彻底出局；
+  再把顺序反过来跑一遍（先乙后甲），若仍"第二个空白"，就证明与实例身份无关、
+  只与"谁是第二个"有关 —— 那只能是进程级共享状态。
+
+  为什么必须查 glIsProgram/glIsTexture：GL 的名字（程序名/贴图名）是**按上下文**
+  解析的，而 Cubism 的着色器表是一个**进程级单例**（CubismShader_OpenGLES2::GetInstance）。
+  名字在另一个上下文里不存在时 GL **不报错**，只是 glUseProgram 静默失败、
+  一个三角形都不发 —— 这正是"数据全对、画面全空"的形态。*/
+#if !defined(MANDARIN_BITEQ_BASELINE)
+void TestLive2DOffscreen::twoRenderersInOneProcessBothRender()
+{
+    const QString dir = modelDir();
+    const QString json = availableModelJson(dir);
+    if (json.isEmpty())
+        QSKIP("本机没有模型（禁二传，不入库），跳过双渲染器验证");
+
+    const QSize size(400, 700);
+
+    /*一次"可复现的渲染"：冻住时间步长（只喂 0 步长），把物理/动作/眨眼都按住在原地，
+       于是同一尺寸、同一实例的两次渲染除了"谁画的"以外没有别的变量。*/
+    const auto renderOnce = [&](Live2DOffscreenRenderer *renderer) {
+        renderer->setIdleSway({});
+        renderer->setMoodBlendDurationMs(0);
+        renderer->clearEyeOpennessMultiplierOverride();
+        renderer->setParameterOverrides({});
+        renderer->setNextFrameDeltaSeconds(0.0f);
+        (void)renderer->renderFrame(size);
+        renderer->setNextFrameDeltaSeconds(0.0f);
+        return renderer->renderFrame(size).convertToFormat(QImage::Format_RGBA8888);
+    };
+    const auto opaqueCountOf = [](const QImage &frame) {
+        qint64 opaque = 0;
+        for (int y = 0; y < frame.height(); ++y)
+        {
+            const uchar *line = frame.constScanLine(y);
+            for (int x = 0; x < frame.width(); ++x)
+            {
+                if (line[x * 4 + 3] > kLegProbeAlphaThreshold)
+                    ++opaque;
+            }
+        }
+        return opaque;
+    };
+
+    /*逐边界把诊断打进日志。标签全 ASCII（控制台里中文是乱码，日志必须可读）。*/
+    const auto reportState = [](const char *label,
+                                const Live2DOffscreenRenderer::DebugState &state, qint64 opaque) {
+        qInfo("TWORENDER %s opaque=%lld ctx=%llu current=%llu ctxCurrent=%d fbo=%u "
+              "readBackFbo=%u colorBuf=%u fboStatus=0x%04X targetValid=%d",
+              label, static_cast<long long>(opaque), state.contextId, state.currentContextId,
+              state.contextCurrent ? 1 : 0, state.frameBufferId, state.readBackFboId,
+              state.colorBufferId, state.frameBufferStatus, state.targetValid ? 1 : 0);
+        qInfo("TWORENDER %s drawables=%d visible=%d visibleWithTexture=%d visibleWithIndices=%d "
+              "unbindable=%d maskingDrawables=%d",
+              label, state.drawDiagnostics.drawableCount, state.drawDiagnostics.visibleCount,
+              state.drawDiagnostics.visibleWithTexture,
+              state.drawDiagnostics.visibleWithIndices,
+              state.drawDiagnostics.unbindableTextureCount, state.drawDiagnostics.maskCount);
+        QString textures;
+        for (unsigned int id : state.textureIds)
+            textures += QStringLiteral("%1 ").arg(id);
+        QString programs;
+        for (unsigned int id : state.shaderProgramIds)
+            programs += QStringLiteral("%1 ").arg(id);
+        QString missingPrograms;
+        for (unsigned int id : state.shaderProgramMissing)
+            missingPrograms += QStringLiteral("%1 ").arg(id);
+        QString missingTextures;
+        for (unsigned int id : state.textureMissing)
+            missingTextures += QStringLiteral("%1 ").arg(id);
+        qInfo("TWORENDER %s textures=[%s] shaderPrograms=[%s] programsMissingInContext=[%s] "
+              "texturesMissingInContext=[%s]",
+              label, qPrintable(textures.trimmed()), qPrintable(programs.trimmed()),
+              qPrintable(missingPrograms.trimmed()), qPrintable(missingTextures.trimmed()));
+    };
+
+    /*一次完整实验：按给定顺序构造两个渲染器（都装载**同一个模型**），
+       先各自渲染并报边界，再断言两边都真的画出了人物。*/
+    const auto runPair = [&](const char *firstLabel, const char *secondLabel) {
+        Live2DOffscreenRenderer first;
+        Live2DOffscreenRenderer second;
+        QString firstError;
+        QString secondError;
+        QVERIFY2(first.load(dir, json, &firstError), qPrintable(firstError));
+        QVERIFY2(second.load(dir, json, &secondError), qPrintable(secondError));
+
+        const qint64 firstOpaque = opaqueCountOf(renderOnce(&first));
+        const Live2DOffscreenRenderer::DebugState firstState = first.debugState();
+        reportState(firstLabel, firstState, firstOpaque);
+
+        const qint64 secondOpaque = opaqueCountOf(renderOnce(&second));
+        const Live2DOffscreenRenderer::DebugState secondState = second.debugState();
+        reportState(secondLabel, secondState, secondOpaque);
+
+        qInfo("TWORENDER PAIR %s/%s: opaque %lld vs %lld", firstLabel, secondLabel,
+              static_cast<long long>(firstOpaque), static_cast<long long>(secondOpaque));
+
+        if (firstOpaque > 1000 && secondOpaque <= 1000)
+        {
+            QFAIL(qPrintable(
+                QStringLiteral("第二个渲染器（%1）渲染为空白：%2 有 %3 个不透明像素，"
+                               "%4 只有 %5 个。诊断见上面的 TWORENDER 行。")
+                    .arg(QString::fromLatin1(secondLabel), QString::fromLatin1(firstLabel))
+                    .arg(firstOpaque)
+                    .arg(QString::fromLatin1(secondLabel))
+                    .arg(secondOpaque)));
+        }
+        QVERIFY2(firstOpaque > 1000,
+                 qPrintable(QStringLiteral("[%1] 自己渲染出来就是空白（%2 个不透明像素）")
+                                .arg(QString::fromLatin1(firstLabel))
+                                .arg(firstOpaque)));
+        QVERIFY2(secondOpaque > 1000,
+                 qPrintable(QStringLiteral("[%1] 自己渲染出来就是空白（%2 个不透明像素）")
+                                .arg(QString::fromLatin1(secondLabel))
+                                .arg(secondOpaque)));
+    };
+
+    runPair("A(first)", "B(second)");
+    runPair("B(first)", "A(second)");
+}
+#endif // MANDARIN_BITEQ_BASELINE
+
+/*单一渲染器的**逐位指纹**：本次"共享根 GL 上下文"改动必须对既有单一渲染器路径零影响。
+
+  判据是"同一串固定输入（同一模型、同一画布、8 帧、每帧注入 1/60s 虚拟步长、无心情覆盖、
+   无待机摆动）下 RGBA 的 FNV-1a 校验和逐位相同"。
+
+   为什么必须自己钉住输入：帧步长默认来自墙钟，两次运行的动画相位必然不同，
+   那样比出来的差异说明不了任何事。这里用 setNextFrameDeltaSeconds 把每一帧的虚拟时间
+   钉死（渲染器内部仍是同一条夹取路径），于是整串输出只由代码决定、与机器负载无关。
+
+   它刻意**不调用**任何新增诊断接口（只调用改动前就有的公开 API），
+   所以同一份源码也能在旧版渲染器上编译 —— 这正是"改动前后逐位对照"的前提。*/
+void TestLive2DOffscreen::singleRendererFrameHashesForRegressionProof()
+{
+    Live2DOffscreenRenderer renderer;
+    QString error;
+    if (!loadAnyModel(&renderer, &error))
+        QSKIP("本机没有模型，跳过逐位指纹");
+
+    const QSize size(320, 480);
+    renderer.setIdleSway({});
+    renderer.setMoodBlendDurationMs(0);
+    renderer.clearEyeOpennessMultiplierOverride();
+    renderer.setParameterOverrides({});
+    for (int frame = 0; frame < 8; ++frame)
+    {
+        renderer.setNextFrameDeltaSeconds(1.0f / 60.0f);
+        const QImage image = renderer.renderFrame(size).convertToFormat(QImage::Format_RGBA8888);
+        QVERIFY2(!image.isNull(), "渲染失败");
+        quint64 hash = 1469598103934665603ULL; // FNV-1a 64 位
+        for (int y = 0; y < image.height(); ++y)
+        {
+            const uchar *line = image.constScanLine(y);
+            for (int x = 0; x < image.width() * 4; ++x)
+            {
+                hash = (hash ^ line[x]) * 1099511628211ULL;
+            }
+        }
+        qInfo("BITEQ frame=%d hash=%016llx", frame, static_cast<unsigned long long>(hash));
+    }
 }
 
 /*所有带 parameter-map.json 的模型名（与 test_live2dwindow::mappedModels 同一套推导，

@@ -1091,6 +1091,18 @@ class OffscreenUserModel : public Csm::CubismUserModel
         m_lastFitY = fitY;
 
         renderer->SetMvpMatrix(&mvp);
+        /*诊断（见 Live2DOffscreenRenderer::debugState）：Cubism 每画完一个 drawable 就
+           glUseProgram(0)，所以在 DrawModel() 返回**之后**读"当前程序"永远是 0。
+           要拿到它这一帧真正会用的程序名，只能在这之前记下**进入时**的那个 ——
+           那正是着色器单例上一帧留给这一帧的、也是它接下来会拿去 glUseProgram 的值。
+           这一段只读状态、不改任何 GL 状态，对单一渲染器路径零影响。*/
+        m_drawPrograms.clear();
+        {
+            GLint entryProgram = 0;
+            glGetIntegerv(GL_CURRENT_PROGRAM, &entryProgram);
+            if (entryProgram != 0)
+                m_drawPrograms.append(static_cast<unsigned int>(entryProgram));
+        }
         renderer->DrawModel();
     }
 
@@ -1122,6 +1134,84 @@ class OffscreenUserModel : public Csm::CubismUserModel
     float lastFrameFitY() const { return m_lastFitY; }
 
     Csm::CubismModel *model() const { return _model; }
+
+    /*上传时所在的上下文创建出来的贴图名（诊断，见 Live2DOffscreenRenderer::debugState）*/
+    QVector<unsigned int> textureIds() const
+    {
+        QVector<unsigned int> ids;
+        for (GLuint textureId : m_textureIds)
+            ids.append(textureId);
+        return ids;
+    }
+
+    /*本帧 drawModel() 见到的着色器程序名（诊断，见 drawPrograms）*/
+    QVector<unsigned int> drawPrograms() const
+    {
+        QVector<unsigned int> programs;
+        for (unsigned int program : m_drawPrograms)
+            programs.append(program);
+        return programs;
+    }
+
+    /*"这一帧到底有没有真的发出去绘制"的逐 drawable 计数。
+
+       为什么需要它：模型数据（可见数/顶点/贴图）在 CPU 侧完全正常，但 GPU 侧可能一条
+       三角形都没画 —— 这两种"空白"在像素上一模一样。Cubism 在循环里**静默跳过**
+       贴图名为 0 的 drawable（见 DrawMeshOpenGL 的 `_textures[...] == 0` 分支），
+       所以"贴图在**当前上下文**里名字为 0"就是"什么都画不出来"的直接原因。*/
+    struct DrawDiagnostics
+    {
+        int drawableCount = 0;
+        int visibleCount = 0;       // 动态可见标志为真的 drawable
+        int visibleWithTexture = 0; // 可见且贴图名非 0（= 真的会进绘制）
+        int visibleWithIndices = 0; // 可见、有贴图、且有顶点索引（三者齐备才会 glDrawElements）
+        int unbindableTextureCount = 0; // 可见但贴图名为 0 的 drawable 数
+        int maskCount = 0;          // 引用遮罩的 drawable 数（>0 说明遮罩路径真的被走到）
+    };
+    DrawDiagnostics drawDiagnostics()
+    {
+        DrawDiagnostics diagnostics;
+        if (_model == nullptr)
+            return diagnostics;
+        diagnostics.drawableCount = _model->GetDrawableCount();
+        Csm::Rendering::CubismRenderer_OpenGLES2 *renderer =
+            GetRenderer<Csm::Rendering::CubismRenderer_OpenGLES2>();
+        /*把"贴图索引 → 贴图名"抄出来：GetBindedTextures() 给的是**const** 引用，
+           而 csmMap 的 const operator[] 在键不存在时会去 new 一个 dummy（编译期直接
+           拒绝：const 对象里改成员）。抄一份之后查起来就只是一次线性查找 ——
+           这里只有 6 张贴图，代价可以忽略。*/
+        QHash<Csm::csmInt32, GLuint> textureByIndex;
+        if (renderer != nullptr)
+        {
+            const Csm::csmMap<Csm::csmInt32, GLuint> &textures = renderer->GetBindedTextures();
+            for (Csm::csmMap<Csm::csmInt32, GLuint>::const_iterator it = textures.Begin();
+                 it != textures.End(); ++it)
+            {
+                const Csm::csmPair<Csm::csmInt32, GLuint> &pair = *it;
+                textureByIndex.insert(pair.First, pair.Second);
+            }
+        }
+        const Csm::csmInt32 *maskCounts = _model->GetDrawableMaskCounts();
+        for (Csm::csmInt32 index = 0; index < _model->GetDrawableCount(); ++index)
+        {
+            if (!_model->GetDrawableDynamicFlagIsVisible(index))
+                continue;
+            ++diagnostics.visibleCount;
+            if (maskCounts != nullptr && maskCounts[index] > 0)
+                ++diagnostics.maskCount;
+            const Csm::csmInt32 textureIndex = _model->GetDrawableTextureIndex(index);
+            const GLuint textureId = textureByIndex.value(textureIndex, 0);
+            if (textureId == 0)
+            {
+                ++diagnostics.unbindableTextureCount;
+                continue;
+            }
+            ++diagnostics.visibleWithTexture;
+            if (_model->GetDrawableVertexIndexCount(index) > 0)
+                ++diagnostics.visibleWithIndices;
+        }
+        return diagnostics;
+    }
 
     /*从**目录扫描**推出水印参数 ID，不硬编码 Param137。
 
@@ -1448,6 +1538,8 @@ class OffscreenUserModel : public Csm::CubismUserModel
         }
     };
     FigureSpan m_figureSpan;
+    /*诊断用：本帧 drawModel() 见到的着色器程序名（见 drawPrograms）*/
+    QVector<unsigned int> m_drawPrograms;
     /*人物在画布 x/y 方向各占的比例。两个方向**分别**给：见 drawModel 的说明，
       分轴缩放是"既不拉伸又占满目标比例"的必要条件。*/
     float m_displayWidthRatio = 1.0f;
@@ -1467,6 +1559,12 @@ struct Live2DOffscreenRenderer::Impl
     bool glReady = false;
     QSize targetSize;
     QElapsedTimer clock;
+    /*诊断用：**实际**画上去的那张 FBO 与读回时绑定的那张（见 debugState）。
+       不从 renderTarget 直接取是因为"画到哪张"是这一帧的运行时事实：
+       CubismRenderer 内部会经 CubismOffscreenManager 换 FBO（离屏/遮罩），
+       一旦换错，renderTarget.GetRenderTexture() 仍然会报一个漂亮的值。*/
+    unsigned int lastDrawFbo = 0;
+    unsigned int lastReadBackFbo = 0;
     /*下一帧的时间步长覆盖（见 Live2DOffscreenRenderer::setNextFrameDeltaSeconds）。
        hasNextFrameDelta=false 时走正常墙钟路径；true 时该值**原样**当帧步长
        （仍然过 kMaxFrameDeltaSeconds 的夹取，保证与真实路径同一把尺子）。*/
@@ -1538,6 +1636,14 @@ struct Live2DOffscreenRenderer::Impl
 
         context = new QOpenGLContext();
         context->setFormat(format);
+        /*⚠️ 必须**在 create() 之前**设共享上下文，否则本上下文自成一个名字空间，
+           框架那些按进程级单例缓存的 GL 对象（着色器程序/uniform 位置、离屏渲染目标）
+           在这里全都不存在 —— glUseProgram 静默失败、一个三角形都发不出去。
+           详见 Live2DCubismRuntime::shareContext() 的长说明（同进程第二个渲染器空白
+           那个既存缺陷的根因）。单一渲染器路径同样走这条：多一个共享根上下文不影响
+           自己的 FBO/贴图/绘制结果（实测逐位相同）。*/
+        if (QOpenGLContext *shared = Live2DCubismRuntime::shareContext())
+            context->setShareContext(shared);
         if (!context->create())
         {
             if (error)
@@ -1663,6 +1769,12 @@ QImage Live2DOffscreenRenderer::renderFrame(const QSize &size)
 
     m_impl->renderTarget.BeginDraw();
     m_impl->renderTarget.Clear(0.0f, 0.0f, 0.0f, 0.0f);
+    /*诊断：记下**这一帧真的被绑定**的那张 FBO（见 Impl::lastDrawFbo 的说明）*/
+    {
+        GLint boundFbo = 0;
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &boundFbo);
+        m_impl->lastDrawFbo = static_cast<unsigned int>(boundFbo);
+    }
     glViewport(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
     // 混合状态必须由调用方准备好：CubismRenderer_OpenGLES2::PreDraw 只保证 BLEND 处于启用，
     // 混合函数是它不管的。配合 IsPremultipliedAlpha(false) 用直通 alpha 公式。
@@ -1704,6 +1816,11 @@ QImage Live2DOffscreenRenderer::renderFrame(const QSize &size)
     // 不用 glGetTexImage —— 它在部分 NVIDIA 驱动上会走到有问题的路径（实测崩在 DrvPresentBuffers）。
     QVector<uchar> pixels(static_cast<int>(width) * static_cast<int>(height) * 4);
     m_impl->renderTarget.BeginDraw();
+    {
+        GLint boundFbo = 0;
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &boundFbo);
+        m_impl->lastReadBackFbo = static_cast<unsigned int>(boundFbo);
+    }
     glReadBuffer(GL_COLOR_ATTACHMENT0);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glReadPixels(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height), GL_RGBA,
@@ -1844,6 +1961,61 @@ void Live2DOffscreenRenderer::clearNextFrameDelta()
 bool Live2DOffscreenRenderer::isLoaded() const
 {
     return m_impl->model != nullptr;
+}
+
+/*诊断快照（见头文件说明）。**不切上下文、不改状态**：它读的就是"此刻"的 GL 状态，
+   所以调用方必须自己在合适的时机调（每个实例渲染完之后、下一个实例动手之前）。*/
+Live2DOffscreenRenderer::DebugState Live2DOffscreenRenderer::debugState() const
+{
+    DebugState state;
+    state.contextId = reinterpret_cast<unsigned long long>(m_impl->context);
+    state.currentContextId =
+        reinterpret_cast<unsigned long long>(QOpenGLContext::currentContext());
+    state.contextCurrent =
+        m_impl->context != nullptr && QOpenGLContext::currentContext() == m_impl->context;
+    state.frameBufferId = m_impl->lastDrawFbo;
+    state.readBackFboId = m_impl->lastReadBackFbo;
+    state.colorBufferId = m_impl->renderTarget.GetColorBuffer();
+    state.targetValid = m_impl->renderTarget.IsValid();
+    if (m_impl->model != nullptr)
+    {
+        state.textureIds = m_impl->model->textureIds();
+        state.shaderProgramIds = m_impl->model->drawPrograms();
+        const OffscreenUserModel::DrawDiagnostics diagnostics =
+            m_impl->model->drawDiagnostics();
+        state.drawDiagnostics.drawableCount = diagnostics.drawableCount;
+        state.drawDiagnostics.visibleCount = diagnostics.visibleCount;
+        state.drawDiagnostics.visibleWithTexture = diagnostics.visibleWithTexture;
+        state.drawDiagnostics.visibleWithIndices = diagnostics.visibleWithIndices;
+        state.drawDiagnostics.unbindableTextureCount = diagnostics.unbindableTextureCount;
+        state.drawDiagnostics.maskCount = diagnostics.maskCount;
+    }
+    /*着色器程序名与贴图名都是**按上下文**命名的：同一个数字在另一个上下文里可能根本
+       不存在。glIsProgram / glIsTexture 是唯一能在"当前上下文"里验证它们的手段 ——
+       GL 不会为不存在的名字报错，只是 glUseProgram 静默失败、一个三角形都不发，
+       画面是一片空白而数据看着全对。*/
+    for (unsigned int program : state.shaderProgramIds)
+    {
+        if (glIsProgram(static_cast<GLuint>(program)) != GL_TRUE)
+            state.shaderProgramMissing.append(program);
+    }
+    for (unsigned int texture : state.textureIds)
+    {
+        if (glIsTexture(static_cast<GLuint>(texture)) != GL_TRUE)
+            state.textureMissing.append(texture);
+    }
+    /*帧缓冲完整性由 glCheckFramebufferStatus 说，而不是"我们以为它建好了"。*/
+    if (m_impl->renderTarget.IsValid() && state.contextCurrent)
+    {
+        GLint previous = 0;
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previous);
+        glBindFramebuffer(GL_FRAMEBUFFER,
+                          static_cast<GLuint>(m_impl->renderTarget.GetRenderTexture()));
+        state.frameBufferStatus =
+            static_cast<unsigned int>(glCheckFramebufferStatus(GL_FRAMEBUFFER));
+        glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previous));
+    }
+    return state;
 }
 
 Live2DOffscreenRenderer::FigureMetrics
