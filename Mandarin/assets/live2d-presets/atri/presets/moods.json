@@ -1,0 +1,166 @@
+{
+    "_comment": "情绪原型 → 参数取值；以及「立绘心情名 → 原型」的别名表。",
+    "_status": "已目视校准一轮（2026-09-29）。校准方式：每个原型各渲染一帧面部裁切图，拼成对照表人工判读。",
+    "_calibrationNotes": [
+        "本模型【嘴笑不出来】：ParamMouthForm 声明范围是 [-1, 0]、默认 -0.5，0 已是上限。",
+        "  所以 happy/excited 的 mouthForm 取 0.0（= 能到的最笑），情绪主要靠 eyeSmile + cheek 表达。",
+        "亚托莉的【眉毛大部分被刘海遮住】，所以靠眉毛的情绪（angry/sad/worried/serious/disdain）天生偏弱。",
+        "  这几个原型的重心已移到 眼睛开合 + 视线 + 头部角度 上。",
+        "ParamEyeLOpen/ROpen 现在会【乘在眨眼结果上】（final = 情绪值 × 眨眼值），所以预设值能生效、眨眼也还在。",
+        "取值范围必须与模型 moc 声明一致，有测试逐参数对账（parameterMapRangesMatchModelDeclarations）。"
+    ],
+    "_rules": [
+        "只写与中立值不同的参数；未列出的参数保持中立（由 parameter-map.json 的 neutral 提供）。",
+        "不要覆盖 breath / hair* —— 那些由呼吸驱动器和物理负责。",
+        "同一原型被多个心情名共用，改一处即可。"
+    ],
+
+    "archetypes": {
+        "neutral": {},
+
+        "happy": {
+            "eyeLSmile": 0.9, "eyeRSmile": 0.9,
+            "mouthForm": 0.0, "cheek": 0.5,
+            "browLY": 0.2, "browRY": 0.2,
+            "headZ": -3.0
+        },
+
+        "excited": {
+            "eyeLSmile": 0.7, "eyeRSmile": 0.7,
+            "eyeLOpen": 1.0, "eyeROpen": 1.0,
+            "mouthForm": 0.0, "mouthOpen": 0.35,
+            "browLY": 0.45, "browRY": 0.45,
+            "headY": 4.0, "headZ": -4.0
+        },
+
+        "confident": {
+            "eyeLSmile": 0.7, "eyeRSmile": 0.7,
+            "mouthForm": -0.1,
+            "browLY": 0.25, "browRY": 0.25,
+            "browLAngle": 0.3, "browRAngle": 0.3,
+            "headY": 4.0, "headZ": 5.0
+        },
+
+        "angry": {
+            "browLY": -0.5, "browRY": -0.5,
+            "browLAngle": -0.6, "browRAngle": -0.6,
+            "browLForm": -0.4, "browRForm": -0.4,
+            "mouthForm": -0.9,
+            "eyeLOpen": 0.6, "eyeROpen": 0.6,
+            "headY": -3.0, "headZ": 3.0
+        },
+
+        "disdain": {
+            "eyeLSmile": 0.35, "eyeRSmile": 0.35,
+            "eyeLOpen": 0.5, "eyeROpen": 0.5,
+            "browLY": -0.35, "browRY": 0.1,
+            "mouthForm": -0.8,
+            "gazeX": -0.5, "gazeY": 0.15,
+            "headY": 3.0, "headZ": -5.0
+        },
+
+        "sad": {
+            "browLY": 0.45, "browRY": 0.45,
+            "browLForm": 0.5, "browRForm": 0.5,
+            "eyeLOpen": 0.45, "eyeROpen": 0.45,
+            "mouthForm": -0.85,
+            "gazeX": -0.1, "gazeY": -0.5, "headY": -6.0
+        },
+
+        "cry": {
+            "browLY": 0.5, "browRY": 0.5,
+            "browLForm": 0.6, "browRForm": 0.6,
+            "eyeLOpen": 0.3, "eyeROpen": 0.3,
+            "mouthForm": -0.9, "mouthOpen": 0.3,
+            "cheek": 0.3,
+            "gazeY": -0.7, "headY": -8.0
+        },
+
+        "surprised": {
+            "eyeLOpen": 1.0, "eyeROpen": 1.0,
+            "mouthOpen": 0.8,
+            "browLY": 0.6, "browRY": 0.6,
+            "headY": 3.0
+        },
+
+        "curious": {
+            "eyeLSmile": 0.35, "eyeRSmile": 0.35,
+            "browLY": 0.3, "browRY": 0.1,
+            "gazeX": 0.5, "headY": 2.0, "headZ": -8.0
+        },
+
+        "embarrassed": {
+            "cheek": 1.0,
+            "eyeLOpen": 0.75, "eyeROpen": 0.75,
+            "gazeX": -0.55, "gazeY": -0.35,
+            "browLY": 0.25, "browRY": -0.15,
+            "mouthForm": -0.6,
+            "headY": -6.0, "headZ": 3.0
+        },
+
+        "worried": {
+            "browLY": 0.6, "browRY": 0.6,
+            "browLForm": 0.5, "browRForm": 0.5,
+            "eyeLOpen": 0.8, "eyeROpen": 0.8,
+            "mouthForm": -0.7,
+            "gazeX": -0.35, "gazeY": -0.2,
+            "headY": -5.0, "headZ": 4.0
+        },
+
+        "serious": {
+            "browLY": -0.3, "browRY": -0.3,
+            "browLAngle": 0.5, "browRAngle": 0.5,
+            "mouthForm": -0.6,
+            "eyeLOpen": 0.8, "eyeROpen": 0.8,
+            "headY": -2.0
+        },
+
+        "sleepy": {
+            "eyeLOpen": 0.05, "eyeROpen": 0.05,
+            "mouthOpen": 0.15, "mouthForm": -0.7,
+            "headY": -8.0, "headZ": 6.0, "bodyZ": 3.0
+        }
+    },
+
+    "moodAliases": {
+        "default": "neutral",
+        "正常": "neutral",
+        "侧身-正常": "neutral",
+
+        "高兴": "happy",
+        "举手-开心": "happy",
+        "侧身-高兴": "happy",
+
+        "兴奋": "excited",
+        "侧身-兴奋": "excited",
+        "充满干劲": "excited",
+
+        "自信": "confident",
+
+        "生气": "angry",
+        "举手-生气": "angry",
+        "愤怒": "angry",
+
+        "鄙视": "disdain",
+
+        "伤心": "sad",
+        "失落": "sad",
+
+        "哭泣": "cry",
+
+        "举手-吃惊": "surprised",
+        "惊呆": "surprised",
+
+        "好奇": "curious",
+        "观望": "curious",
+
+        "尴尬": "embarrassed",
+
+        "担心": "worried",
+
+        "认真": "serious",
+        "举手-认真": "serious",
+
+        "睡觉": "sleepy"
+    }
+}

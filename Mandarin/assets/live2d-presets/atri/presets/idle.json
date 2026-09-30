@@ -1,0 +1,27 @@
+{
+    "_comment": "待机摆动（idle sway）→ 每条轴的幅度/周期/相位。让角色「站着、重心在动」，而不是只有呼吸。渲染器每帧按这个表往参数上加一个正弦偏移（见 Mandarin/utils/Live2DMoodPreset.h 与 Live2DOffscreenRenderer::setIdleSway）。",
+    "_model": "atri",
+    "_status": "保守默认值（用户要求在还没目视校准前先给一个克制的手感）。目视校准方式：test_live2doffscreen 的 rendersIdleSwayPhaseFrames 会在一个周期内均匀出 6 张**全身**帧到 build2/tests/live2d-probe/idle-phase0..5.png，并排看即可判断「她是不是真的在换重心」。",
+
+    "_rules": [
+        "每条只写**语义参数名**（见本目录上一级的 parameter-map.json），绝不写真实参数 ID —— 换模型时这张表可以整体复用，只要目标模型的 parameter-map.json 里有同名语义项（这就是「扩展到 miku 只改数据」的全部含义）。",
+        "amplitude 用**参数自己的单位**（不是比例）。应当是声明范围的一小部分：建议不超过量程的 20%（越接近量程的一半，波峰就越频繁地顶到上下限被夹平，看起来从「换重心」变成「抽搐」）。装载时超过 20% 会打一条告警，但不阻止生效。",
+        "period 是**秒**：站立时的重心移动大约 4~7s 一循环。低于 1s 会变成抖动（看着像发抖而不是活着）。",
+        "phase 是**周期分数（0~1）**，不是弧度也不是角度。几条轴必须错开相位，否则整个身体像一整块刚体在摇 —— 一眼就是假的。",
+        "不要写 breath / hairFront / hairSide / hairBack：它们每帧由呼吸驱动器与物理写入，写了也会被防御性跳过并告警。",
+        "不要写 mouthForm（嘴形）：嘴形属于心情，摆动只做身体。"
+    ],
+    "_composition": "最终参数值 = 心情值 + amplitude × sin(2π × (t/period + phase))，再夹取到模型**声明**的 min/max（declaredParameterRanges）。因为是**加法**，心情值就是摆动围绕的基准 —— 「生气地站着」仍然是生气的，只是身体在动。t 是渲染器累计的虚拟时间（帧步长累加、含 0.1s 夹取），所以注入固定步长时相位完全可复现。",
+    "_howToExtend": "换模型：把本文件复制到新模型目录的 presets/ 下，按它的 parameter-map.json 的语义名与声明范围调数值即可 —— **不需要改 C++**。",
+
+    "sway": [
+        { "parameter": "bodyZ", "amplitude": 3.5, "period": 5.0,  "phase": 0.0,
+          "_note": "ParamBodyAngleZ 声明 ±10：左右重心移动，这是「站着换重心」最主要的来源。幅度取 17.5% 量程。" },
+
+        { "parameter": "bodyX", "amplitude": 1.5, "period": 6.5,  "phase": 0.25,
+          "_note": "ParamBodyAngleX 声明 ±10：前后微倾。周期比 bodyZ 长、相位错开 1/4 周期，于是两者的波峰不会同时到。" },
+
+        { "parameter": "headZ",  "amplitude": 2.5, "period": 4.2,  "phase": 0.6,
+          "_note": "ParamAngleZ 声明 ±30：头随重心微摆。相位与另外两条都错开得最多（0.6），避免「头带着身子一起摇」的刚体感。" }
+    ]
+}

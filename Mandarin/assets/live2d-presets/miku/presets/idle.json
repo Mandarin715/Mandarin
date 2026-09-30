@@ -1,0 +1,42 @@
+{
+    "_comment": "待机摆动（idle sway）→ 每条轴的幅度/周期/相位。让角色「站着、重心在动」，而不是只有呼吸。渲染器每帧按这个表往参数上加一个正弦偏移（见 Mandarin/utils/Live2DMoodPreset.h 与 Live2DOffscreenRenderer::setIdleSway）。",
+    "_model": "miku",
+    "_status": "⚠️ 未目视校准的初稿（2026-09-30）：数值按**本模型声明的量程**推出来的克制手感，没有看过动起来的样子。目视校准方式：跑 test_live2doffscreen 的 rendersIdleSwayPhaseFrames()，它会在一个周期内均匀出 6 张**全身**帧，落盘 build2/tests/live2d-probe/idle-<模型>-phase0..5.png，并排看即可判断「她是不是真的在换重心」。",
+
+    "_differsFromAtri": [
+        "⚠️ **bodyZ / bodyX 在本模型上是死的，所以这一份没有抄 atri 的那两条**：腿部探针实测把 ParamBodyAngleX / ParamBodyAngleZ 推到满量程（±10）后，整帧 alpha 掩码逐位不变、RGB 也不变（见 parameter-map.json 里这两条的 _note，原始数据在 build2/tests/live2d-probe/leg-probe-miku.txt）。atri 那份的『左右换重心』正是靠 bodyZ 做的 —— 抄过来会得到一份**看起来什么都没动**的摆动数据（而装载器不会报错：幅度合法、参数存在）。",
+        "miku 的『换重心』改用 wholeBodyX（整体横向平移）+ lowerBodyZ（胯部旋转）+ upperBodyZ（上身反向旋转）三条来做 —— 它们经探针验证**确实会动像素**，而且拼起来正好是『下半身先动、上身略微滞后』的站立感。",
+        "**lowerBodyZ 是胯部旋转，不是腿部关节**：本模型没有任何膝/踝参数（见 parameter-map.json 的 _unusedByDesign._noLegJoints），腿是被胯带着走的。探针实测：推满 ±30 时下半身 9.2% 的像素掩码变了、重心横移 1.63px，但**掩码面积只变 2.2%** —— 它是把下半身整体转过去，不是在掰腿。所以这条轴的幅度只能按『换重心时胯转多少』来定，不能指望它做出『迈步』。",
+        "全身轴幅度**刻意压得很小**（声明的 ±30 只取 2.5~3.0）：它们动的是整个人，幅度一大就从「换重心」变成「她在屏幕上平移」，用户会以为桌宠在自己跑。"
+    ],
+
+    "_rules": [
+        "每条只写**语义参数名**（见本目录上一级的 parameter-map.json），绝不写真实参数 ID —— 换模型时这张表可以整体复用，只要目标模型的 parameter-map.json 里有同名语义项（这就是「扩展到 miku 只改数据」的全部含义）。",
+        "amplitude 用**参数自己的单位**（不是比例）。应当是声明范围的一小部分：建议不超过量程的 20%（越接近量程的一半，波峰就越频繁地顶到上下限被夹平，看起来从「换重心」变成「抽搐」）。装载时超过 20% 会打一条告警，但不阻止生效。",
+        "period 是**秒**：站立时的重心移动大约 4~7s 一循环。低于 1s 会变成抖动（看着像发抖而不是活着）。",
+        "phase 是**周期分数（0~1）**，不是弧度也不是角度。几条轴必须错开相位，否则整个身体像一整块刚体在摇 —— 一眼就是假的。",
+        "不要写 breath / hairFront / hairSide / hairBack：它们每帧由呼吸驱动器与物理写入，写了也会被防御性跳过并告警。",
+        "不要写 mouthForm（嘴形）：嘴形属于心情，摆动只做身体。"
+    ],
+    "_composition": "最终参数值 = 心情值 + amplitude × sin(2π × (t/period + phase))，再夹取到模型**声明**的 min/max（declaredParameterRanges）。因为是**加法**，心情值就是摆动围绕的基准 —— 「生气地站着」仍然是生气的，只是身体在动。t 是渲染器累计的虚拟时间（帧步长累加、含 0.1s 夹取），所以注入固定步长时相位完全可复现。",
+    "_whyNotCopyAtri": "**这份数据与 atri 的不能互抄**，尽管语义名是同一套：atri 三条轴里的 bodyZ / bodyX 在 miku 这个 rig 上推不动任何像素（探针实测，见 _differsFromAtri 第一条）。『换模型只改数据』指的是**不需要改 C++、schema 与机制完全相同**，不是『数值可以照抄』—— 数值必须对着目标模型的实测行为定。",
+    "_howToExtend": "换模型：把本文件复制到新模型目录的 presets/ 下，按它的 parameter-map.json 的语义名与声明范围调数值即可 —— **不需要改 C++**。",
+    "_amplitudeAudit": "每条轴占**声明量程**的比例（装载时的 20% 告警线就是在核这个；此处全部远低于它）：lowerBodyZ 10.0%、upperBodyZ 5.8%、wholeBodyX 8.3%、wholeBodyY 4.2%、headZ 9.2%。",
+
+    "sway": [
+        { "parameter": "lowerBodyZ", "amplitude": 3.0, "period": 6.0,  "phase": 0.0,
+          "_note": "Param13 声明 ±30（量程 60，幅度 10%）：**胯部旋转** —— 换重心时下半身真正的来源（本模型没有腿部关节，见 _differsFromAtri）。相位 0 是这套动作的主时基（周期最长，其它轴都相对它错开）。" },
+
+        { "parameter": "upperBodyZ", "amplitude": 3.5, "period": 5.0,  "phase": 0.15,
+          "_note": "Param 声明 ±30（幅度 11.7%；注意这个参数 ID **就叫 `Param`**）：上身的反向旋转。周期比胯短、相位只错开 0.15 —— 上下半身**几乎同相但略滞后**才像真的站立（完全同相 = 一根棍子，完全反相 = 拧麻花）。" },
+
+        { "parameter": "wholeBodyX", "amplitude": 2.5, "period": 5.0, "phase": 0.0,
+          "_note": "Param25（cdi3『x全身』）声明 ±30（幅度 8.3%）：**整个人的横向微移**。与 lowerBodyZ 同相（都做左右），一个平移一个旋转 —— 两者叠起来才有『重心在地面上挪』的份量感；单靠旋转会显得下半身在原地扭。" },
+
+        { "parameter": "wholeBodyY", "amplitude": 2.5, "period": 7.0,  "phase": 0.8,
+          "_note": "Param26（cdi3『y全身』）声明 ±30（幅度 8.3%）：**整个人的上下微浮**。周期取最长（7s），与呼吸（3.2~15.5s）不成整数比，所以两者的相对相位会慢慢错开、看不出周期感。" },
+
+        { "parameter": "headZ",  "amplitude": 2.75, "period": 4.2,  "phase": 0.6,
+          "_note": "ParamAngleZ 声明 ±30（幅度 9.2%）：头随重心微摆。相位与另外几条都错开得最多（0.6），避免「头带着身子一起摇」的刚体感。这条是 atri / miku 都活着的轴，也是唯一从 atri 那份原样保留的轴。" }
+    ]
+}

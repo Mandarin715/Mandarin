@@ -1,0 +1,80 @@
+{
+    "_comment": "语义参数名 → 本模型的实际参数 ID 与取值范围。范围/中立值**取自模型自己声明的取值域**（moc 的 csmGetParameterMinimumValues / DefaultValues / MaximumValues），经测试 parameterMapRangesMatchModelDeclarations 逐条核对。请勿手抄范围，改动请重新从模型读出。",
+    "_model": "miku",
+    "_modelJson": "miku.model3.json",
+    "_paramCount": 141,
+    "_generatedFrom": "测试 dumpsDeclaredParameterTable 打印的模型真值表（build2/tests/live2d-probe/declared-params-miku.tsv）：id / min / default / max 四列一并落入本表，未做任何人工换算。显示名取自模型自带的 miku.cdi3.json（那 141 个参数里大量是无语义 ID，如 Param25，只有 cdi3 说得出它是『x全身』）。",
+
+    "params": {
+        "eyeLOpen":  { "id": "ParamEyeLOpen",  "min": 0.0,  "max": 1.0,  "neutral": 1.0 },
+        "eyeROpen":  { "id": "ParamEyeROpen",  "min": 0.0,  "max": 1.0,  "neutral": 1.0 },
+        "eyeLSmile": { "id": "ParamEyeLSmile", "min": 0.0,  "max": 1.0,  "neutral": 0.0 },
+        "eyeRSmile": { "id": "ParamEyeRSmile", "min": 0.0,  "max": 1.0,  "neutral": 0.0 },
+        "gazeX":     { "id": "ParamEyeBallX",  "min": -1.0, "max": 1.0,  "neutral": 0.0 },
+        "gazeY":     { "id": "ParamEyeBallY",  "min": -1.0, "max": 1.0,  "neutral": 0.0 },
+
+        "browLY":    { "id": "ParamBrowLY",    "min": -1.0, "max": 1.0,  "neutral": 0.0 },
+        "browRY":    { "id": "ParamBrowRY",    "min": -1.0, "max": 1.0,  "neutral": 0.0 },
+        "browLForm": { "id": "ParamBrowLForm", "min": -1.0, "max": 1.0,  "neutral": 0.0 },
+        "browRForm": { "id": "ParamBrowRForm", "min": -1.0, "max": 1.0,  "neutral": 0.0 },
+        "browLAngle": { "id": "ParamBrowLAngle", "min": -1.0, "max": 1.0, "neutral": 0.0 },
+        "browRAngle": { "id": "ParamBrowRAngle", "min": -1.0, "max": 1.0, "neutral": 0.0 },
+        "browLX":    { "id": "ParamBrowLX",    "min": -1.0, "max": 1.0,  "neutral": 0.0 },
+        "browRX":    { "id": "ParamBrowRX",    "min": -1.0, "max": 1.0,  "neutral": 0.0 },
+
+        "mouthForm": { "id": "ParamMouthForm", "min": -1.0, "max": 1.0,  "neutral": 0.0,
+                       "_note": "⚠️ 与 atri **不同**：miku 的嘴形是完整双向 [-1, +1]、默认 0.0（atri 是 [-1, 0]、默认 -0.5，正数会被 Core 夹掉）。所以 miku **能靠这个参数笑**（正数 = 笑），不需要像 atri 那样把『笑』全押在 eye*Smile 上。" },
+        "mouthOpen": { "id": "ParamMouthOpenY", "min": 0.0,  "max": 1.0,  "neutral": 0.0 },
+        "cheek":     { "id": "Param130",       "min": 0.0,  "max": 1.0,  "neutral": 0.0,
+                       "_note": "作者把腮红做成了独立参数并配了一个表情（脸红.exp3.json = {Param130 +1}），cdi3 显示名就是『脸红』。0 为关闭。" },
+
+        "headX":     { "id": "ParamAngleX",    "min": -30.0, "max": 30.0, "neutral": 0.0 },
+        "headY":     { "id": "ParamAngleY",    "min": -30.0, "max": 30.0, "neutral": 0.0 },
+        "headZ":     { "id": "ParamAngleZ",    "min": -30.0, "max": 30.0, "neutral": 0.0 },
+        "bodyX":     { "id": "ParamBodyAngleX", "min": -10.0, "max": 10.0, "neutral": 0.0,
+                       "_note": "⚠️ **实测在这个 rig 上推不动任何像素**：腿部探针把 ParamBodyAngleX 推到 ±10，整帧 alpha 掩码逐位不变、RGB 也不变（geometry=0、appearance=0）。它在 moc 里存在、也被呼吸驱动器写（Live2DOffscreenRenderer 的 ParamBodyAngleX），但**没有连到任何 artmesh**。保留这条语义是因为 a) atri 的同名参数是活的、语义表要保持两模型同构，b) 作者若日后修好 rig，数据不用改。**别拿它做摆动或情绪**——它不会动。" },
+        "bodyY":     { "id": "ParamBodyAngleY", "min": -10.0, "max": 10.0, "neutral": 0.0,
+                       "_note": "⚠️ 同 bodyX：实测推 ±10 零像素变化（它只出现在 physics3.json 里）。别用它。" },
+        "bodyZ":     { "id": "ParamBodyAngleZ", "min": -10.0, "max": 10.0, "neutral": 0.0,
+                       "_note": "⚠️ 同 bodyX：实测推 ±10 零像素变化（它只出现在 physics3.json 里）。atri 那份 idle.json 靠这条轴做左右换重心；**在 miku 上换成 wholeBodyX / lowerBodyZ**（见 presets/idle.json 的 _differsFromAtri）。" },
+
+        "wholeBodyX":     { "id": "Param25", "min": -30.0, "max": 30.0, "neutral": 0.0,
+                            "_note": "cdi3 显示名『x全身』：整体横向平移。miku 独有（atri 没有全身平移）。腿部探针实测：推 ±30 时下半身重心横移 0.70px、掩码面积只变 0.47% ⇒ **是整体平移，不是腿部形变**。" },
+        "wholeBodyY":     { "id": "Param26", "min": -30.0, "max": 30.0, "neutral": 0.0,
+                            "_note": "cdi3 显示名『y全身』：整体上下移动。探针实测下半身重心纵移 0.72px、面积变 2.12% ⇒ 同样是整体位移。" },
+        "upperBodyZ":     { "id": "Param",   "min": -30.0, "max": 30.0, "neutral": 0.0,
+                            "_note": "⚠️ 参数 ID **就叫 `Param`（没有数字）** —— 这是真的，不是笔误：moc 里就注册了这个 id，cdi3 显示名是『z上身』，physics3.json 也在用它。探针实测它主要影响上半身（下半身 geoUpper=3109 对 geoLower=3561，面积变 0.36%）。" },
+        "lowerBodyZ":     { "id": "Param13", "min": -30.0, "max": 30.0, "neutral": 0.0,
+                            "_note": "cdi3 显示名『z下身』：**胯部旋转**，不是腿部关节。探针实测推 ±30：下半身 5822 像素的掩码动了（占区域 9.2%）、重心横移 1.63px，但**掩码面积只变 2.20%** ⇒ 它是把下半身**整体转过去**，不是在掰腿。本模型的腿没有膝/踝参数（见 _unusedByDesign._noLegJoints），所以『让腿动』只能靠它 + 全身平移。" },
+
+        "breath":    { "id": "ParamBreath",    "min": 0.0, "max": 1.0, "neutral": 0.0,
+                       "_note": "由呼吸驱动器持续驱动，情绪预设不要覆盖它" },
+        "hairFront": { "id": "ParamHairFront", "min": -1.0, "max": 1.0, "neutral": 0.0 },
+        "hairSide":  { "id": "ParamHairSide",  "min": -1.0, "max": 1.0, "neutral": 0.0 },
+        "hairBack":  { "id": "ParamHairBack",  "min": -1.0, "max": 1.0, "neutral": 0.0 }
+    },
+
+    "_rangesFromModel": {
+        "_why": "本表所有 min/max/neutral 都等于模型自己声明的 最小/最大/默认值（moc 的真值）。atri 那边踩过的坑在这里一次都没踩：那份表当初参照 atri_8.vtube.json 的 VTS OutputRange 手推，而那是『某个 VTube Studio 配置允许把参数推到多远』，不是这个 moc 的取值边界 —— 实测代价是 mouthForm 写成 [-1,+1]/中立 0.0（真值 [-1,0]/默认 -0.5）令『笑』被夹成 0。miku 的表是**先跑 dumpsDeclaredParameterTable 打出模型真值再照抄**的。",
+        "_howToRegenerate": "测试 dumpsDeclaredParameterTable 会把每个模型的全部声明参数（含 cdi3 显示名）落成 build2/tests/live2d-probe/declared-params-<模型>.tsv；照那张表填，不要照 vtube.json。测试 parameterMapRangesMatchModelDeclarations 会**遍历所有带本文件数据的模型**逐条核对。",
+        "_neutralIsDefault": "neutral 必须是模型的**声明默认值**：中立姿势 = 作者设计的静息值。"
+    },
+
+    "_unusedByDesign": {
+        "_note": "本版不用、但模型确实存在的参数。这里是**作者的按键/道具**开关：作者用 8 个表情文件（*.exp3.json，VTS 热键）各把一个（或几个）参数推到 1.0，属于换装/演出，不是情绪 —— 情绪走 moods.json，不该顺手把它们拉起来（那会让『高兴』和『拿葱』绑在一起）。留在这里是为了让下一个人知道它们**存在**、且被**刻意保留**给换装/道具阶段。",
+        "_verifiedDead": ["Param21", "Param27", "ParamBodyAngleX", "ParamBodyAngleY", "ParamBodyAngleZ"],
+        "_verifiedDeadWhy": "⚠️ **腿部探针实测的『推了也没有任何像素变化』清单**（build2/tests/live2d-probe/leg-probe-miku.txt 里 geoLower=appLower=0、areaDelta=0）：Param21『z平移2』、Param27『x平移』两个从未被任何 artmesh / physics3.json / 动作曲线引用；ParamBodyAngleX/Y/Z 在 moc 里存在、也被呼吸驱动器或物理写，但没有连到任何 artmesh。**别拿它们做情绪或摆动**。注意 `verifiedDead` 里的 ParamBodyAngleX/Y/Z 仍然保留在 params 里（见各自的 _note）：语义表要与 atri 同构，且作者日后修好 rig 时数据不用改。Param21/Param27 没有任何这样的理由，所以**不进语义表**。",
+        "_hotkeyToggle": ["Param125", "Param130", "Param131", "Param132", "Param136", "Param137"],
+        "_hotkeyToggleWhy": "作者热键各推一个参数到 1.0：圈圈=Param125、脸红=Param130、前倾=Param132、QQ人=Param131+Param136、水印=Param137。其中 Param130 已作为 `cheek` 语义正式启用（腮红本来就是情绪的一部分），Param137 由渲染器的 setWatermarkVisible 独占（**反相**：0 = 显示水印、1 = 隐藏，见 Live2DOffscreenRenderer.h），其余留作换装/演出。",
+        "_hotkeyRadioGroup": ["Param133", "Param134", "Param135"],
+        "_hotkeyRadioGroupWhy": "三个互斥的道具/动作开关（葱.exp3.json / 唱歌.exp3.json / 比心.exp3.json 各自把其中一个推到 1.0、其余置 0）—— 这是一组**单选**，任何『顺便』的覆盖都会把作者的当前道具换掉。未纳入本版语义，保留原样。",
+        "_riggingBones": ["Param2", "Param3", "Param4", "Param5", "Param6", "Param7", "Param8", "Param9", "Param10", "Param11", "Param12", "Param14", "Param15", "Param16", "Param17", "Param18", "Param19", "Param20", "Param22", "Param23", "Param24", "Param28", "Param29", "Param30", "Param31", "Param32", "Param33", "Param34", "Param35", "Param36", "Param37", "Param38", "Param39", "Param40", "Param41", "Param42", "Param43", "Param44", "Param45", "Param46", "Param47", "Param48", "Param49", "Param50", "Param51", "Param52", "Param53", "Param54", "Param55", "Param56", "Param57", "Param58", "Param59", "Param60", "Param61", "Param62", "Param63", "Param64", "Param65", "Param66", "Param67", "Param68", "Param69", "Param70", "Param71", "Param72", "Param73", "Param74", "Param75", "Param76", "Param77", "Param78", "Param79", "Param80", "Param81", "Param82", "Param83", "Param84", "Param85", "Param86", "Param87", "Param88", "Param92", "Param93", "Param98", "Param99", "Param100", "Param101", "Param120", "Param126"],
+        "_riggingBonesWhy": "作者的内部骨骼/形变层（cdi3 显示名多是 `z` / `FA1` / `S1` / `前发1` / `瞳孔1` 这种），141 个参数里绝大多数是它们。它们**不是**给外部驱动的语义轴，逐个驱动会让模型进入作者没设计过的姿势。注意其中几个**名字有迷惑性**：Param16/45/63 显示名『大葱』、Param15/46/62『唱歌』、Param14/47/61『比心』看着像开关，实际是那几个道具的骨骼层（真正的开关是 Param133/134/135）。",
+        "_expressionRigging": ["Param31", "Param32", "Param33", "Param34", "Param35", "Param36", "Param50", "Param51", "Param52", "Param53", "Param57", "Param58", "Param71", "Param75", "Param77", "Param80", "Param81", "Param92", "Param93", "Param98", "Param99", "Param100", "Param101", "Param120"],
+        "_expressionRiggingWhy": "眼睛/前发/侧发/后发的形变骨骼（cdi3：眼1/眼2/瞳孔/高光/前发/侧发/后发x）。头发那几条**不要**碰：物理链每帧在写它们的一部分，覆盖它等于把那套物理做废 —— 语义表里已经给了 ParamHairFront/Side/Back 三个正规入口（它们本身也被 isUpdaterOwnedParameter 拦住）。",
+        "_faceExtras": ["Param7", "Paramtushe", "Paramwaizui", "Paramgulian", "Paramguzui", "Paramguzui2", "ParamMouthShrug", "mouthRollLower", "mouthRollLower2", "EyeL_Squint", "EyeR_Squint"],
+        "_faceExtrasWhy": "作者额外做的面部动作：眼变形(Param7)、吐舌(Paramtushe)、歪嘴、鼓脸、鼓嘴1/2、MouthShrug、咬唇/撅嘴、以及 EyeL_Squint / EyeR_Squint（眯眼，**参数名没有 Param 前缀**，是从 VTS 那边带进来的）。本版情绪只用 atri 那套既有词汇 + 全身轴，这些**留给后续**『更细的表情』阶段；其中 Eye*_Squint 最值得优先纳入（眯眼比 eye*Smile 更明确）。",
+        "_noLegJoints": "本模型**没有膝/踝等腿部关节参数**（cdi3 的 141 条里没有）。腿的姿态只能靠 lowerBodyZ（胯旋转）与 wholeBodyX/Y（整体平移）间接改变 —— 这不是数据漏了，是作者没做腿部关节。腿部探针（leg-probe）实测了『哪些参数真的动得了下半身』。",
+        "authorExpressions": "作者把上述参数打包成 8 个 exp3（圈圈/脸红/前倾/葱/唱歌/比心/QQ人/水印），本表按参数直驱，不走 exp3"
+    }
+}

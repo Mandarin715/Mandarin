@@ -1,0 +1,58 @@
+{
+    "_comment": "语义参数名 → 本模型的实际参数 ID 与取值范围。范围/中立值**取自模型自己声明的取值域**（moc 的 csmGetParameterMinimumValues / DefaultValues / MaximumValues），经测试 parameterMapRangesMatchModelDeclarations 逐条核对。请勿手抄范围，改动请重新从模型读出。",
+    "_model": "atri",
+    "_modelJson": "atri_8.model3.json",
+    "_paramCount": 88,
+
+    "params": {
+        "eyeLOpen":  { "id": "ParamEyeLOpen",  "min": 0.0,  "max": 1.0,  "neutral": 1.0 },
+        "eyeROpen":  { "id": "ParamEyeROpen",  "min": 0.0,  "max": 1.0,  "neutral": 1.0 },
+        "eyeLSmile": { "id": "ParamEyeLSmile", "min": 0.0,  "max": 1.0,  "neutral": 0.0 },
+        "eyeRSmile": { "id": "ParamEyeRSmile", "min": 0.0,  "max": 1.0,  "neutral": 0.0 },
+        "gazeX":     { "id": "ParamEyeBallX",  "min": -1.0, "max": 1.0,  "neutral": 0.0 },
+        "gazeY":     { "id": "ParamEyeBallY",  "min": -1.0, "max": 1.0,  "neutral": 0.0 },
+
+        "browLY":    { "id": "ParamBrowLY",    "min": -1.0, "max": 1.0,  "neutral": 0.0 },
+        "browRY":    { "id": "ParamBrowRY",    "min": -1.0, "max": 1.0,  "neutral": 0.0 },
+        "browLForm": { "id": "ParamBrowLForm", "min": -1.0, "max": 1.0,  "neutral": 0.0 },
+        "browRForm": { "id": "ParamBrowRForm", "min": -1.0, "max": 1.0,  "neutral": 0.0 },
+        "browLAngle": { "id": "ParamBrowLAngle", "min": -1.0, "max": 1.0, "neutral": 0.0 },
+        "browRAngle": { "id": "ParamBrowRAngle", "min": -1.0, "max": 1.0, "neutral": 0.0 },
+        "browLX":    { "id": "ParamBrowLX",    "min": -1.0, "max": 1.0,  "neutral": 0.0 },
+        "browRX":    { "id": "ParamBrowRX",    "min": -1.0, "max": 1.0,  "neutral": 0.0 },
+
+        "mouthForm": { "id": "ParamMouthForm", "min": -1.0, "max": 0.0,  "neutral": -0.5,
+                       "_note": "moc 只允许 [-1,0] 且默认 -0.5（静息就是 -0.5，不是 0）：正数会被 Core 夹成 0，所以\"笑\"不靠这个参数，靠 eyeLSmile/eyeRSmile" },
+        "mouthOpen": { "id": "ParamMouthOpenY", "min": 0.0, "max": 1.0,  "neutral": 0.0 },
+        "cheek":     { "id": "ParamCheek",     "min": 0.0,  "max": 1.0,  "neutral": 0.0,
+                       "_note": "0 为关闭；实测可见泛红区间约 0.5~1.0（作者的表情文件用的就是 1.0）" },
+
+        "headX":     { "id": "ParamAngleX",    "min": -30.0, "max": 30.0, "neutral": 0.0 },
+        "headY":     { "id": "ParamAngleY",    "min": -30.0, "max": 30.0, "neutral": 0.0 },
+        "headZ":     { "id": "ParamAngleZ",    "min": -30.0, "max": 30.0, "neutral": 0.0 },
+        "bodyX":     { "id": "ParamBodyAngleX", "min": -10.0, "max": 10.0, "neutral": 0.0 },
+        "bodyY":     { "id": "ParamBodyAngleY", "min": -10.0, "max": 10.0, "neutral": 0.0 },
+        "bodyZ":     { "id": "ParamBodyAngleZ", "min": -10.0, "max": 10.0, "neutral": 0.0 },
+
+        "breath":    { "id": "ParamBreath",    "min": 0.0, "max": 1.0, "neutral": 0.0,
+                       "_note": "由呼吸驱动器持续驱动，情绪预设不要覆盖它" },
+        "hairFront": { "id": "ParamHairFront", "min": -1.0, "max": 1.0, "neutral": 0.0 },
+        "hairSide":  { "id": "ParamHairSide",  "min": -1.0, "max": 1.0, "neutral": 0.0 },
+        "hairBack":  { "id": "ParamHairBack",  "min": -1.0, "max": 1.0, "neutral": 0.0 }
+    },
+
+    "_rangesFromModel": {
+        "_why": "本表所有 min/max/neutral 都等于模型自己声明的 最小/最大/默认值（moc 的真值）。曾经这里是手推的：参照 atri_8.vtube.json 的 VTS OutputRange —— 那是『某个 VTube Studio 配置允许把参数推到多远』，不是这个 moc 的取值边界，两者不是一回事。实测代价：mouthForm 写成 [-1,+1]/中立 0.0（真值 [-1,0]/默认 -0.5）令『笑』被夹成 0；eyeLOpen/eyeROpen 写成 1.9（真值 1.0）令 surprised 的 1.7 无效；mouthOpen 写成 2.1（真值 1.0）同样越界。",
+        "_howToRegenerate": "读 moc3 → CubismModel::GetParameter{Minimum,Default,Maximum}Value（渲染器已暴露为 Live2DOffscreenRenderer::declaredParameterRanges）；测试 parameterMapRangesMatchModelDeclarations 会逐条核对并打印模型真值表。",
+        "_neutralIsDefault": "neutral 必须是模型的**声明默认值**：中立姿势 = 作者设计的静息值。把 mouthForm 钉在 0 会让『中立』从一开始就不是模型本来的表情。"
+    },
+
+    "_unusedByDesign": {
+        "_note": "本版不用、但模型确实存在的参数。换装/道具（B 阶段）会用到其中一部分。",
+        "costume":  ["Param17", "Param18", "Param9",  "Param10"],
+        "shoes":    ["Param19", "Param20"],
+        "effects":  ["Param21", "Param22", "Param31", "Param36", "Param37", "Param38"],
+        "gesture":  ["Param39"],
+        "authorExpressions": "作者把上述参数打包成 16 个 exp3（blush/dress1/shoe1/Blood/Kani/YES/NO…），本表按参数直驱，不走 exp3"
+    }
+}
