@@ -454,6 +454,17 @@ endif()
 # ---- 单元测试（Qt Test）----
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(test_atomicjsonstore tests/test_atomicjsonstore.cpp)
+    target_link_libraries(test_atomicjsonstore PRIVATE Qt${QT_VERSION_MAJOR}::Test Qt${QT_VERSION_MAJOR}::Core)
+    set_target_properties(test_atomicjsonstore PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_custom_command(TARGET test_atomicjsonstore POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Test>"
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Core>"
+            "$<TARGET_FILE_DIR:test_atomicjsonstore>")
+    add_test(NAME test_atomicjsonstore COMMAND test_atomicjsonstore)
+
     add_executable(test_chatlogstore
         tests/test_chatlogstore.cpp
         utils/ChatLogStore.cpp
