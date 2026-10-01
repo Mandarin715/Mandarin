@@ -4,6 +4,7 @@
 #include "reminder/reminder.h"
 #include "../../utils/ChatLogStore.h"
 #include "../../utils/AtomicJsonStore.h"
+#include "../../utils/ReplyAppearanceIntent.h"
 
 #include <QRandomGenerator>
 #include "ui_dialog.h"
@@ -585,9 +586,13 @@ void Dialog::initServices()
     // 播放错误诊断
     connect(m_vitsPlayer, &QMediaPlayer::errorOccurred, this,
             [this](QMediaPlayer::Error error, const QString &errorString) {
-                if (error != QMediaPlayer::NoError) {
+                if (error != QMediaPlayer::NoError)
+                {
                     m_reminderDelivery.failed = true;
                     QTimer::singleShot(0, this, &Dialog::checkVitsPipelineFinished);
+                    ++m_replyExpressionGeneration;
+                    m_replyExpressionActive = false;
+                    emit requestReplyExpressionFinished();
                 }
                 qWarning() << "[VITS] player error:" << error << errorString
                            << "| state:" << m_vitsPlayer->playbackState()
@@ -1588,6 +1593,10 @@ void Dialog::tryStartNextVitsRequest()
 void Dialog::resetVitsPipeline()
 {
     finishReminderDelivery(false);
+    ++m_replyExpressionGeneration;
+    m_replyExpressionActive = false;
+    m_streamExpressionApplied = false;
+    emit requestReplyExpressionFinished();
     ++m_vitsGeneration;
 
     const auto replies = m_vitsInFlightReplies;
@@ -1616,6 +1625,7 @@ void Dialog::resetVitsPipeline()
 /*检查 VITS 管线是否全部完成（供统一回调）*/
 void Dialog::checkVitsPipelineFinished()
 {
+    // A sentence may end while more reply chunks and synthesis jobs are still coming.
     if (m_activeChatAi || m_proactiveInFlight) return;
     if (!m_vitsPendingTexts.isEmpty()) return;
     if (!m_vitsInFlightReplies.isEmpty()) return;
@@ -1629,18 +1639,36 @@ void Dialog::checkVitsPipelineFinished()
     }
     if (m_vitsFinishScheduled) return;
     m_vitsFinishScheduled = true;
+    if (m_replyExpressionActive)
+    {
+        m_replyExpressionActive = false;
+        if (m_replyAudioExpected)
+            emit requestReplyExpressionFinished();
+        else
+        {
+            const quint64 expressionGeneration = m_replyExpressionGeneration;
+            QTimer::singleShot(2500, this, [this, expressionGeneration]() {
+                if (expressionGeneration == m_replyExpressionGeneration)
+                    emit requestReplyExpressionFinished();
+            });
+        }
+    }
 
     // VITS 管线只负责恢复默认立绘；内心独白由 Tachie 的 20 秒定时器管理。
+    const quint64 expressionGeneration = m_replyExpressionGeneration;
     if (!m_isSpeechRecording) {
-        QTimer::singleShot(m_continuousAudioDelayMs, this, [this]() {
-            emit requestSetCharTachie("default");
+        QTimer::singleShot(m_continuousAudioDelayMs, this, [this, expressionGeneration]() {
+            if (expressionGeneration == m_replyExpressionGeneration &&
+                !isChatBusy() && isAllVitsDone() && !m_isSpeechRecording)
+                emit requestSetCharTachie("default");
         });
     }
 
     // 连续对话模式：全部播完后开始下一轮
     if (m_continuousMode && !m_isSpeechRecording) {
-        QTimer::singleShot(500, this, [this]() {
-            if (!isAllVitsDone() || !m_continuousMode) return;
+        QTimer::singleShot(500, this, [this, expressionGeneration]() {
+            if (expressionGeneration != m_replyExpressionGeneration ||
+                isChatBusy() || !isAllVitsDone() || !m_continuousMode) return;
             if (!ui->textEdit->isEnabled() && ui->pushButton_next->isVisible()) {
                 ui->textEdit->setEnabled(true);
                 ui->pushButton_next->hide();
@@ -2151,14 +2179,14 @@ bool Dialog::doSubmitCurrentInput(const QString &userInput)
 
     const QString currentChar = ReadNowSelectChar();
 
-    provider->setSystemPrompt(buildSystemPrompt(currentChar));
+    provider->setSystemPrompt(buildSystemPrompt(currentChar) + ReplyAppearanceIntent::prompt(m_appearanceContext));
 
     m_lastUserInput = userInput;
     ZcJsonLib charConfig(ReadCharacterUserConfigPath());
     m_streamVitsEnabled = charConfig.value("vitsEnable").toBool();
     ZcJsonLib config(JsonSettingPath);
     m_streamVitsSentenceSplitEnabled =
-        config.value("vits/SentenceSplit", true).toBool();
+        config.value("vits/SentenceSplit", true).toBool() && ReplyAppearanceIntent::requested(userInput).isEmpty();
     // 缓存VITS配置，避免每句话重复读文件
     m_cachedVitsApiUrl = config.value("vits/ApiUrl").toString();
     QString modelAndSpeaker = charConfig.value("vitsMasSelect").toString();
@@ -2995,8 +3023,6 @@ void Dialog::doSubmitWithSearchContext(const QString &userMessage,
 
     doSubmitCurrentInput(enhancedInput);
 }
-
-/*截取屏幕并编码为JPEG base64*/
 
 /*捕获屏幕并启动分析*/
 void Dialog::captureAndAnalyzeScreen()
@@ -4214,6 +4240,10 @@ static QString buildProactivePrompt(const QString &windowTitle,
 void Dialog::cancelActiveChat()
 {
     ++m_chatGeneration;
+    ++m_replyExpressionGeneration;
+    m_replyExpressionActive = false;
+    m_streamExpressionApplied = false;
+    emit requestReplyExpressionFinished();
 
     if (m_activeChatAi)
     {
@@ -4352,8 +4382,6 @@ void Dialog::finishReminderDelivery(bool success)
     m_reminderDelivery.audioExpected = false;
     m_reminderDelivery.failed = false;
 }
-
-/*保存日程列表*/
 
 /*中文数字转阿拉伯数字：一→1 十二→12 二十三→23 十→10*/
 static int chineseToInt(const QString &s)
@@ -4541,7 +4569,6 @@ void Dialog::checkSchedules()
     }
 }
 
-/*触发提醒：走主动对话链路说话，返回是否真正发声（应用忙则false）*/
 bool Dialog::fireSchedule(const Schedule &reminder, bool missed)
 {
     if (!m_activeReminderId.isEmpty() || isChatBusy() || m_userAway ||
@@ -4565,7 +4592,6 @@ bool Dialog::fireSchedule(const Schedule &reminder, bool missed)
     return false;
 }
 
-/*启动时补触发遗漏日程（合并播报）*/
 void Dialog::catchUpMissedSchedules()
 {
     // All overdue reminders remain queued, including those older than 24 hours.
@@ -4584,6 +4610,16 @@ void Dialog::connectChatCallbacks(AiProvider *provider, quint64 generation)
                 m_streamRawReply += chunk;
                 const int firstSep = m_streamRawReply.indexOf('|');
                 if (firstSep < 0) return;
+                if (!m_streamExpressionApplied)
+                {
+                    m_streamExpressionApplied = true;
+                    m_replyExpressionActive = true;
+                    m_replyAudioExpected = m_streamVitsEnabled;
+                    ++m_replyExpressionGeneration;
+                    const QString mood = m_streamRawReply.left(firstSep).trimmed();
+                    emit requestReplyExpression(mood);
+                    emit requestSetCharTachie(mood);
+                }
                 const int secondSep = m_streamRawReply.indexOf('|', firstSep + 1);
                 const int chineseEnd = secondSep < 0 ? m_streamRawReply.size() : secondSep;
                 const QString chinesePartial = m_streamRawReply.mid(firstSep + 1, chineseEnd - firstSep - 1);
@@ -4592,7 +4628,7 @@ void Dialog::connectChatCallbacks(AiProvider *provider, quint64 generation)
                     if (!m_streamDisplayTimer->isActive()) m_streamDisplayTimer->start();
                 }
                 if (m_streamVitsEnabled && m_streamVitsSentenceSplitEnabled && secondSep >= 0) {
-                    const QString jp = m_streamRawReply.mid(secondSep + 1);
+                    const QString jp = m_streamRawReply.section('|', 2, 2);
                     if (!jp.isEmpty()) {
                         int se = findNextSentenceEnd(jp, m_streamSynthCursor);
                         while (se >= 0) {
@@ -4614,6 +4650,18 @@ void Dialog::connectChatCallbacks(AiProvider *provider, quint64 generation)
                 const QString cn = fr.section('|', 1, 1).trimmed();
                 const QString jp = fr.section('|', 2, 2).trimmed();
                 const QString it = fr.section('|', 3, 3).trimmed();
+                if (!m_streamExpressionApplied)
+                {
+                    m_replyExpressionActive = true;
+                    m_replyAudioExpected = m_streamVitsEnabled;
+                    ++m_replyExpressionGeneration;
+                    emit requestReplyExpression(mood);
+                }
+                if (!m_appearanceContext.isEmpty())
+                {
+                    const auto appearance = ReplyAppearanceIntent::parse(fr, m_lastUserInput);
+                    if (!appearance.isEmpty()) emit requestAppearanceChange(appearance);
+                }
                 m_streamDisplayTimer->stop();
                 ui->pushButton_next->show();
                 ui->textEdit->setText(cn);
@@ -4626,7 +4674,6 @@ void Dialog::connectChatCallbacks(AiProvider *provider, quint64 generation)
                 emit requestSetCharTachie(mood);
                 if (!it.isEmpty())
                     emit requestShowInnerThought(it);
-                { if (isAllVitsDone() && !m_isSpeechRecording) QTimer::singleShot(m_continuousAudioDelayMs, this, [this]() { emit requestSetCharTachie("default"); }); }
                 const QString ui_ = m_lastUserInput;
                 if (!m_lastUserInput.isEmpty()) { appendHistoryLine("用户：" + m_lastUserInput); m_lastUserInput.clear(); }
                 appendHistoryLine("角色：" + cn);
@@ -4636,13 +4683,6 @@ void Dialog::connectChatCallbacks(AiProvider *provider, quint64 generation)
                     QTimer::singleShot(200, this, [this, uc, ac, memoryPath, memoryGeneration]() {
                         if (memoryPath == ReadCharacterMemoryPath() && memoryGeneration == m_memoryGeneration)
                             extractAndStoreMemory(uc, ac);
-                    });
-                }
-                if (m_continuousMode && !m_streamVitsEnabled && isAllVitsDone() && !m_isSpeechRecording) {
-                    QTimer::singleShot(500, this, [this]() {
-                        if (!isAllVitsDone()) return;
-                        if (!ui->textEdit->isEnabled() && ui->pushButton_next->isVisible()) { ui->textEdit->setEnabled(true); ui->pushButton_next->hide(); ui->textEdit->clear(); }
-                        startSpeechRecordingFromHotkey();
                     });
                 }
                 m_streamRawReply.clear(); m_streamDisplayedChinese.clear(); m_streamVitsEnabled = false; m_streamSynthCursor = 0;
@@ -4659,6 +4699,9 @@ void Dialog::connectChatCallbacks(AiProvider *provider, quint64 generation)
                 m_lastUserInput.clear(); m_streamRawReply.clear(); m_streamDisplayedChinese.clear();
                 m_streamVitsEnabled = false; m_streamSynthCursor = 0;
                 m_activeChatAi = nullptr;
+                ++m_replyExpressionGeneration;
+                m_replyExpressionActive = false;
+                emit requestReplyExpressionFinished();
                 provider->deleteLater();
             });
 }
@@ -4788,6 +4831,10 @@ bool Dialog::doProactiveSpeak(const QString &windowTitle,
                 ui->textEdit->setText(chinese);
                 ui->textEdit->setEnabled(false);
                 ui->label_name->setText(QStringLiteral("她"));
+                m_replyExpressionActive = true;
+                m_replyAudioExpected = speak;
+                ++m_replyExpressionGeneration;
+                emit requestReplyExpression(mood);
                 emit requestSetCharTachie(mood);
                 if (!innerThought.isEmpty())
                     emit requestShowInnerThought(innerThought);

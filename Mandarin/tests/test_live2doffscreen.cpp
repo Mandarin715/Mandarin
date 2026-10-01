@@ -4,6 +4,7 @@
 #include "../utils/AudioEnvelope.h"
 #include "../utils/Live2DMoodPreset.h"
 #include "../utils/Live2DOffscreenRenderer.h"
+#include "../utils/Live2DCubismRuntime.h"
 #include "SyntheticWav.h"
 
 #include <QDir>
@@ -15,7 +16,9 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QPainter>
 #include <QRegularExpression>
+#include <QScopeGuard>
 #include <QSet>
 #include <QSettings>
 #include <QThread>
@@ -140,6 +143,7 @@ class TestLive2DOffscreen : public QObject
        本阶段起**遍历每个带 presets/idle.json 的模型**，文件名带模型名
        （`idle-<模型>-phase<N>.png`），atri 的既有无后缀素材刻意不动。*/
     void rendersIdleSwayPhaseFrames();
+    void validatesSakuraRepositoryPresets();
     /*[数据纪律] 每个带 idle.json 的模型：装载成功、没有驱动器/嘴形条目、
        每条幅度都在声明量程的 20% 警戒线以内（文件自己的规则）。*/
     void idleSwayDataObeysItsOwnRulesForEveryModel();
@@ -174,6 +178,8 @@ class TestLive2DOffscreen : public QObject
         与新版跑同一串固定输入、比对逐位指纹。正常构建不定义这个宏。*/
 #if !defined(MANDARIN_BITEQ_BASELINE)
     void twoRenderersInOneProcessBothRender();
+    void unloadedRendererCannotReleaseAnotherRendererRuntime();
+    void repeatedLoadsReleaseRuntime();
 #endif
 
     /*单一渲染器的逐位指纹：本次"共享根 GL 上下文"改动必须对既有单一渲染器路径零影响，
@@ -655,7 +661,7 @@ void TestLive2DOffscreen::reportsFrameCost()
     for (const Result &r : results)
     {
         QVERIFY2(r.msPerFrame < 500.0,
-                 qPrintable(QStringLiteral("%1x%2 每帧 %.1f ms，慢到不可用")
+                 qPrintable(QStringLiteral("%1x%2 每帧 %3 ms，慢到不可用")
                                 .arg(r.size.width())
                                 .arg(r.size.height())
                                 .arg(r.msPerFrame)));
@@ -765,7 +771,7 @@ void TestLive2DOffscreen::moodBlendReachesTargetExactly()
        指数逼近（value += (target-value)*k*dt）在这里永远差一点点，
        所以这条断言就是"必须 snap"的那颗钉子。*/
     QVERIFY2(qAbs(arrived - 0.9f) <= 1e-5f,
-             qPrintable(QStringLiteral("过渡时长过后 %1 = %.6f，不等于目标 0.900000 —— "
+             qPrintable(QStringLiteral("过渡时长过后 %1 = %2，不等于目标 0.900000 —— "
                                        "逼近必须收敛到目标（snap），不能只是无限接近")
                             .arg(kMoodProbeParameter)
                             .arg(double(arrived))));
@@ -813,7 +819,7 @@ void TestLive2DOffscreen::moodBlendHasNoSingleFrameJump()
        - 而"一帧跳完"的实现第一帧就位移 0.9，是阈值的 3 倍，必然被抓到。
        噪声不参与：这个参数不归任何驱动器管（见 kMoodProbeParameter 的说明）。*/
     QVERIFY2(maxStep <= totalRange / 3.0f,
-             qPrintable(QStringLiteral("逐帧最大变化 %.4f（第 %1 帧）超过量程的 1/3 —— "
+             qPrintable(QStringLiteral("逐帧最大变化 %1（第 %2 帧）超过量程的 1/3 —— "
                                        "参数在某一帧整块跳过去了，过渡没有铺开")
                             .arg(double(maxStep))
                             .arg(maxStepIndex)));
@@ -3693,6 +3699,39 @@ void TestLive2DOffscreen::comparesTwoModelsForRigEquivalence()
   名字在另一个上下文里不存在时 GL **不报错**，只是 glUseProgram 静默失败、
   一个三角形都不发 —— 这正是"数据全对、画面全空"的形态。*/
 #if !defined(MANDARIN_BITEQ_BASELINE)
+void TestLive2DOffscreen::unloadedRendererCannotReleaseAnotherRendererRuntime()
+{
+    QString error;
+    QVERIFY2(Live2DCubismRuntime::acquire(&error), qPrintable(error));
+    const auto cleanup = qScopeGuard([] {
+        if (Live2DCubismRuntime::isRunning()) Live2DCubismRuntime::release();
+    });
+    {
+        Live2DOffscreenRenderer unusedPreview;
+    }
+    QVERIFY2(Live2DCubismRuntime::isRunning(),
+             "An unloaded renderer released another owner's Cubism runtime");
+}
+
+void TestLive2DOffscreen::repeatedLoadsReleaseRuntime()
+{
+    const QString dir = modelDir();
+    const QString json = availableModelJson(dir);
+    if (json.isEmpty()) QSKIP("No local model available");
+    QVERIFY(!Live2DCubismRuntime::isRunning());
+    const auto cleanup = qScopeGuard([] {
+        while (Live2DCubismRuntime::isRunning()) Live2DCubismRuntime::release();
+    });
+    {
+        Live2DOffscreenRenderer renderer;
+        QString error;
+        QVERIFY2(renderer.load(dir, json, &error), qPrintable(error));
+        QVERIFY2(renderer.load(dir, json, &error), qPrintable(error));
+        QVERIFY(!renderer.renderFrame(QSize(200, 350)).isNull());
+    }
+    QVERIFY2(!Live2DCubismRuntime::isRunning(), "Repeated loads leaked a runtime reference");
+}
+
 void TestLive2DOffscreen::twoRenderersInOneProcessBothRender()
 {
     const QString dir = modelDir();
@@ -3865,6 +3904,126 @@ QStringList TestLive2DOffscreen::modelNamesWithMoodData()
             names.append(name);
     }
     return names;
+}
+
+/*直接验收仓库候选，不必先写用户数据。没有本地模型时只跳过 moc/画图部分。*/
+void TestLive2DOffscreen::validatesSakuraRepositoryPresets()
+{
+    const QString name = QStringLiteral("樱花miku");
+    const QString root = QFINDTESTDATA("../assets/live2d-presets");
+    QVERIFY2(!root.isEmpty(), "Repository preset root is missing");
+    const QString dir = QDir(root).filePath(name);
+    QVERIFY2(QDir(dir).exists(), "Sakura repository preset directory is missing");
+    Live2DMoodPreset preset;
+    QVERIFY2(preset.load(name, dir), "Sakura repository presets cannot be loaded");
+    QVERIFY(preset.loadIdle());
+    QVERIFY(!preset.idleSwayEntries().isEmpty());
+    const auto ranges = preset.parameters();
+    QVERIFY(!ranges.isEmpty());
+    const auto deltas = preset.archetypeDeltas();
+    QVERIFY(!deltas.isEmpty());
+    int compared = 0;
+    for (auto archetype = deltas.cbegin(); archetype != deltas.cend(); ++archetype)
+    {
+        for (auto delta = archetype.value().cbegin(); delta != archetype.value().cend(); ++delta)
+        {
+            QVERIFY2(ranges.contains(delta.key()), qPrintable(delta.key()));
+            const auto range = ranges.value(delta.key());
+            const float target = delta.value(); // 稀疏绝对目标；未列出的参数用 neutral
+            QVERIFY2(target >= range.min && target <= range.max,
+                     qPrintable(archetype.key() + QLatin1Char('/') + delta.key()));
+            QVERIFY(!Live2DMoodPreset::isUpdaterOwnedParameter(range.id));
+            // 演出开关不属于情绪；Param133 在这套 rig 上是哭，不是葱。
+            QVERIFY(range.id != QStringLiteral("Param133") &&
+                    range.id != QStringLiteral("Param131") &&
+                    range.id != QStringLiteral("Param136"));
+            ++compared;
+        }
+    }
+    QVERIFY(compared > 0);
+    // 别名属于角色，必须与已经验收的 miku 词表一致。
+    Live2DMoodPreset reference;
+    QVERIFY(reference.load(QStringLiteral("miku"), QDir(dir).filePath("../miku")));
+    QVERIFY(preset.moodAliases() == reference.moodAliases());
+    const QString modelDir = QDir(Live2DModelRootPath).filePath(name);
+    if (!QDir(modelDir).exists())
+        QSKIP("Sakura JSON checked; local model absent, skipping moc/render checks");
+    Live2DOffscreenRenderer renderer;
+    QString error;
+    QVERIFY2(loadModelByName(name, &renderer, &error), qPrintable(error));
+    const auto declared = renderer.declaredParameterRanges();
+    for (auto entry = ranges.cbegin(); entry != ranges.cend(); ++entry)
+    {
+        QVERIFY2(declared.contains(entry.value().id), qPrintable(entry.key()));
+        const auto actual = declared.value(entry.value().id);
+        const auto expected = entry.value();
+        QVERIFY2(qAbs(actual.min - expected.min) < 1e-5f &&
+                     qAbs(actual.max - expected.max) < 1e-5f &&
+                     qAbs(actual.neutral - expected.neutral) < 1e-5f,
+                 qPrintable(QStringLiteral("%1 declared=%2/%3/%4 map=%5/%6/%7")
+                     .arg(entry.key()).arg(actual.min).arg(actual.neutral).arg(actual.max)
+                     .arg(expected.min).arg(expected.neutral).arg(expected.max)));
+    }
+    renderer.setWatermarkVisible(false);
+    renderer.setMoodBlendDurationMs(0);
+    renderer.setMeasureMode(true);
+    for (int i = 0; i < 20; ++i)
+    {
+        renderer.setNextFrameDeltaSeconds(0.1f);
+        const QImage frame = renderer.renderFrame(QSize(512, 512));
+        QVERIFY(!frame.isNull());
+        renderer.probeFigureMetrics(frame);
+    }
+    renderer.setMeasureMode(false);
+    const auto metrics = renderer.figureMetrics();
+    QVERIFY(metrics.valid && metrics.boundsAspect > 0.05f);
+    const QSize size(qRound(1072 * metrics.boundsAspect), 1072);
+    renderer.setDisplayRatios(0.84f, 0.84f);
+    const QString outDir = QDir(QCoreApplication::applicationDirPath())
+                               .absoluteFilePath("../live2d-probe/sakura-review");
+    QVERIFY(QDir().mkpath(outDir));
+    const QStringList archetypes = preset.archetypeNames();
+    QImage sheet(size.width() * 7, (size.height() + 28) * 2, QImage::Format_RGB32);
+    sheet.fill(QColor(230, 230, 230));
+    QPainter painter(&sheet);
+    int index = 0;
+    for (const QString &archetype : archetypes)
+    {
+        renderer.setParameterOverrides(preset.parametersForArchetype(archetype));
+        renderer.setNextFrameDeltaSeconds(0.0f);
+        const QImage frame = renderer.renderFrame(size);
+        QVERIFY(!frame.isNull());
+        QVERIFY(frame.save(QDir(outDir).filePath(archetype + ".png")));
+        const QPoint origin((index % 7) * size.width(), (index / 7) * (size.height() + 28));
+        painter.drawText(origin + QPoint(8, 20), archetype);
+        painter.drawImage(origin + QPoint(0, 28), frame);
+        ++index;
+    }
+    painter.end();
+    QVERIFY(index > 1 && index <= 14);
+    QVERIFY(sheet.save(QDir(outDir).filePath("moods.png")));
+    renderer.setParameterOverrides(preset.parametersForArchetype(QStringLiteral("neutral")));
+    renderer.setIdleSway(preset.idleSwayEntries());
+    QVERIFY(renderer.isIdleSwayActive());
+    QImage idleSheet(size.width() * 6, size.height(), QImage::Format_RGB32);
+    idleSheet.fill(QColor(230, 230, 230));
+    QPainter idlePainter(&idleSheet);
+    for (int phase = 0; phase < 6; ++phase)
+    {
+        QImage frame;
+        for (int i = 0; i < 10; ++i)
+        {
+            renderer.setNextFrameDeltaSeconds(0.1f);
+            frame = renderer.renderFrame(size);
+            QVERIFY(!frame.isNull());
+        }
+        idlePainter.drawImage(QPoint(phase * size.width(), 0), frame);
+        QVERIFY(frame.save(QDir(outDir).filePath(QStringLiteral("idle-%1.png").arg(phase))));
+    }
+    idlePainter.end();
+    QVERIFY(idleSheet.save(QDir(outDir).filePath("idle.png")));
+    qInfo("SAKURA checked: %d mapped parameters, %d mood entries, %d archetypes; review=%s",
+          ranges.size(), compared, archetypes.size(), qPrintable(outDir));
 }
 
 QTEST_MAIN(TestLive2DOffscreen)

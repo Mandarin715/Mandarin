@@ -51,6 +51,10 @@ class Live2DOffscreenRenderer
       key 为参数 ID（如 ParamEyeLSmile）。*/
     void setParameterOverrides(const QHash<QString, float> &overrides);
 
+    // 独立装扮层：动作/情绪/物理之后施加，且不写进下一帧基线。
+    // 调用方须先用声明范围及情绪/驱动器参数清单验证装扮表。
+    void setAppearanceOverrides(const QHash<QString, float> &overrides);
+
     /*清空整组覆盖：回到"每个参数完全由动作/驱动器决定"的状态。
       情绪功能自关（预设文件缺失/非法）时用它，避免留下上一帧的残留情绪。*/
     void clearParameterOverrides();

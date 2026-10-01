@@ -1,0 +1,234 @@
+{
+  "_comment": "语义名独立核对樱花miku的 cdi3 显示名；min/max/neutral 来自本次 dumpsDeclaredParameterTable 的 moc 声明，不从 VTS 抄范围。",
+  "_model": "樱花miku",
+  "_modelJson": "樱花miku.model3.json",
+  "_paramCount": 141,
+  "_generatedFrom": "build2/tests/live2d-probe/declared-params-樱花miku.tsv (2026-09-30)",
+  "params": {
+    "eyeLOpen": {
+      "id": "ParamEyeLOpen",
+      "min": 0.0,
+      "max": 1.0,
+      "neutral": 1.0,
+      "_displayName": "左眼　开闭"
+    },
+    "eyeROpen": {
+      "id": "ParamEyeROpen",
+      "min": 0.0,
+      "max": 1.0,
+      "neutral": 1.0,
+      "_displayName": "右眼"
+    },
+    "eyeLSmile": {
+      "id": "ParamEyeLSmile",
+      "min": 0.0,
+      "max": 1.0,
+      "neutral": 0.0,
+      "_displayName": "左眼　微笑"
+    },
+    "eyeRSmile": {
+      "id": "ParamEyeRSmile",
+      "min": 0.0,
+      "max": 1.0,
+      "neutral": 0.0,
+      "_displayName": "右眼　微笑"
+    },
+    "gazeX": {
+      "id": "ParamEyeBallX",
+      "min": -1.0,
+      "max": 1.0,
+      "neutral": 0.0,
+      "_displayName": "眼珠 X"
+    },
+    "gazeY": {
+      "id": "ParamEyeBallY",
+      "min": -1.0,
+      "max": 1.0,
+      "neutral": 0.0,
+      "_displayName": "眼珠 Y"
+    },
+    "browLY": {
+      "id": "ParamBrowLY",
+      "min": -1.0,
+      "max": 1.0,
+      "neutral": 0.0,
+      "_displayName": "左眉上下"
+    },
+    "browRY": {
+      "id": "ParamBrowRY",
+      "min": -1.0,
+      "max": 1.0,
+      "neutral": 0.0,
+      "_displayName": "右眉　上下"
+    },
+    "browLForm": {
+      "id": "ParamBrowLForm",
+      "min": -1.0,
+      "max": 1.0,
+      "neutral": 0.0,
+      "_displayName": "左眉　変形"
+    },
+    "browRForm": {
+      "id": "ParamBrowRForm",
+      "min": -1.0,
+      "max": 1.0,
+      "neutral": 0.0,
+      "_displayName": "右眉　変形"
+    },
+    "browLAngle": {
+      "id": "ParamBrowLAngle",
+      "min": -1.0,
+      "max": 1.0,
+      "neutral": 0.0,
+      "_displayName": "左眉　角度"
+    },
+    "browRAngle": {
+      "id": "ParamBrowRAngle",
+      "min": -1.0,
+      "max": 1.0,
+      "neutral": 0.0,
+      "_displayName": "右眉　角度"
+    },
+    "browLX": {
+      "id": "ParamBrowLX",
+      "min": -1.0,
+      "max": 1.0,
+      "neutral": 0.0,
+      "_displayName": "左眉　左右"
+    },
+    "browRX": {
+      "id": "ParamBrowRX",
+      "min": -1.0,
+      "max": 1.0,
+      "neutral": 0.0,
+      "_displayName": "右眉　左右"
+    },
+    "mouthForm": {
+      "id": "ParamMouthForm",
+      "min": -1.0,
+      "max": 1.0,
+      "neutral": 0.0,
+      "_displayName": "嘴　变形"
+    },
+    "mouthOpen": {
+      "id": "ParamMouthOpenY",
+      "min": 0.0,
+      "max": 1.0,
+      "neutral": 0.0,
+      "_displayName": "嘴　张开和闭合"
+    },
+    "cheek": {
+      "id": "Param130",
+      "min": 0.0,
+      "max": 1.0,
+      "neutral": 0.0,
+      "_displayName": "脸红"
+    },
+    "headX": {
+      "id": "ParamAngleX",
+      "min": -30.0,
+      "max": 30.0,
+      "neutral": 0.0,
+      "_displayName": "角度 X"
+    },
+    "headY": {
+      "id": "ParamAngleY",
+      "min": -30.0,
+      "max": 30.0,
+      "neutral": 0.0,
+      "_displayName": "角度 Y"
+    },
+    "headZ": {
+      "id": "ParamAngleZ",
+      "min": -30.0,
+      "max": 30.0,
+      "neutral": 0.0,
+      "_displayName": "角度 Z"
+    },
+    "bodyX": {
+      "id": "ParamBodyAngleX",
+      "min": -10.0,
+      "max": 10.0,
+      "neutral": 0.0,
+      "_displayName": "身体旋转　X"
+    },
+    "bodyY": {
+      "id": "ParamBodyAngleY",
+      "min": -10.0,
+      "max": 10.0,
+      "neutral": 0.0,
+      "_displayName": "身体旋转　Y"
+    },
+    "bodyZ": {
+      "id": "ParamBodyAngleZ",
+      "min": -10.0,
+      "max": 10.0,
+      "neutral": 0.0,
+      "_displayName": "身体旋转　Z"
+    },
+    "wholeBodyX": {
+      "id": "Param25",
+      "min": -30.0,
+      "max": 30.0,
+      "neutral": 0.0,
+      "_displayName": "x全身"
+    },
+    "wholeBodyY": {
+      "id": "Param26",
+      "min": -30.0,
+      "max": 30.0,
+      "neutral": 0.0,
+      "_displayName": "y全身"
+    },
+    "upperBodyZ": {
+      "id": "Param",
+      "min": -30.0,
+      "max": 30.0,
+      "neutral": 0.0,
+      "_displayName": "z上身"
+    },
+    "lowerBodyZ": {
+      "id": "Param13",
+      "min": -30.0,
+      "max": 30.0,
+      "neutral": 0.0,
+      "_displayName": "z下身"
+    },
+    "breath": {
+      "id": "ParamBreath",
+      "min": 0.0,
+      "max": 1.0,
+      "neutral": 0.0,
+      "_displayName": "呼吸"
+    },
+    "hairFront": {
+      "id": "ParamHairFront",
+      "min": -1.0,
+      "max": 1.0,
+      "neutral": 0.0,
+      "_displayName": "摇动 前发"
+    },
+    "hairSide": {
+      "id": "ParamHairSide",
+      "min": -1.0,
+      "max": 1.0,
+      "neutral": 0.0,
+      "_displayName": "摇动 侧发"
+    },
+    "hairBack": {
+      "id": "ParamHairBack",
+      "min": -1.0,
+      "max": 1.0,
+      "neutral": 0.0,
+      "_displayName": "摇动 后发"
+    }
+  },
+  "_reservedExpressions": {
+    "Param125": "圈圈",
+    "Param137": "水印，渲染器独占",
+    "Param131": "QQ人",
+    "Param133": "哭（miku 同 ID 是葱，不能复用其道具表）",
+    "Param132": "前倾",
+    "Param136": "QQ人"
+  }
+}

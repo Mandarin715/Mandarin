@@ -243,7 +243,7 @@ bool Live2DMoodPreset::loadMoods(const QString &path, QString *error)
     return true;
 }
 
-bool Live2DMoodPreset::load(const QString &modelName)
+bool Live2DMoodPreset::load(const QString &modelName, const QString &directoryOverride)
 {
     clearAll();
 
@@ -251,7 +251,7 @@ bool Live2DMoodPreset::load(const QString &modelName)
     if (m_modelName.isEmpty())
         return fail(QStringLiteral("模型名为空"));
 
-    m_modelDir = resolveModelDir(m_modelName);
+    m_modelDir = directoryOverride.isEmpty() ? resolveModelDir(m_modelName) : directoryOverride;
     if (m_modelDir.isEmpty())
         return fail(QStringLiteral("按 CharSelect + 模型名推不出模型目录: %1").arg(m_modelName));
 
@@ -571,7 +571,7 @@ QHash<QString, float> Live2DMoodPreset::parametersForArchetype(const QString &ar
     for (auto it = m_parameters.constBegin(); it != m_parameters.constEnd(); ++it)
         (void)insertOwnedParameter(&result, it.key(), it.value().neutral);
 
-    /*② 叠上原型的差异（只写了与中立值不同的那些参数）。*/
+    /*② 用原型的绝对目标值替换基线（只写与中立值不同的参数，不做加法）。*/
     const QHash<QString, float> deltas = m_archetypeDeltas.value(archetype);
     for (auto it = deltas.constBegin(); it != deltas.constEnd(); ++it)
         (void)insertOwnedParameter(&result, it.key(), it.value());

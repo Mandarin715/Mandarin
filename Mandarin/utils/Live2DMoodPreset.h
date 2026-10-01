@@ -13,9 +13,9 @@
 
     1) `<模型目录>/parameter-map.json`
        语义参数名 → 真实参数 ID + 取值范围 + 中立值（27 个）。范围取自模型自带的
-       vtube.json / cdi3.json，**不许在这里重新推导**。
+       moc 声明，**不许从 vtube.json / cdi3.json 抄范围**。
     2) `<模型目录>/presets/moods.json`
-       `archetypes`：14 个情绪原型，每个只写"与中立值的差异"；
+       `archetypes`：14 个情绪原型，每个只写"与中立值不同的绝对目标值"；
        `moodAliases`：26 个心情名（= 角色 `Tachie/` 下 PNG 的文件名）→ 原型。
     3) `<模型目录>/presets/idle.json`
        `sway`：待机摆动的若干条轴（**语义**参数名 + 幅度 + 周期 + 相位）。让角色"站着、
@@ -67,8 +67,9 @@ class Live2DMoodPreset
     };
 
     /*按模型名装载两份 JSON。返回是否可用；不可用时 isEnabled()==false，
-      调用方应当"什么都不施加"（并保证不残留上一种情绪）。*/
-    bool load(const QString &modelName);
+      调用方应当"什么都不施加"（并保证不残留上一种情绪）。
+      directoryOverride 非空时从指定预设目录读取，供离线校准/测试使用；默认路径不变。*/
+    bool load(const QString &modelName, const QString &directoryOverride = QString());
 
     /*装载**待机摆动**数据（`<模型目录>/presets/idle.json`）。
 

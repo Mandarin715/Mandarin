@@ -3,6 +3,7 @@
 #include "../../GlobalConstants.h"
 
 #include "../../utils/DragHelper.h"
+#include "../../utils/InnerThoughtGeometry.h"
 
 #include <QAbstractAnimation>
 #include <QBitmap>
@@ -12,6 +13,12 @@
 #include <QFontMetrics>
 #include <QGraphicsOpacityEffect>
 #include <QLabel>
+#include <QGuiApplication>
+#include <QScreen>
+#include <QMoveEvent>
+#include <QResizeEvent>
+#include <QHideEvent>
+#include <QtMath>
 #include <QMimeData>
 #include <QMouseEvent>
 #include <QPropertyAnimation>
@@ -53,7 +60,7 @@ CharacterWindowBase::CharacterWindowBase(QWidget *parent)
 
 CharacterWindowBase::~CharacterWindowBase()
 {
-    // 内心气泡是以本窗口为父的 QLabel 子对象、定时器同样以 this 为父，
+    // 内心气泡窗口和定时器均由本窗口持有，
     // 随 QObject 析构自动销毁，这里无需手工清理。
 }
 
@@ -116,8 +123,11 @@ void CharacterWindowBase::ApplyInteractiveRegionFullWindow()
 void CharacterWindowBase::updateRenderedImage(const QImage &image,
                                               const QPoint &topLeft)
 {
+    const bool geometryChanged = m_scaledImg.size() != image.size() || m_scaledImgTopLeft != topLeft;
     m_scaledImg = image;
     m_scaledImgTopLeft = topLeft;
+    if (m_innerThoughtBubble && geometryChanged)
+        RefreshInnerThoughtAnchor();
     RepositionInnerThoughtBubble();
 }
 
@@ -265,32 +275,40 @@ void CharacterWindowBase::RestoreTachieLoc()
     m_tachiePosRestoreDone = true;
 }
 
-/*内心独白气泡：立绘头顶右上 45°，半透明淡入→停留→语音播完淡出*/
+/*内心独白气泡：头顶优先、屏幕边缘避脸，半透明淡入→停留→语音播完淡出*/
 void CharacterWindowBase::ShowInnerThought(QString text)
 {
     text = text.trimmed();
-    if (text.isEmpty())
+    if (text.isEmpty() || !isVisible())
         return;
 
     // 先清理上一个气泡
     HideInnerThought();
 
-    // 恢复原来的父窗口内 QLabel 绘制方式，确保半透明背景稳定显示。
-    auto *bubble = new QLabel(text, this);
-    bubble->setTextFormat(Qt::PlainText);
-    bubble->setWordWrap(true);
-    bubble->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    // 气泡允许越过立绘画布；背景由子 QLabel 绘制，避免透明窗口黑底。
+    auto *bubble = new QWidget(this, Qt::Tool | Qt::FramelessWindowHint |
+                                    Qt::WindowStaysOnTopHint | Qt::WindowTransparentForInput |
+                                    Qt::WindowDoesNotAcceptFocus);
+    bubble->setAttribute(Qt::WA_TranslucentBackground);
+    bubble->setAttribute(Qt::WA_ShowWithoutActivating);
+    bubble->setObjectName(QStringLiteral("innerThoughtBubble"));
+    auto *label = new QLabel(text, bubble);
+    label->setTextFormat(Qt::PlainText);
+    label->setWordWrap(true);
+    label->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
 
     QFont bubbleFont = bubble->font();
     bubbleFont.setPixelSize(13);
-    bubble->setFont(bubbleFont);
-    bubble->setStyleSheet(
+    label->setFont(bubbleFont);
+    label->setStyleSheet(
         "color: #555; background: rgba(255,255,255,200); "
         "border: 1px solid rgba(180,180,180,120); "
         "border-radius: 12px; padding: 8px 14px;");
 
-    // 在 Tachie 画布范围内自动换行，避免长文本横向越界。
-    const QRect available = rect().adjusted(10, 10, -10, -10);
+    QScreen *targetScreen = QGuiApplication::screenAt(mapToGlobal(rect().center()));
+    if (!targetScreen)
+        targetScreen = screen();
+    const QRect available = targetScreen->availableGeometry().adjusted(8, 8, -8, -8);
 
     constexpr int kHorizontalPadding = 30;
     constexpr int kVerticalPadding = 18;
@@ -304,15 +322,17 @@ void CharacterWindowBase::ShowInnerThought(QString text)
         Qt::TextWordWrap | Qt::TextWrapAnywhere | Qt::AlignLeft, text);
     bubble->setFixedSize(qMin(maxBubbleWidth,
                               qMax(130, textRect.width() + kHorizontalPadding)),
-                         qMax(36, textRect.height() + kVerticalPadding));
+                         qMin(available.height(), qMax(36, textRect.height() + kVerticalPadding)));
+    label->setGeometry(bubble->rect());
 
     m_innerThoughtBubble = bubble;
+    RefreshInnerThoughtAnchor();
     RepositionInnerThoughtBubble();
     bubble->show();
 
     // 淡入
-    auto *effect = new QGraphicsOpacityEffect(bubble);
-    bubble->setGraphicsEffect(effect);
+    auto *effect = new QGraphicsOpacityEffect(label);
+    label->setGraphicsEffect(effect);
     effect->setOpacity(0.0);
     auto *fadeIn = new QPropertyAnimation(effect, "opacity", bubble);
     fadeIn->setDuration(400);
@@ -323,43 +343,80 @@ void CharacterWindowBase::ShowInnerThought(QString text)
     m_innerThoughtTimer->start();
 }
 
-/*将气泡定位到立绘头部附近，并限制在 Tachie 画布内*/
+QRect CharacterWindowBase::renderedImageRect() const
+{
+    const qreal dpr = m_scaledImg.devicePixelRatio();
+    return QRect(m_scaledImgTopLeft, QSize(qRound(m_scaledImg.width() / dpr),
+                                           qRound(m_scaledImg.height() / dpr)));
+}
+
+// Scan only on show/layout changes, never at the Live2D frame rate.
+void CharacterWindowBase::RefreshInnerThoughtAnchor()
+{
+    const QRect target = renderedImageRect();
+    m_innerThoughtFigureBounds = target.isEmpty() ? rect() : target;
+    if (m_scaledImg.isNull())
+        return;
+    const QImage rgba = m_scaledImg.convertToFormat(QImage::Format_RGBA8888);
+    int left = rgba.width(), top = rgba.height(), right = -1, bottom = -1;
+    for (int y = 0; y < rgba.height(); ++y)
+    {
+        const uchar *line = rgba.constScanLine(y);
+        for (int x = 0; x < rgba.width(); ++x)
+        {
+            if (line[x * 4 + 3] <= 32)
+                continue;
+            left = qMin(left, x); right = qMax(right, x);
+            top = qMin(top, y); bottom = qMax(bottom, y);
+        }
+    }
+    if (right >= left && bottom >= top)
+    {
+        const qreal sx = qreal(target.width()) / rgba.width();
+        const qreal sy = qreal(target.height()) / rgba.height();
+        m_innerThoughtFigureBounds = QRect(
+            target.topLeft() + QPoint(qFloor(left * sx), qFloor(top * sy)),
+            QSize(qCeil((right - left + 1) * sx), qCeil((bottom - top + 1) * sy)));
+    }
+}
+
+void CharacterWindowBase::moveEvent(QMoveEvent *event)
+{
+    QWidget::moveEvent(event);
+    RepositionInnerThoughtBubble();
+}
+
+void CharacterWindowBase::resizeEvent(QResizeEvent *event)
+{
+    QWidget::resizeEvent(event);
+    if (m_innerThoughtBubble)
+        RefreshInnerThoughtAnchor();
+    RepositionInnerThoughtBubble();
+}
+
+void CharacterWindowBase::hideEvent(QHideEvent *event)
+{
+    QWidget::hideEvent(event);
+    if (m_innerThoughtBubble)
+    {
+        m_innerThoughtBubble->hide();
+        HideInnerThought();
+    }
+}
+
+// Prefer above the visible figure, then either side; never clamp into its face.
 void CharacterWindowBase::RepositionInnerThoughtBubble()
 {
     if (!m_innerThoughtBubble)
         return;
-
-    const QPoint head(width() / 2, static_cast<int>(height() * 0.30));
-    constexpr int kCanvasMargin = 10;
-    constexpr int kHorizontalOffset = 50;
-    constexpr int kVerticalOffset = 35;
-
-    int x = head.x() + kHorizontalOffset;
-    int y = head.y() - kVerticalOffset - m_innerThoughtBubble->height();
-
-    // 右侧空间不足时翻转到立绘左上方。
-    if (x + m_innerThoughtBubble->width() >
-        width() - kCanvasMargin)
-    {
-        x = head.x() - kHorizontalOffset -
-            m_innerThoughtBubble->width();
-    }
-
-    // 顶部空间不足时改放到头部下方。
-    if (y < kCanvasMargin)
-        y = head.y() + kVerticalOffset;
-
-    const int minX = kCanvasMargin;
-    const int minY = kCanvasMargin;
-    const int maxX = qMax(minX, width() - kCanvasMargin -
-                                    m_innerThoughtBubble->width());
-    const int maxY = qMax(minY, height() - kCanvasMargin -
-                                    m_innerThoughtBubble->height());
-
-    m_innerThoughtBubble->move(qBound(minX, x, maxX),
-                               qBound(minY, y, maxY));
+    const QRect figure(mapToGlobal(m_innerThoughtFigureBounds.topLeft()),
+                       m_innerThoughtFigureBounds.size());
+    QScreen *targetScreen = QGuiApplication::screenAt(figure.center());
+    if (!targetScreen)
+        targetScreen = screen();
+    m_innerThoughtBubble->move(InnerThoughtGeometry::position(
+        figure, m_innerThoughtBubble->size(), targetScreen->availableGeometry()));
 }
-
 /*隐藏内心独白气泡：淡出后销毁*/
 void CharacterWindowBase::HideInnerThought()
 {
@@ -372,7 +429,8 @@ void CharacterWindowBase::HideInnerThought()
     QWidget *bubble = m_innerThoughtBubble;
     m_innerThoughtBubble = nullptr;
 
-    auto *eff = qobject_cast<QGraphicsOpacityEffect *>(bubble->graphicsEffect());
+    auto *label = bubble->findChild<QLabel *>();
+    auto *eff = label ? qobject_cast<QGraphicsOpacityEffect *>(label->graphicsEffect()) : nullptr;
     if (!eff)
     {
         delete bubble;

@@ -347,8 +347,15 @@ class OffscreenUserModel : public Csm::CubismUserModel
           因为物理/呼吸要看到它们（呼吸是加性的，预设值就是摆动基准）。*/
         applyEyeOpennessMultiplier();
 
+        for (auto it = m_appearanceOverrides.cbegin(); it != m_appearanceOverrides.cend(); ++it)
+            _model->SetParameterValue(Csm::CubismFramework::GetIdManager()->RegisterId(
+                Csm::csmString(it.key().toUtf8().constData())), it.value());
+
         _model->Update();
     }
+
+    void setAppearanceOverrides(const QHash<QString, float> &values)
+    { m_appearanceOverrides = values; }
 
     void setParameter(const QString &parameterId, float value)
     {
@@ -1444,6 +1451,7 @@ class OffscreenUserModel : public Csm::CubismUserModel
     QVector<GLuint> m_textureIds;
     /*覆盖值的**目标**表（setParameterOverrides 写这里）*/
     QHash<QString, float> m_parameterOverrides;
+    QHash<QString, float> m_appearanceOverrides;
     /*覆盖值的**当前**表：本帧真正施加的就是它，逐帧朝目标推进。
        初始为空：第一次施加目标表时，起点直接取目标值（不做"从 0 淡入"——
        装载模型后的第一份心情必须立刻是它该有的样子，不能慢半拍）。*/
@@ -1557,6 +1565,7 @@ struct Live2DOffscreenRenderer::Impl
     std::unique_ptr<OffscreenUserModel> model;
     Csm::Rendering::CubismRenderTarget_OpenGLES2 renderTarget;
     bool glReady = false;
+    bool runtimeAcquired = false;
     QSize targetSize;
     QElapsedTimer clock;
     /*诊断用：**实际**画上去的那张 FBO 与读回时绑定的那张（见 debugState）。
@@ -1682,24 +1691,31 @@ Live2DOffscreenRenderer::Live2DOffscreenRenderer() : m_impl(std::make_unique<Imp
 
 Live2DOffscreenRenderer::~Live2DOffscreenRenderer()
 {
-    m_impl->model.reset(); // 先销毁模型（会删 GL 贴图），上下文还在
     if (m_impl->context != nullptr)
     {
         if (m_impl->surface != nullptr)
             m_impl->context->makeCurrent(m_impl->surface);
+        m_impl->model.reset(); // Model destruction deletes GL resources in this context.
         m_impl->renderTarget.DestroyRenderTarget();
         m_impl->context->doneCurrent();
     }
+    else
+        m_impl->model.reset();
     delete m_impl->context;
     delete m_impl->surface;
-    Live2DCubismRuntime::release();
+    if (m_impl->runtimeAcquired)
+        Live2DCubismRuntime::release();
 }
 
 bool Live2DOffscreenRenderer::load(const QString &modelDir, const QString &modelJsonName,
                                    QString *error)
 {
-    if (!Live2DCubismRuntime::acquire(error))
-        return false;
+    if (!m_impl->runtimeAcquired)
+    {
+        if (!Live2DCubismRuntime::acquire(error))
+            return false;
+        m_impl->runtimeAcquired = true;
+    }
 
     if (!m_impl->glReady && !m_impl->initializeGl(error))
         return false;
@@ -1848,6 +1864,12 @@ void Live2DOffscreenRenderer::setParameterOverrides(const QHash<QString, float> 
     {
         m_impl->model->setParameterOverrides(overrides);
     }
+}
+
+void Live2DOffscreenRenderer::setAppearanceOverrides(const QHash<QString, float> &overrides)
+{
+    if (m_impl->model != nullptr)
+        m_impl->model->setAppearanceOverrides(overrides);
 }
 
 /*过渡时长：窗口层从 character/live2dMoodBlendMs 读出来喂进来（见头文件说明）。

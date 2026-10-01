@@ -141,7 +141,7 @@ int main(int argc, char *argv[])
     const QString renderMode =
         mainSettings.value("character/renderMode", "png").toString().trimmed().toLower();
     const QString live2dModel =
-        mainSettings.value("character/live2dModel", "miku").toString().trimmed();
+        mainSettings.value("character/live2dModel", "atri").toString().trimmed();
     CharacterWindowBase *characterWin = nullptr;
     if (renderMode == "live2d")
     {
@@ -199,6 +199,16 @@ int main(int argc, char *argv[])
        渲染器据此保持今天的盲扑动 —— 这条回退在 Dialog 侧就决定了。*/
     QObject::connect(&dialogWin, &Dialog::requestSpeakLevel, characterWin,
                      &CharacterWindowBase::SetSpeechLevel);
+#ifdef MANDARIN_HAS_LIVE2D
+    if (auto *live = qobject_cast<Live2DCharacterWindow *>(characterWin))
+    {
+        QObject::connect(&dialogWin, &Dialog::requestAppearanceChange, live, &Live2DCharacterWindow::applyReplyAppearance);
+        QObject::connect(&dialogWin, &Dialog::requestReplyExpression, live, &Live2DCharacterWindow::beginReplyExpression);
+        QObject::connect(&dialogWin, &Dialog::requestReplyExpressionFinished, live, &Live2DCharacterWindow::finishReplyExpression);
+        QObject::connect(live, &Live2DCharacterWindow::appearanceStateChanged, &dialogWin, &Dialog::SetAppearanceContext);
+        dialogWin.SetAppearanceContext(live->appearanceState());
+    }
+#endif
 
     /*托盘*/
     QSystemTrayIcon tray;

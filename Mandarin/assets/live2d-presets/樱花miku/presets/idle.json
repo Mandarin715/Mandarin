@@ -1,0 +1,37 @@
+{
+  "_model": "樱花miku",
+  "_status": "2026-09-30：六张全身相位帧目视复核完成，保留小幅胯部/上身/全身/头部摆动；没有屈膝迈步。",
+  "_composition": "物理之后叠加正弦偏移，按 moc 范围夹取；全身轴的基准来自物理，不能保证是情绪值。",
+  "sway": [
+    {
+      "parameter": "lowerBodyZ",
+      "amplitude": 3.0,
+      "period": 6.0,
+      "phase": 0.0
+    },
+    {
+      "parameter": "upperBodyZ",
+      "amplitude": 3.5,
+      "period": 5.0,
+      "phase": 0.15
+    },
+    {
+      "parameter": "wholeBodyX",
+      "amplitude": 2.5,
+      "period": 5.0,
+      "phase": 0.0
+    },
+    {
+      "parameter": "wholeBodyY",
+      "amplitude": 2.5,
+      "period": 7.0,
+      "phase": 0.8
+    },
+    {
+      "parameter": "headZ",
+      "amplitude": 2.75,
+      "period": 4.2,
+      "phase": 0.6
+    }
+  ]
+}

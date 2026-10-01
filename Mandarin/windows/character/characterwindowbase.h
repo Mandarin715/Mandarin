@@ -66,6 +66,10 @@ class CharacterWindowBase : public QWidget
     virtual void relayoutContent() = 0;
     /*子类实现：当前内容尺寸（用于气泡定位等）*/
     virtual QSize contentSize() const = 0;
+    virtual QRect renderedImageRect() const;
+    void moveEvent(QMoveEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
+    void hideEvent(QHideEvent *event) override;
 
     void contextMenuEvent(QContextMenuEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
@@ -80,6 +84,8 @@ class CharacterWindowBase : public QWidget
 
     QWidget *m_innerThoughtBubble = nullptr;
     QTimer *m_innerThoughtTimer = nullptr;
+    QRect m_innerThoughtFigureBounds;
+    void RefreshInnerThoughtAnchor();
 };
 
 #endif // CHARACTERWINDOWBASE_H

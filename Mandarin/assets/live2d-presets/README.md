@@ -43,6 +43,16 @@ Documents/Mandarin/Character/Assets/<角色>/Live2D/<模型>/
 | 死绑定 | — | `Param21` / `Param27` / `ParamBodyAngleX/Y/Z` 写进去零像素变化 |
 | 校准状态 | ✅ 已逐张目视校准 | ✅ 已目视判读（数值随 miku 的 `[-1,+1]` 嘴形而调整） |
 
-`樱花miku` 与 miku 同一套绑定（声明值、可见顶点边界完全一致），但**行为未验证**：
-它的表情参数名与 miku 不同（`Param133` 在它是「哭」，在 miku 是「大葱」），
-且验证被一个既有渲染器缺陷挡住（同一进程里第二个渲染器渲染空白）。
+樱花miku 现有独立三份预设：31 条语义映射、14 个原型、26 个角色心情别名、5 条摆动轴。
+范围由本次 moc 导出核对；参数集与 miku 不同（miku 的 Param134/135 对应不了樱花miku 的 Param89/90），
+Param133 在樱花模型中是『哭』，演出开关不纳入情绪覆盖。共享轴的数值经独立脸部/全身出图复核后保留，
+去掉原型中未采用的 bodyZ；眉毛表现含蓄。完整记录见 [推进记录](../../docs/Live2D推进记录-樱花miku.md)。
+
+新增测试 validatesSakuraRepositoryPresets 直接读取本目录候选，先核数据再核本地 moc，
+无需先安装到 Documents；没有本地模型时仅跳过模型检查。加载器的 directoryOverride 只供显式目录读取，
+应用默认读取位置仍是上文 Documents 路径。
+
+## 亚托莉 B 阶段手动装扮
+
+atri/presets/appearance.json 是独立装扮表，包含互斥服装/鞋子、道具与视觉开关、血衣组合。
+已安装到亚托莉运行时目录；选择不持久化，重载模型恢复默认。规则与验证见 [B 阶段记录](../../docs/Live2D-B阶段-手动装扮.md)。

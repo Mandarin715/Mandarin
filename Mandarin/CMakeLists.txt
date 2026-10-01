@@ -447,6 +447,14 @@ if(TARGET Framework)
             COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${CUBISM_SDK_DIR}/Framework/src/Rendering/OpenGL/Shaders/Standard"
                 "$<TARGET_FILE_DIR:Mandarin>/FrameworkShaders"
+            # Ship our mappings and setup guide alongside the executable; model
+            # files remain supplied by the user in the documented data folders.
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_CURRENT_SOURCE_DIR}/assets/live2d-presets"
+                "$<TARGET_FILE_DIR:Mandarin>/live2d-presets"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_SOURCE_DIR}/docs/Live2D使用说明.md"
+                "$<TARGET_FILE_DIR:Mandarin>/Live2D使用说明.md"
         )
     endif()
 endif()
@@ -756,6 +764,7 @@ if(BUILD_TESTING)
         target_include_directories(test_live2dwindow PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}
             ${CMAKE_CURRENT_BINARY_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ZcJsonLib/include
         )
         target_link_libraries(test_live2dwindow PRIVATE
             Qt${QT_VERSION_MAJOR}::Test
@@ -763,6 +772,17 @@ if(BUILD_TESTING)
             Qt${QT_VERSION_MAJOR}::Widgets
             Framework
         )
+        if(WIN32)
+            target_link_libraries(test_live2dwindow PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ZcJsonLib/lib/ZcJsonLib.lib")
+            add_custom_command(TARGET test_live2dwindow POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ZcJsonLib/bin/ZcJsonLib.dll"
+                    "$<TARGET_FILE_DIR:test_live2dwindow>")
+        elseif(APPLE)
+            target_link_libraries(test_live2dwindow PRIVATE "${ZCJSONLIB_MAC_LIB}")
+        else()
+            target_link_libraries(test_live2dwindow PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ZcJsonLib/lib/libZcJsonLib.a")
+        endif()
         # 同 Mandarin：Cubism Core 静态库带进静态 CRT 引子，与 /MD 混链会报 LNK4098 噪音
         target_link_options(test_live2dwindow PRIVATE /NODEFAULTLIB:LIBCMT)
         set_target_properties(test_live2dwindow PROPERTIES

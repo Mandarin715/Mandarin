@@ -4,9 +4,11 @@
 #include "characterwindowbase.h"
 
 #include "../../utils/Live2DMoodPreset.h"
+#include "../../utils/Live2DAppearancePreset.h"
 #include "../../utils/Live2DOffscreenRenderer.h"
 
 #include <QImage>
+#include <QPointer>
 #include <QString>
 
 class QTimer;
@@ -17,7 +19,7 @@ class QPaintEvent;
 /*Live2D 立绘渲染器：窗口层（穿透/交互区/拖拽/位置/气泡/拖放）全部继承自 CharacterWindowBase，
   本类只负责「离屏渲染成帧 → 登记给窗口层」这一段。
 
-  v1 范围：只做渲染与窗口形状，不含表情/动作/口型（那些是后续阶段）。*/
+  接收心情、口型与手动装扮意图，不持有 Dialog 业务逻辑。*/
 class Live2DCharacterWindow : public CharacterWindowBase
 {
     Q_OBJECT
@@ -30,6 +32,22 @@ class Live2DCharacterWindow : public CharacterWindowBase
       **换心情不再走这条路**，否则"心情名找不到同名模型"会被静默忽略（这就是本来的 bug）。
       返回是否装载成功；失败时保留上一版画布，不做任何清理（避免闪烁成空白窗口）。*/
     bool loadModel(const QString &modelName);
+
+    bool loadAppearancePreset(const QString &path);
+    bool selectAppearance(const QString &group, const QString &option);
+    bool selectAppearanceLook(const QString &id);
+    void resetAppearance();
+    QString selectedAppearance(const QString &group) const { return m_appearance.selected(group); }
+    QWidget *createAppearancePanel(QWidget *parent = nullptr);
+    QJsonObject appearanceState() const;
+    void applyReplyAppearance(const QJsonObject &values);
+    void beginReplyExpression(const QString &mood);
+    void finishReplyExpression();
+
+  signals:
+    void appearanceStateChanged(QJsonObject state);
+
+  public:
 
     /*模型是否装载成功（main.cpp 据此决定要不要回退到 PNG 立绘）*/
     bool isModelLoaded() const { return m_modelLoaded; }
@@ -111,6 +129,7 @@ class Live2DCharacterWindow : public CharacterWindowBase
     void SetSpeechLevel(float level) override;
 
   protected:
+    void contextMenuEvent(QContextMenuEvent *event) override;
     void relayoutContent() override; //按 m_tachieSizePercent 重算逻辑画布并渲染首帧
 
     /*把登记好的渲染帧画到半透明窗口上。
@@ -228,6 +247,7 @@ class Live2DCharacterWindow : public CharacterWindowBase
     /*量当前登记帧（m_scaledImg，物理像素）里人物可见部分的包围盒。
       layout 时用它实测校正显示比例，不依赖解析换算。*/
     bool opaqueBoundsInFrame(QRect *bounds) const;
+    QRect renderedImageRect() const override { return rect(); }
 
     Live2DOffscreenRenderer m_renderer;
     QTimer *m_frameTimer = nullptr; //渲染节拍
@@ -303,6 +323,12 @@ class Live2DCharacterWindow : public CharacterWindowBase
       m_currentMoodName 的初值是 "default"（Tachie 里就是中立那张）：模型装载完成后
       即使 AI 还没说话，也要有一份显式的 neutral 覆盖，而不是"表里什么都没有"。*/
     Live2DMoodPreset m_moodPreset;
+    Live2DAppearancePreset m_appearance;
+    bool m_replyWhiteEye = false;
+    void updateAppearanceOverrides();
+    QPointer<QWidget> m_appearancePanel;
+    bool m_appearanceDismissPending = false;
+    void syncAppearancePanel();
     QString m_currentMoodName = QStringLiteral("default");
 };
 

@@ -80,6 +80,9 @@ class Dialog : public QWidget
     void requestSetCharTachie(QString TachieName);
     void requestShowInnerThought(QString text);
     void requestHideInnerThought();
+    void requestAppearanceChange(QJsonObject values);
+    void requestReplyExpression(QString mood);
+    void requestReplyExpressionFinished();
     /*TTS 是否在播（true = 开始/继续播，false = 停止或出错）。
        立绘据此让嘴巴开合 —— 是"纸片人开合"，不做音素口型、也不看音量。
        为什么用布尔而不是把音频数据送出去：需求要的就是"在说话"这一个信号，
@@ -101,6 +104,7 @@ class Dialog : public QWidget
     void requestSpeakLevel(float level);
 
   public slots:
+    void SetAppearanceContext(QJsonObject state) { m_appearanceContext = state; }
     void ReloadAIConfig();          // 完整重载（角色切换/F5）
     void ReloadProviderConfig();     // 仅 API Key/BaseURL（LLM 页变更）
     void ReloadCharacterConfig();    // 角色 prompt/模型/上下文/记忆
@@ -177,6 +181,11 @@ class Dialog : public QWidget
     void exitContinuousMode();
     bool isAllVitsDone() const;
     bool m_streamVitsEnabled = false;
+    QJsonObject m_appearanceContext;
+    bool m_streamExpressionApplied = false;
+    bool m_replyExpressionActive = false;
+    bool m_replyAudioExpected = false;
+    quint64 m_replyExpressionGeneration = 0;
     bool m_streamVitsSentenceSplitEnabled = true;
     int m_streamSynthCursor = 0;
     QStringList m_vitsPendingTexts;

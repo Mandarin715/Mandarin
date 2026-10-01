@@ -1,0 +1,212 @@
+{
+  "version": 1,
+  "model": "atri",
+  "_note": "装扮独立于心情。数值经 moc 声明核对；只复制我们自己的参数数据，不加载或修改作者表情文件。默认复位到 moc neutral；不持久化选择，重载模型回默认。Param39 的动作语义尚待校准，未开放。",
+  "groups": [
+    {
+      "id": "clothes",
+      "label": "服装",
+      "default": "default",
+      "options": [
+        {
+          "id": "default",
+          "label": "默认服装",
+          "values": {}
+        },
+        {
+          "id": "pajamas",
+          "label": "睡衣",
+          "values": {
+            "Param18": 30
+          }
+        },
+        {
+          "id": "bikini",
+          "label": "泳装",
+          "values": {
+            "Param17": 30
+          }
+        },
+        {
+          "id": "shorts",
+          "label": "睡衣＋南瓜裤",
+          "values": {
+            "Param9": 30
+          }
+        }
+      ]
+    },
+    {
+      "id": "shoes",
+      "label": "鞋子",
+      "default": "default",
+      "options": [
+        {
+          "id": "default",
+          "label": "默认",
+          "values": {}
+        },
+        {
+          "id": "sandals",
+          "label": "凉鞋",
+          "values": {
+            "Param19": 30
+          }
+        },
+        {
+          "id": "shoes",
+          "label": "皮鞋",
+          "values": {
+            "Param20": 30
+          }
+        }
+      ]
+    },
+    {
+      "id": "no-highlight",
+      "label": "眼睛高光隐藏",
+      "default": "off",
+      "options": [
+        {
+          "id": "off",
+          "label": "关闭",
+          "values": {}
+        },
+        {
+          "id": "on",
+          "label": "开启",
+          "values": {
+            "Param21": 30
+          }
+        }
+      ]
+    },
+    {
+      "id": "white-eye",
+      "label": "白眼",
+      "default": "off",
+      "options": [
+        {
+          "id": "off",
+          "label": "关闭",
+          "values": {}
+        },
+        {
+          "id": "on",
+          "label": "开启",
+          "values": {
+            "Param22": 30
+          }
+        }
+      ]
+    },
+    {
+      "id": "screen",
+      "label": "屏幕效果",
+      "default": "off",
+      "options": [
+        {
+          "id": "off",
+          "label": "关闭",
+          "values": {}
+        },
+        {
+          "id": "on",
+          "label": "开启",
+          "values": {
+            "Param31": 30
+          }
+        }
+      ]
+    },
+    {
+      "id": "blood",
+      "label": "血衣",
+      "default": "off",
+      "options": [
+        {
+          "id": "off",
+          "label": "关闭",
+          "values": {}
+        },
+        {
+          "id": "on",
+          "label": "开启",
+          "values": {
+            "Param36": 30
+          }
+        }
+      ]
+    },
+    {
+      "id": "bird",
+      "label": "小鸟",
+      "default": "off",
+      "options": [
+        {
+          "id": "off",
+          "label": "关闭",
+          "values": {}
+        },
+        {
+          "id": "on",
+          "label": "开启",
+          "values": {
+            "Param37": 30
+          }
+        }
+      ]
+    },
+    {
+      "id": "crab",
+      "label": "螃蟹",
+      "default": "off",
+      "options": [
+        {
+          "id": "off",
+          "label": "关闭",
+          "values": {}
+        },
+        {
+          "id": "on",
+          "label": "开启",
+          "values": {
+            "Param38": 30
+          }
+        }
+      ]
+    },
+    {
+      "id": "dark",
+      "label": "暗淡效果",
+      "default": "off",
+      "options": [
+        {
+          "id": "off",
+          "label": "关闭",
+          "values": {}
+        },
+        {
+          "id": "on",
+          "label": "开启",
+          "values": {
+            "Param10": 30
+          }
+        }
+      ]
+    }
+  ],
+  "looks": [
+    {
+      "id": "blood",
+      "selections": {
+        "no-highlight": "on",
+        "dark": "on",
+        "blood": "on",
+        "clothes": "default",
+        "shoes": "default"
+      },
+      "label": "血衣组合"
+    }
+  ]
+}

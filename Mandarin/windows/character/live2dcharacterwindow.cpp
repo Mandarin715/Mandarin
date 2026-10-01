@@ -3,6 +3,9 @@
 #include "../../GlobalConstants.h"
 
 #include "../../utils/DevicePixelAlign.h"
+#include "../../utils/AppearancePanel.h"
+#include "../../utils/ReplyAppearanceIntent.h"
+#include "ZcJsonLib.h"
 
 #include <QDebug>
 #include <QDir>
@@ -16,10 +19,214 @@
 #include <QSettings>
 #include <QShowEvent>
 #include <QTimer>
+#include <QComboBox>
+#include <QFormLayout>
+#include <QVBoxLayout>
+#include <QPushButton>
+#include <QSignalBlocker>
+#include <QAction>
+#include <QActionGroup>
+#include <QContextMenuEvent>
 
 #include <algorithm>
 #include <cmath>
 
+bool Live2DCharacterWindow::loadAppearancePreset(const QString &path)
+{
+    m_replyWhiteEye = false;
+    if (m_appearancePanel)
+        m_appearancePanel->close();
+    QSet<QString> forbidden;
+    for (const auto &range : m_moodPreset.parameters()) forbidden.insert(range.id);
+    forbidden.insert(m_renderer.watermarkParamId());
+    // 即使心情数据缺失，也不能让装扮抢走标准脸部/呼吸驱动器。
+    const auto ranges = m_renderer.declaredParameterRanges();
+    for (auto it = ranges.cbegin(); it != ranges.cend(); ++it)
+        if (it.key().startsWith("ParamEye") || it.key().startsWith("ParamBrow") ||
+            it.key().startsWith("ParamAngle") || it.key().startsWith("ParamBody") ||
+            it.key().startsWith("ParamMouth") || it.key().startsWith("ParamHair") ||
+            it.key() == "ParamBreath" || it.key() == "ParamCheek") forbidden.insert(it.key());
+    QString error;
+    const bool ok = m_appearance.load(path, ranges, forbidden, &error, QFileInfo(m_modelDir).fileName());
+    updateAppearanceOverrides();
+    syncAppearancePanel();
+    if (!ok && QFileInfo::exists(path)) qWarning() << "[Live2D appearance] disabled:" << error;
+    return ok;
+}
+
+bool Live2DCharacterWindow::selectAppearance(const QString &group, const QString &option)
+{
+    if (!m_appearance.select(group, option)) return false;
+    updateAppearanceOverrides();
+    syncAppearancePanel();
+    return true; // 下一拍渲染；不在菜单回调中同步跑探针或重建模型。
+}
+
+bool Live2DCharacterWindow::selectAppearanceLook(const QString &id)
+{
+    if (!m_appearance.selectLook(id)) return false;
+    updateAppearanceOverrides();
+    syncAppearancePanel();
+    return true;
+}
+
+void Live2DCharacterWindow::resetAppearance()
+{
+    m_appearance.reset();
+    updateAppearanceOverrides();
+    syncAppearancePanel();
+}
+
+void Live2DCharacterWindow::syncAppearancePanel()
+{
+    emit appearanceStateChanged(appearanceState());
+    if (!m_appearancePanel)
+        return;
+    for (const auto &group : m_appearance.groups())
+    {
+        const QString selected = m_appearance.selected(group.id);
+        auto *combo = m_appearancePanel->findChild<QComboBox *>(group.id);
+        if (combo)
+        {
+            const QSignalBlocker blocker(combo);
+            combo->setCurrentIndex(combo->findData(selected));
+        }
+        for (const auto &option : group.options)
+            if (auto *action = m_appearancePanel->findChild<QAction *>(group.id + QLatin1Char('/') + option.id))
+                action->setChecked(option.id == selected);
+    }
+}
+
+QJsonObject Live2DCharacterWindow::appearanceState() const
+{
+    QJsonObject state;
+    for (const QString &group : {QStringLiteral("clothes"), QStringLiteral("shoes")})
+        if (!m_appearance.selected(group).isEmpty()) state[group] = m_appearance.selected(group);
+    return state;
+}
+
+void Live2DCharacterWindow::updateAppearanceOverrides()
+{
+    auto appearance = m_appearance;
+    if (m_replyWhiteEye) appearance.select("white-eye", "on");
+    m_renderer.setAppearanceOverrides(appearance.values());
+}
+
+void Live2DCharacterWindow::applyReplyAppearance(const QJsonObject &values)
+{
+    auto next = m_appearance;
+    for (auto it = values.begin(); it != values.end(); ++it)
+        if ((it.key() != "clothes" && it.key() != "shoes") || !it.value().isString() ||
+            !next.select(it.key(), it.value().toString())) return;
+    m_appearance = next;
+    updateAppearanceOverrides();
+    syncAppearancePanel();
+}
+
+void Live2DCharacterWindow::beginReplyExpression(const QString &mood)
+{
+    m_replyWhiteEye = ReplyAppearanceIntent::isShock(mood);
+    updateAppearanceOverrides();
+}
+
+void Live2DCharacterWindow::finishReplyExpression()
+{
+    m_replyWhiteEye = false;
+    updateAppearanceOverrides();
+}
+
+QWidget *Live2DCharacterWindow::createAppearancePanel(QWidget *parent)
+{
+    if (m_appearance.groups().isEmpty()) return nullptr;
+    auto *panel = new AppearancePanel(parent, [this]() {
+        m_appearanceDismissPending = true;
+    });
+    m_appearancePanel = panel;
+    panel->setWindowTitle(QStringLiteral("装扮"));
+    panel->setStyleSheet(QStringLiteral(
+        "QFrame#appearancePanel { background: #fafafa; border: 1px solid #b0b0b0; border-radius: 8px; }"));
+    auto *layout = new QVBoxLayout(panel);
+    layout->setContentsMargins(12, 12, 12, 12);
+    layout->addWidget(new AppearanceDragHandle(panel));
+    auto addButton = [panel, layout](const QString &label, const QString &id) {
+        auto *action = new QAction(label, panel);
+        action->setObjectName(id);
+        auto *button = new QPushButton(label, panel);
+        button->setObjectName(id + QStringLiteral("/button"));
+        QObject::connect(button, &QPushButton::clicked, action, &QAction::trigger);
+        layout->addWidget(button);
+        return action;
+    };
+    auto *dialog = addButton(QStringLiteral("显示／隐藏对话框"), QStringLiteral("appearance/dialog"));
+    connect(dialog, &QAction::triggered, this, &CharacterWindowBase::requestToggleVisible);
+    auto *form = new QFormLayout;
+    layout->addLayout(form);
+    for (const auto &group : m_appearance.groups())
+    {
+        auto *combo = new QComboBox(panel);
+        combo->setObjectName(group.id);
+        combo->setMinimumWidth(170);
+        auto *exclusive = new QActionGroup(panel);
+        exclusive->setExclusive(true);
+        for (const auto &option : group.options)
+        {
+            combo->addItem(option.label, option.id);
+            auto *action = new QAction(option.label, panel);
+            action->setObjectName(group.id + QLatin1Char('/') + option.id);
+            action->setCheckable(true);
+            exclusive->addAction(action);
+            connect(action, &QAction::triggered, this,
+                    [this, groupId = group.id, optionId = option.id]() {
+                        selectAppearance(groupId, optionId);
+                    });
+        }
+        connect(combo, QOverload<int>::of(&QComboBox::activated), panel,
+                [panel, combo, groupId = group.id](int index) {
+                    if (auto *action = panel->findChild<QAction *>(groupId + QLatin1Char('/') + combo->itemData(index).toString()))
+                        action->trigger();
+                });
+        form->addRow(group.label, combo);
+    }
+    for (const auto &look : m_appearance.looks())
+    {
+        auto *action = addButton(look.label, "look/" + look.id);
+        connect(action, &QAction::triggered, this, [this, id = look.id]() { selectAppearanceLook(id); });
+    }
+    auto *reset = addButton(QStringLiteral("恢复默认装扮"), QStringLiteral("appearance/reset"));
+    connect(reset, &QAction::triggered, this, &Live2DCharacterWindow::resetAppearance);
+    syncAppearancePanel();
+    return panel;
+}
+
+void Live2DCharacterWindow::contextMenuEvent(QContextMenuEvent *event)
+{
+    // Native release and the platform may both request a context menu for one click.
+    // Keep dismissal latched until a fresh right press, rather than consuming it once.
+    if (m_appearanceDismissPending && event->reason() == QContextMenuEvent::Mouse)
+    {
+        event->accept();
+        return;
+    }
+    m_appearanceDismissPending = false;
+    if (m_appearancePanel && m_appearancePanel->isVisible())
+    {
+        m_appearancePanel->close();
+        m_appearanceDismissPending = true;
+        event->accept();
+        return;
+    }
+    auto *panel = createAppearancePanel(this);
+    if (!panel) { CharacterWindowBase::contextMenuEvent(event); return; }
+    panel->setAttribute(Qt::WA_DeleteOnClose);
+    panel->adjustSize();
+    QScreen *target = QGuiApplication::screenAt(event->globalPos());
+    if (!target) target = screen();
+    const QRect area = target->availableGeometry().adjusted(8, 8, -8, -8);
+    panel->move(qBound(area.left(), event->globalPos().x(), qMax(area.left(), area.right() + 1 - panel->width())),
+                qBound(area.top(), event->globalPos().y(), qMax(area.top(), area.bottom() + 1 - panel->height())));
+    panel->show();
+    event->accept();
+}
 #if defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
 //ApplyInteractiveRegionFromImage() 的非 Windows 分支要用到基类里的这套 X11 逻辑，
 //派生类的编译单元必须看到同样的头（与 Tachie 保持一致）。
@@ -71,6 +278,14 @@ Live2DCharacterWindow::Live2DCharacterWindow(QWidget *parent)
     m_frameTimer->setTimerType(Qt::PreciseTimer);
     m_frameTimer->setInterval(m_frameIntervalMs);
     connect(m_frameTimer, &QTimer::timeout, this, &Live2DCharacterWindow::onFrameTick);
+    // Match the PNG renderer: restore the selected character's saved size before layout.
+    // Tests redirect only this read to a temporary character config.
+    const QString characterConfigOverride = QString::fromUtf8(qgetenv("MANDARIN_CHARACTER_CONFIG"));
+    ZcJsonLib characterConfig(characterConfigOverride.isEmpty()
+                                  ? ReadCharacterUserConfigPath() : characterConfigOverride);
+    bool sizeValid = false;
+    const int savedSize = characterConfig.value("tachieSize").toVariant().toInt(&sizeValid);
+    SetTachieSize(sizeValid ? savedSize : 100);
 }
 
 Live2DCharacterWindow::~Live2DCharacterWindow()
@@ -252,6 +467,8 @@ bool Live2DCharacterWindow::loadModel(const QString &modelName)
     /*情绪预设：路径要靠模型名才推得出来（…/Live2D/<模型名>/presets/moods.json），
       所以只能在这里装载。失败时功能整个自关 —— 不施加任何覆盖、也不残留上一种情绪。*/
     m_moodPreset.load(name);
+    loadAppearancePreset(QDir(Live2DMoodPreset::resolveModelDir(name))
+                             .filePath(QStringLiteral("presets/appearance.json")));
 
     /*待机摆动数据（…/presets/idle.json）与情绪预设**分开**装载：它是可选的，缺了只是不做
        摆动（角色照样呼吸/眨眼/跟着心情变表情），见 Live2DMoodPreset::loadIdle。
@@ -960,6 +1177,11 @@ bool Live2DCharacterWindow::acceptsClickAt(const QPoint &logicalPoint) const
 
 void Live2DCharacterWindow::mousePressEvent(QMouseEvent *event)
 {
+    if (event->button() == Qt::RightButton)
+    {
+        // A new press starts an interaction; repeated context events stay suppressed.
+        m_appearanceDismissPending = false;
+    }
     if (!acceptsClickAt(event->pos()))
     {
         event->ignore(); //透明区域：穿透

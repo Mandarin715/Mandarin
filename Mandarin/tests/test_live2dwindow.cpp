@@ -25,6 +25,15 @@
 #include <QTest>
 #include <QThread>
 #include <QTimer>
+#include <QMenu>
+#include <QComboBox>
+#include <QAbstractItemView>
+#include <QPushButton>
+#include <QAction>
+#include <QContextMenuEvent>
+#include <QWindow>
+#include <QScopeGuard>
+#include "../utils/AppearancePanel.h"
 
 #include <algorithm>
 #include <cmath>
@@ -55,6 +64,11 @@ class TestLive2DWindow : public QObject
   private slots:
     /*整套测试共用的临时配置：用完即删，用户真实 config.ini 全程只读*/
     void initTestCase();
+    void appearanceSurvivesMoodAndResets();
+    void appearanceRejectsUnsafeData();
+    void replyAppearanceAndShockLifecycle();
+    void restoresSavedCharacterSizeOnStartup();
+    void appearancePanelStaysOpenUntilOutsideRightClick();
     void cleanupTestCase();
 
     void shapesWindowFromRenderedModel();
@@ -593,12 +607,18 @@ void TestLive2DWindow::initTestCase()
     QVERIFY2(QFileInfo::exists(m_tempConfigPath), "临时配置文件没写出来");
 
     qputenv("MANDARIN_CONFIG_INI", m_tempConfigPath.toLocal8Bit());
+    QFile characterConfig(m_tempDir.filePath("character.json"));
+    QVERIFY(characterConfig.open(QIODevice::WriteOnly));
+    characterConfig.write("{\"tachieSize\":\"100\"}");
+    characterConfig.close();
+    qputenv("MANDARIN_CHARACTER_CONFIG", characterConfig.fileName().toUtf8());
     qInfo("配置已重定向到临时文件：%s（真实 config.ini 只读）", qPrintable(m_tempConfigPath));
 }
 
 void TestLive2DWindow::cleanupTestCase()
 {
     qunsetenv("MANDARIN_CONFIG_INI");
+    qunsetenv("MANDARIN_CHARACTER_CONFIG");
     m_tempConfigPath.clear();
     // m_tempDir 析构时自动删除整棵目录
 }
@@ -3581,7 +3601,7 @@ void TestLive2DWindow::moodIgnoringEyesLeavesBlinkUnchanged()
         // 乘数恒等：最终值与眨眼原始值必须逐项一致（同一个采样窗口）
         QVERIFY2(qAbs(sample->composedMin - sample->blinkMin) <= 1e-3f &&
                      qAbs(sample->composedMax - sample->blinkMax) <= 1e-3f,
-                 qPrintable(QStringLiteral("最终值 %.4f~%.4f 与眨眼原始值 %.4f~%.4f 不一致 ——"
+                 qPrintable(QStringLiteral("最终值 %1~%2 与眨眼原始值 %3~%4 不一致 ——"
                                            "不碰眼睛的心情不该改动眨眼")
                                 .arg(double(sample->composedMin))
                                 .arg(double(sample->composedMax))
@@ -4567,6 +4587,362 @@ void TestLive2DWindow::sizeChangeSettlesWithoutRelayoutPerFrame()
                             .arg(cost200.canvas.width())
                             .arg(cost200.canvas.height())
                             .arg(aspectDeviation(cost200.canvas, referenceAspect) * 100.0)));
+}
+
+void TestLive2DWindow::restoresSavedCharacterSizeOnStartup()
+{
+    const QByteArray previous = qgetenv("MANDARIN_CHARACTER_CONFIG");
+    const auto restore = qScopeGuard([previous]() { qputenv("MANDARIN_CHARACTER_CONFIG", previous); });
+    const QString path = m_tempDir.filePath("saved-size.json");
+    QFile config(path);
+    QVERIFY(config.open(QIODevice::WriteOnly));
+    config.write("{\"tachieSize\":\"60\"}");
+    config.close();
+    qputenv("MANDARIN_CHARACTER_CONFIG", path.toUtf8());
+    class SizeProbe : public Live2DCharacterWindow
+    {
+      public:
+        int savedPercent() const { return m_tachieSizePercent; }
+    };
+    QSize startupSize;
+    {
+        SizeProbe window;
+        QCOMPARE(window.savedPercent(), 60); // Before any settings-page signal or model layout.
+        if (!QDir(modelDirFor(QStringLiteral("atri"))).exists()) QSKIP("Local atri model absent");
+        QVERIFY(window.loadModel(QStringLiteral("atri")));
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        startupSize = window.size();
+        window.SetTachieSize(60);
+        QCOMPARE(window.size(), startupSize); // Reapplying the saved setting must not resize it.
+        window.hide();
+    }
+    {
+        SizeProbe restarted;
+        QCOMPARE(restarted.savedPercent(), 60);
+        QVERIFY(restarted.loadModel(QStringLiteral("atri")));
+        restarted.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&restarted));
+        QVERIFY(qAbs(restarted.height() - startupSize.height()) <= 2);
+        QVERIFY(qAbs(restarted.width() - startupSize.width()) <= 2);
+        restarted.hide();
+    }
+    QVERIFY(config.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    config.write("{\"tachieSize\":40}");
+    config.close();
+    {
+        SizeProbe numeric;
+        QCOMPARE(numeric.savedPercent(), 40);
+    }
+    QVERIFY(config.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    config.write("{\"tachieSize\":\"broken\"}");
+    config.close();
+    {
+        SizeProbe invalid;
+        QCOMPARE(invalid.savedPercent(), 100);
+    }
+}
+void TestLive2DWindow::replyAppearanceAndShockLifecycle()
+{
+    if (!QDir(modelDirFor(QStringLiteral("atri"))).exists()) QSKIP("Local atri model absent");
+    Live2DCharacterWindow window;
+    QVERIFY(window.loadModel(QStringLiteral("atri")));
+    const QString path = QFINDTESTDATA("../assets/live2d-presets/atri/presets/appearance.json");
+    QVERIFY(window.loadAppearancePreset(path));
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    window.hide();
+    QSignalSpy states(&window, &Live2DCharacterWindow::appearanceStateChanged);
+    window.applyReplyAppearance({{"clothes", "pajamas"}, {"shoes", "sandals"}});
+    QCOMPARE(window.selectedAppearance("clothes"), QStringLiteral("pajamas"));
+    QVERIFY(!states.isEmpty());
+    QVERIFY(window.renderFrameNow());
+    QCOMPARE(window.parameterValue("Param18"), 30.0f);
+    window.applyReplyAppearance({{"clothes", "bikini"}, {"white-eye", "on"}});
+    QCOMPARE(window.selectedAppearance("clothes"), QStringLiteral("pajamas")); // Reject atomically.
+    window.beginReplyExpression(QStringLiteral("震惊"));
+    window.reloadContent(QStringLiteral("震惊"));
+    window.SetSpeaking(true);
+    QVERIFY(window.renderFrameNow());
+    QCOMPARE(window.parameterValue("Param22"), 30.0f);
+    QCOMPARE(window.selectedAppearance("white-eye"), QStringLiteral("off"));
+    window.SetSpeaking(false); // Sentence boundary is not the end of the whole reply.
+    QVERIFY(window.renderFrameNow());
+    QCOMPARE(window.parameterValue("Param22"), 30.0f);
+    window.SetSpeaking(true);
+    window.selectAppearance("clothes", "bikini");
+    QVERIFY(window.renderFrameNow());
+    QCOMPARE(window.parameterValue("Param22"), 30.0f);
+    window.finishReplyExpression();
+    QVERIFY(window.renderFrameNow());
+    QCOMPARE(window.parameterValue("Param22"), 0.0f);
+    QCOMPARE(window.parameterValue("Param17"), 30.0f);
+    window.selectAppearance("white-eye", "on");
+    window.beginReplyExpression(QStringLiteral("惊讶"));
+    window.finishReplyExpression();
+    QVERIFY(window.renderFrameNow());
+    QCOMPARE(window.parameterValue("Param22"), 30.0f); // Preserve an explicit manual choice.
+    window.selectAppearance("white-eye", "off");
+    window.beginReplyExpression(QStringLiteral("震惊"));
+    window.beginReplyExpression(QStringLiteral("快乐"));
+    QVERIFY(window.renderFrameNow());
+    QCOMPARE(window.parameterValue("Param22"), 0.0f);
+}
+void TestLive2DWindow::appearanceSurvivesMoodAndResets()
+{
+    if (!QDir(modelDirFor(QStringLiteral("atri"))).exists()) QSKIP("Local atri model absent");
+    const QString path = QFINDTESTDATA("../assets/live2d-presets/atri/presets/appearance.json");
+    QVERIFY(!path.isEmpty());
+    Live2DCharacterWindow window;
+    QVERIFY(window.loadModel(QStringLiteral("atri")));
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    window.hide();
+    QVERIFY(window.loadAppearancePreset(path));
+    std::unique_ptr<QWidget> menu(window.createAppearancePanel());
+    QVERIFY(menu);
+    QSignalSpy toggles(&window, &CharacterWindowBase::requestToggleVisible);
+    menu->findChild<QAction *>("appearance/dialog")->trigger();
+    QCOMPARE(toggles.count(), 1);
+    // 测真实 QAction 接线，不只调用控制器：右键菜单选择必须到达渲染器。
+    auto *pajamas = menu->findChild<QAction *>("clothes/pajamas");
+    QVERIFY(pajamas);
+    pajamas->trigger();
+    QCOMPARE(window.selectedAppearance("clothes"), QStringLiteral("pajamas"));
+    for (int i = 0; i < 60; ++i)
+    {
+        window.reloadContent(i % 2 ? QStringLiteral("高兴") : QStringLiteral("生气"));
+        window.SetSpeaking(true);
+        window.SetSpeechLevel(1.0f);
+        window.setNextFrameDeltaSecondsForTest(0.02f);
+        QVERIFY(window.renderFrameNow());
+        QVERIFY2(qAbs(window.parameterValue("Param18") - 30.0f) < 1e-4f,
+                 qPrintable(QStringLiteral("Appearance lost while speaking/changing mood: Param18=%1")
+                            .arg(window.parameterValue("Param18"))));
+    }
+    QVERIFY(window.parameterValue("ParamMouthOpenY") > 0.1f);
+    QVERIFY(window.selectAppearance("clothes", "bikini"));
+    QVERIFY(window.renderFrameNow());
+    QCOMPARE(window.parameterValue("Param18"), 0.0f);
+    QCOMPARE(window.parameterValue("Param17"), 30.0f);
+    QVERIFY(window.selectAppearance("shoes", "sandals"));
+    QVERIFY(window.selectAppearance("shoes", "shoes"));
+    QVERIFY(window.renderFrameNow());
+    QCOMPARE(window.parameterValue("Param19"), 0.0f);
+    QCOMPARE(window.parameterValue("Param20"), 30.0f);
+    QVERIFY(window.selectAppearanceLook("blood"));
+    QVERIFY(window.renderFrameNow());
+    QCOMPARE(window.parameterValue("Param17"), 0.0f);
+    QCOMPARE(window.parameterValue("Param20"), 0.0f);
+    QCOMPARE(window.parameterValue("Param36"), 30.0f);
+    QCOMPARE(window.parameterValue("Param10"), 30.0f);
+    QCOMPARE(window.parameterValue("Param21"), 30.0f);
+    QVERIFY(!window.selectAppearance("clothes", "unknown"));
+    QCOMPARE(window.selectedAppearance("clothes"), QStringLiteral("default"));
+    menu->findChild<QAction *>("appearance/reset")->trigger();
+    QVERIFY(window.renderFrameNow());
+    for (const QString &id : {"Param9", "Param10", "Param17", "Param18", "Param19",
+                              "Param20", "Param21", "Param22", "Param31", "Param36",
+                              "Param37", "Param38"}) QCOMPARE(window.parameterValue(id), 0.0f);
+    window.SetSpeaking(false);
+    window.reloadContent(QStringLiteral("default"));
+    const QString out = QDir(QCoreApplication::applicationDirPath()).absoluteFilePath("../live2d-probe/appearance-atri");
+    QVERIFY(QDir().mkpath(out));
+    const auto manifest = QJsonDocument::fromJson([&]() { QFile f(path); f.open(QIODevice::ReadOnly); return f.readAll(); }()).object();
+    int produced = 0;
+    for (const auto value : manifest.value("groups").toArray())
+    {
+        const auto group = value.toObject();
+        for (const auto choice : group.value("options").toArray())
+        {
+            window.resetAppearance();
+            const auto option = choice.toObject();
+            QVERIFY(window.selectAppearance(group.value("id").toString(), option.value("id").toString()));
+            window.setNextFrameDeltaSecondsForTest(0.0f);
+            QVERIFY(window.renderFrameNow());
+            QVERIFY(window.renderedImage().save(QDir(out).filePath(group.value("id").toString() + "-" + option.value("id").toString() + ".png")));
+            ++produced;
+        }
+    }
+    QVERIFY(produced > 0);
+    window.resetAppearance();
+    QVERIFY(window.selectAppearanceLook("blood"));
+    QVERIFY(window.renderFrameNow());
+    QVERIFY(window.renderedImage().save(QDir(out).filePath("blood-look.png")));
+    // 重载不是延续上个模型的装扮。
+    QVERIFY(window.loadModel(QStringLiteral("atri")));
+    QVERIFY(window.loadAppearancePreset(path));
+    QCOMPARE(window.selectedAppearance("clothes"), QStringLiteral("default"));
+    QVERIFY(window.renderFrameNow());
+    QCOMPARE(window.parameterValue("Param36"), 0.0f);
+    qInfo("APPEARANCE exported %d choices to %s", produced, qPrintable(out));
+}
+
+void TestLive2DWindow::appearancePanelStaysOpenUntilOutsideRightClick()
+{
+    if (!QDir(modelDirFor(QStringLiteral("atri"))).exists()) QSKIP("Local atri model absent");
+    Live2DCharacterWindow window;
+    QVERIFY(window.loadModel(QStringLiteral("atri")));
+    const QString path = QFINDTESTDATA("../assets/live2d-presets/atri/presets/appearance.json");
+    QVERIFY(window.loadAppearancePreset(path));
+    std::unique_ptr<QWidget> panel(window.createAppearancePanel());
+    QVERIFY(panel);
+    panel->move(panel->screen()->availableGeometry().topLeft() + QPoint(100, 100));
+    panel->show();
+    QVERIFY(QTest::qWaitForWindowExposed(panel.get()));
+    auto *handle = panel->findChild<QWidget *>("appearanceDragHandle");
+    QVERIFY(handle);
+    const QPoint beforeDrag = panel->pos();
+    const QPoint start = handle->rect().center();
+    const QPoint dragDelta(40, 35);
+    const QPoint dragGlobal = handle->mapToGlobal(start) + dragDelta;
+    QTest::mousePress(handle, Qt::LeftButton, Qt::NoModifier, start);
+    QMouseEvent drag(QEvent::MouseMove, start + dragDelta, dragGlobal,
+                     Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+    QCoreApplication::sendEvent(handle, &drag);
+    QTest::mouseRelease(handle, Qt::LeftButton, Qt::NoModifier, start);
+    QCOMPARE(panel->pos(), beforeDrag + dragDelta);
+    QVERIFY(panel->isVisible());
+    auto *clothes = panel->findChild<QComboBox *>("clothes");
+    QVERIFY(clothes);
+    for (const QString &option : {QStringLiteral("pajamas"), QStringLiteral("bikini")})
+    {
+        clothes->showPopup();
+        auto *view = clothes->view();
+        QVERIFY(QTest::qWaitForWindowExposed(view->window()));
+        QTest::qWait(250); // Let Qt's popup-opening release guard expire.
+        const QModelIndex index = clothes->model()->index(clothes->findData(option), 0);
+        QVERIFY(index.isValid());
+        QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier, view->visualRect(index).center());
+        QCOMPARE(window.selectedAppearance("clothes"), option);
+        QVERIFY2(panel->isVisible(), "Appearance panel closed after choosing an outfit");
+        QVERIFY(window.renderFrameNow());
+        QCOMPARE(window.parameterValue("Param18"), option == "pajamas" ? 30.0f : 0.0f);
+        QCOMPARE(window.parameterValue("Param17"), option == "bikini" ? 30.0f : 0.0f);
+    }
+    QTest::mouseClick(panel->findChild<QPushButton *>("look/blood/button"), Qt::LeftButton);
+    QVERIFY(panel->isVisible());
+    QCOMPARE(clothes->currentData().toString(), QStringLiteral("default"));
+    QCOMPARE(panel->findChild<QComboBox *>("blood")->currentData().toString(), QStringLiteral("on"));
+    QTest::mouseClick(panel->findChild<QPushButton *>("appearance/reset/button"), Qt::LeftButton);
+    QVERIFY(panel->isVisible());
+    QCOMPARE(panel->findChild<QComboBox *>("blood")->currentData().toString(), QStringLiteral("off"));
+    QTest::keyClick(panel.get(), Qt::Key_Escape);
+    QVERIFY(panel->isVisible());
+    QVERIFY(panel->grab().save(QDir(QCoreApplication::applicationDirPath()).absoluteFilePath("../../appearance-panel.png")));
+    QWidget outside(nullptr, Qt::Tool);
+    outside.resize(50, 50);
+    outside.move(panel->geometry().topRight() + QPoint(50, 0));
+    outside.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&outside));
+    QVERIFY(panel->isVisible()); // Focus changes must not close it.
+    QTest::mouseClick(&outside, Qt::LeftButton);
+    QVERIFY(panel->isVisible());
+    QTest::mouseClick(&outside, Qt::RightButton);
+    QVERIFY(!panel->isVisible());
+    // The avatar is also outside the panel. Its same right click must not reopen it.
+    std::unique_ptr<QWidget> ownedPanel(window.createAppearancePanel(&window));
+    ownedPanel->move(panel->screen()->availableGeometry().topLeft() + QPoint(400, 100));
+    window.move(panel->screen()->availableGeometry().topLeft() + QPoint(20, 20));
+    window.show();
+    ownedPanel->show();
+    QVERIFY(QTest::qWaitForWindowExposed(ownedPanel.get()));
+    QPoint click(-1, -1);
+    for (int y = 0; y < window.height() && click.x() < 0; y += 4)
+        for (int x = 0; x < window.width(); x += 4)
+            if (window.acceptsClickAt(QPoint(x, y)) &&
+                !ownedPanel->geometry().contains(window.mapToGlobal(QPoint(x, y))))
+            {
+                click = QPoint(x, y);
+                break;
+            }
+    QVERIFY2(click.x() >= 0, "No opaque avatar pixel outside panel found");
+    // Native input reaches QWindow before QWidget. Do not dismiss during that first hop.
+    QMouseEvent nativePress(QEvent::MouseButtonPress, click, window.mapToGlobal(click),
+                            Qt::RightButton, Qt::RightButton, Qt::NoModifier);
+    QCoreApplication::sendEvent(window.windowHandle(), &nativePress);
+    QVERIFY2(ownedPanel->isVisible(), "Native QWindow press prematurely dismissed the panel");
+    QMouseEvent nativeRelease(QEvent::MouseButtonRelease, click, window.mapToGlobal(click),
+                              Qt::RightButton, Qt::NoButton, Qt::NoModifier);
+    QCoreApplication::sendEvent(window.windowHandle(), &nativeRelease);
+    QContextMenuEvent context(QContextMenuEvent::Mouse, click, window.mapToGlobal(click) + QPoint(3, 2));
+    QCoreApplication::sendEvent(&window, &context);
+    for (auto *child : window.findChildren<QWidget *>("appearancePanel"))
+        QVERIFY2(!child->isVisible(), "Dismissing on the avatar reopened the appearance panel");
+    // Native polling has no Qt press event; the guard must survive panel deletion.
+    auto *nativePanel = static_cast<AppearancePanel *>(window.createAppearancePanel(&window));
+    QPointer<QWidget> nativeLifetime(nativePanel);
+    nativePanel->setAttribute(Qt::WA_DeleteOnClose);
+    nativePanel->show();
+    nativePanel->dismissForOutsideRightClick();
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    QVERIFY(nativeLifetime.isNull());
+    QContextMenuEvent nativeContext(QContextMenuEvent::Mouse, click,
+                                    window.mapToGlobal(click) + QPoint(7, 4));
+    QCoreApplication::sendEvent(&window, &nativeContext);
+    for (auto *child : window.findChildren<QWidget *>("appearancePanel"))
+        QVERIFY2(!child->isVisible(), "Native dismissal reopened the panel after deletion");
+    // A separate right click must still open it normally.
+    QTest::mouseClick(&window, Qt::RightButton, Qt::NoModifier, click);
+    QContextMenuEvent nextContext(QContextMenuEvent::Mouse, click, window.mapToGlobal(click));
+    QCoreApplication::sendEvent(&window, &nextContext);
+    int visiblePanels = 0;
+    for (auto *child : window.findChildren<QWidget *>("appearancePanel"))
+        visiblePanels += child->isVisible() ? 1 : 0;
+    QCOMPARE(visiblePanels, 1);
+    // Clicking another app may produce no Qt context event at all. Do not lose the next click.
+    for (auto *child : window.findChildren<QWidget *>("appearancePanel"))
+        if (child->isVisible()) static_cast<AppearancePanel *>(child)->dismissForOutsideRightClick();
+    QTest::mouseClick(&window, Qt::RightButton, Qt::NoModifier, click);
+    QContextMenuEvent afterExternalClick(QContextMenuEvent::Mouse, click, window.mapToGlobal(click));
+    QCoreApplication::sendEvent(&window, &afterExternalClick);
+    visiblePanels = 0;
+    for (auto *child : window.findChildren<QWidget *>("appearancePanel"))
+        visiblePanels += child->isVisible() ? 1 : 0;
+    QCOMPARE(visiblePanels, 1);
+    window.hide();
+}
+void TestLive2DWindow::appearanceRejectsUnsafeData()
+{
+    const QString path = QFINDTESTDATA("../assets/live2d-presets/atri/presets/appearance.json");
+    QFile source(path);
+    QVERIFY(source.open(QIODevice::ReadOnly));
+    const auto original = QJsonDocument::fromJson(source.readAll()).object();
+    Live2DOffscreenRenderer renderer;
+    if (!QDir(modelDirFor(QStringLiteral("atri"))).exists()) QSKIP("Local atri model absent");
+    QVERIFY(openModelByName(QStringLiteral("atri"), &renderer));
+    Live2DAppearancePreset preset;
+    QString error;
+    const auto ranges = renderer.declaredParameterRanges();
+    const QSet<QString> forbidden{"ParamEyeLOpen"};
+    QVERIFY2(preset.load(path, ranges, forbidden, &error, "atri"), qPrintable(error));
+    QVERIFY(!preset.groups().isEmpty());
+    QTemporaryDir temp;
+    QVERIFY(temp.isValid());
+    for (const QString &mode : {"missing-id", "eye", "range", "duplicate-owner", "bad-look", "empty", "wrong-model"})
+    {
+        auto data = original;
+        auto groups = data.value("groups").toArray();
+        auto group = groups.first().toObject();
+        auto options = group.value("options").toArray();
+        auto option = options.at(1).toObject();
+        if (mode == "missing-id") option["values"] = QJsonObject{{"NOT_A_PARAMETER", 30}};
+        if (mode == "eye") option["values"] = QJsonObject{{"ParamEyeLOpen", 0}};
+        if (mode == "range") option["values"] = QJsonObject{{"Param18", 31}};
+        options[1] = option; group["options"] = options; groups[0] = group;
+        if (mode == "duplicate-owner") { group["id"] = "another"; groups.append(group); }
+        if (mode == "empty") groups = {};
+        if (mode == "wrong-model") data["model"] = "miku";
+        data["groups"] = groups;
+        if (mode == "bad-look") data["looks"] = QJsonArray{QJsonObject{{"id", "bad"}, {"label", "bad"}, {"selections", QJsonObject{{"clothes", "nope"}}}}};
+        const QString bad = temp.filePath("bad.json");
+        QFile file(bad); QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write(QJsonDocument(data).toJson()); file.close();
+        QVERIFY2(!preset.load(bad, ranges, forbidden, &error, "atri"), qPrintable("Unsafe preset accepted: " + mode));
+        QVERIFY(preset.values().isEmpty());
+        QVERIFY(preset.groups().isEmpty());
+        QVERIFY(preset.load(path, ranges, forbidden, nullptr, "atri"));
+    }
 }
 
 QTEST_MAIN(TestLive2DWindow)
