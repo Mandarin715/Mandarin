@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(Mandarin VERSION 1.14.3 LANGUAGES CXX)
+project(Mandarin VERSION 1.14.4 LANGUAGES CXX)
 
 # MSVC 默认按系统代码页解析源文件（中文 Windows 上是 936/GBK），会把中文注释与字面量读坏，
 # 表现为 C4819 + C1071（"在注释中遇到意外的文件结束"）。
