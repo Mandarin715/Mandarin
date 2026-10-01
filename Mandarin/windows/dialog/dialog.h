@@ -216,12 +216,14 @@ class Dialog : public QWidget
     bool submitCurrentInput();
     // 记忆功能
     QJsonObject m_memoryData;
+    QString m_memoryPath;
     // 系统提示词缓存（避免每次发消息重复构建）
     QString m_cachedSystemPrompt;
     QString m_cachedCharacterForPrompt;
     bool m_memoryDirty = true;
     void loadMemory();
-    void saveMemory() const;
+    bool saveMemory(const QJsonObject &candidate);
+    quint64 m_memoryGeneration = 0;
     QString buildMemoryContext() const;
     void extractAndStoreMemory(const QString &userInput, const QString &aiReply);
     void compressContextHistory();

@@ -515,6 +515,17 @@ if(BUILD_TESTING)
     )
     add_test(NAME test_live2dmodelinfo COMMAND test_live2dmodelinfo)
 
+    add_executable(test_memorystore tests/test_memorystore.cpp)
+    target_link_libraries(test_memorystore PRIVATE Qt${QT_VERSION_MAJOR}::Test Qt${QT_VERSION_MAJOR}::Core)
+    set_target_properties(test_memorystore PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_custom_command(TARGET test_memorystore POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Test>"
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Core>"
+            "$<TARGET_FILE_DIR:test_memorystore>")
+    add_test(NAME test_memorystore COMMAND test_memorystore)
+
     add_executable(test_tachiegeometry
         tests/test_tachiegeometry.cpp
         utils/TachieGeometry.cpp

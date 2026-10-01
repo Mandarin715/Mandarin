@@ -15,6 +15,7 @@ class SettingChild_Memory : public QWidget
   public:
     explicit SettingChild_Memory(QWidget *parent = nullptr);
     ~SettingChild_Memory();
+    void RefreshMemoryList();
 
   signals:
     void requestReloadMemory();
@@ -26,7 +27,7 @@ class SettingChild_Memory : public QWidget
   private:
     Ui::SettingChild_Memory *ui;
     QList<QWidget *> m_memoryRows;
-    void RefreshMemoryList();
+    QString m_displayedMemoryPath;
     void ClearMemoryRows();
 };
 

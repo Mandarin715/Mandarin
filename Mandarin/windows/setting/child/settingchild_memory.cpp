@@ -2,6 +2,7 @@
 #include "ui_settingchild_memory.h"
 
 #include "../../../GlobalConstants.h"
+#include "../../../utils/MemoryStore.h"
 
 #include "ElaMessageBar.h"
 #include "ElaScrollPageArea.h"
@@ -44,20 +45,22 @@ void SettingChild_Memory::ClearMemoryRows()
 void SettingChild_Memory::RefreshMemoryList()
 {
     ClearMemoryRows();
+    ui->pushButton_ClearAll->setEnabled(false);
 
     const QString memoryPath = ReadCharacterMemoryPath();
+    m_displayedMemoryPath = memoryPath;
     if (memoryPath.isEmpty())
         return;
 
-    QFile file(memoryPath);
-    if (!file.open(QIODevice::ReadOnly))
+    QJsonObject data;
+    QString error;
+    if (!MemoryStore::load(memoryPath, data, &error)) {
+        ElaMessageBar::error(ElaMessageBarType::BottomRight, "读取失败", error, 5000, this);
         return;
+    }
 
-    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
-    file.close();
-
-    const QJsonArray summaries = doc.object().value("help_summaries").toArray();
-    const QJsonObject personalInfo = doc.object().value("personal_info").toObject();
+    const QJsonArray summaries = data.value("help_summaries").toArray();
+    const QJsonObject personalInfo = data.value("personal_info").toObject();
 
     // ── 用户信息区 ──
     if (!personalInfo.isEmpty())
@@ -135,22 +138,17 @@ void SettingChild_Memory::RefreshMemoryList()
         btnDelete->setToolTip("删除此条记忆");
         rowLayout->addWidget(btnDelete);
 
-        connect(btnDelete, &QPushButton::clicked, this, [this, i]() {
-            const QString path = ReadCharacterMemoryPath();
-            QFile f(path);
-            if (!f.open(QIODevice::ReadOnly))
+        const QString entryId = entry.value("id").toString();
+        connect(btnDelete, &QPushButton::clicked, this, [this, memoryPath, entryId]() {
+            if (ReadCharacterMemoryPath() != memoryPath) {
+                RefreshMemoryList();
                 return;
-            QJsonDocument d = QJsonDocument::fromJson(f.readAll());
-            f.close();
-            QJsonObject obj = d.object();
-            QJsonArray arr = obj.value("help_summaries").toArray();
-            if (i >= 0 && i < arr.size())
-                arr.removeAt(i);
-            obj["help_summaries"] = arr;
-            if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
-            {
-                f.write(QJsonDocument(obj).toJson(QJsonDocument::Indented));
-                f.close();
+            }
+            QString error;
+            if (!MemoryStore::removeForCharacter(memoryPath, ReadCharacterMemoryPath(), entryId, false, &error)) {
+                ElaMessageBar::error(ElaMessageBarType::BottomRight, "删除失败", error, 5000, this);
+                RefreshMemoryList();
+                return;
             }
             RefreshMemoryList();
             emit requestReloadMemory();
@@ -164,18 +162,15 @@ void SettingChild_Memory::RefreshMemoryList()
 /*全部清空*/
 void SettingChild_Memory::on_pushButton_ClearAll_clicked()
 {
-    const QString path = ReadCharacterMemoryPath();
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly))
+    const QString path = m_displayedMemoryPath;
+    if (path.isEmpty() || ReadCharacterMemoryPath() != path) {
+        RefreshMemoryList();
         return;
-    QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
-    file.close();
-    QJsonObject obj = doc.object();
-    obj["help_summaries"] = QJsonArray();
-    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate))
-    {
-        file.write(QJsonDocument(obj).toJson(QJsonDocument::Indented));
-        file.close();
+    }
+    QString error;
+    if (!MemoryStore::removeForCharacter(path, ReadCharacterMemoryPath(), {}, true, &error)) {
+        ElaMessageBar::error(ElaMessageBarType::BottomRight, "清空失败", error, 5000, this);
+        return;
     }
     RefreshMemoryList();
     emit requestReloadMemory();

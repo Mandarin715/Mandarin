@@ -72,6 +72,8 @@ MainWindow::MainWindow(Dialog *dialog, CharacterWindowBase *characterWin, QWidge
             dialog, &Dialog::ReloadCharacterConfig); //角色/prompt变更重载
     connect(settingchild_memoryWin, &SettingChild_Memory::requestReloadMemory,
             dialog, &Dialog::ReloadMemoryConfig); //重载记忆缓存
+    connect(settingchild_charWin, &SettingChild_Char::requestReloadCharSelect,
+            settingchild_memoryWin, &SettingChild_Memory::RefreshMemoryList);
     //获取模型列表后刷新角色页的模型下拉框
     connect(settingchild_llmWin, &SettingChild_LLM::modelListRefreshed,
             settingchild_charWin, &SettingChild_Char::RefreshModelList); //刷新LLM模型列表
