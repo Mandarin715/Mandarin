@@ -1,3 +1,5 @@
+> 本文保留历史记录；最新接手基线见 [Live2D交接.md](Live2D交接.md)，后续推进见 [Live2D推进记录-樱花miku.md](Live2D推进记录-樱花miku.md)。
+
 # Live2D 进度与待办
 
 > ⚠️ **本文档落后约 8 轮，部分内容已过时。接手请以 [Live2D交接.md](Live2D交接.md) 为准。**

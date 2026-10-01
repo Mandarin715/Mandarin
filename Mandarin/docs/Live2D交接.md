@@ -1,5 +1,7 @@
 # Live2D 桌宠 · 交接文档
 
+> 本文是接手时的历史基线。2026-09-30 后续已完成樱花miku独立预设与四处测试格式修复，验收细节见 [Live2D推进记录-樱花miku.md](Live2D推进记录-樱花miku.md)。
+
 > 写作时间：2026-09-30。作者：上一个 AI 会话（DeepSeek Harness）。
 > 本文档是**接手起点**；`docs/Live2D方案.md`（设计）与 `docs/Live2D实施计划-阶段0-1.md`（阶段 0-1 计划）仍然有效，
 > 但 **`docs/Live2D进度与待办.md` 已过时**（落后约 8 轮），其「待办」段落请以本文档为准。
@@ -29,7 +31,7 @@ Mandarin/assets/live2d-presets/                       ← 上面那三份的**�
 
 每个模型目录下：
 - `parameter-map.json`：**语义名 → {真实参数 ID, min, max, neutral}**
-- `presets/moods.json`：14 个**情绪原型**（相对 neutral 的增量）+ 26 条「立绘心情名 → 原型」别名
+- `presets/moods.json`：14 个**情绪原型**（稀疏绝对目标值，未列项回 neutral）+ 26 条「立绘心情名 → 原型」别名
 - `presets/idle.json`：待机摆动，每条 = `{语义参数名, 振幅, 周期秒, 相位(占周期比例)}`
 
 **关键分工**：**词表属于角色**（26 个心情名 = 该角色 `Tachie/` 下 PNG 的文件名），**参数属于模型**。
@@ -84,7 +86,7 @@ CharacterWindowBase（基类承接信号；PNG 路径为空实现）
 ### 情绪预设的语义
 
 - `neutral` = 模型**声明的默认值**（`mouthForm` 在 atri 是 -0.5，不是 0！）
-- 原型只写**与 neutral 的增量**；未列出的参数保持 neutral
+- 原型只写**与 neutral 不同的绝对目标值**；未列出的参数保持 neutral
 - 词表外的词 → **回退 neutral**（绝不让上一个情绪挂在脸上），只记一次日志
 - 数据缺失/损坏 → 整个功能**优雅关闭**（记一条日志，什么都不应用，不崩）
 

@@ -104,3 +104,7 @@ Documents/Mandarin/
 - 配置写入：各设置页面在值变更时立即写文件，然后 emit 信号通知 Dialog 重载
 - 命名：类名 PascalCase，成员变量 `m_` 前缀，私有成员 `_` 前缀（部分）
 - JSON 操作使用 ZcJsonLib（`load()`/`save()`/`value()`）
+
+## 当前维护重点
+
+用户于 2026-09-30 指定：后续主要维护亚托莉角色（Live2D 模型 atri，语音 VITS - 4 - ATRI）。涉及角色表现、预设与验证时，默认以亚托莉为主；其他角色保留为备用。
