@@ -18,6 +18,7 @@ class TestChatLogStore : public QObject
     void migrateParsesLegacyFormat();
     void migrateDropsDateMarkers();
     void rewriteReplacesContent();
+    void appendAfterInterruptedWrite();
 };
 
 /*追加后读回一致（role/content/time/id/meta）*/
@@ -135,6 +136,23 @@ void TestChatLogStore::rewriteReplacesContent()
     QCOMPARE(msgs.size(), 2);
     QCOMPARE(msgs[0].toObject().value("content").toString(), QStringLiteral("第一条"));
     QCOMPARE(msgs[1].toObject().value("content").toString(), QStringLiteral("第二条"));
+}
+
+void TestChatLogStore::appendAfterInterruptedWrite()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath("chat.jsonl");
+    ChatLogStore store(path);
+    store.appendMessage("user", "saved");
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Append));
+    file.write("{\"role\":\"assistant\",\"content\":\"interrupted");
+    file.close();
+    store.appendMessage("user", "after restart");
+    const auto messages = store.loadMessages();
+    QCOMPARE(messages.size(), 2);
+    QCOMPARE(messages.last().toObject().value("content").toString(), QString("after restart"));
 }
 
 QTEST_MAIN(TestChatLogStore)

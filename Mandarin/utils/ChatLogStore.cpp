@@ -22,8 +22,12 @@ void ChatLogStore::appendMessage(const QString &role, const QString &content,
 {
     if (!m_dirReady)
     {
-        QDir().mkpath(QFileInfo(m_logPath).absolutePath());
-        m_dirReady = true;
+        m_dirReady = QDir().mkpath(QFileInfo(m_logPath).absolutePath());
+        if (!m_dirReady)
+        {
+            qWarning() << "ChatLogStore: cannot create log directory:" << m_logPath;
+            return;
+        }
     }
 
     QJsonObject obj;
@@ -37,10 +41,24 @@ void ChatLogStore::appendMessage(const QString &role, const QString &content,
         obj["meta"] = meta;
 
     QFile file(m_logPath);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+    if (!file.open(QIODevice::ReadWrite | QIODevice::Append))
+    {
+        qWarning() << "ChatLogStore: cannot append:" << m_logPath << file.errorString();
         return;
-    file.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
-    file.write("\n");
+    }
+    QByteArray record;
+    // Isolate an interrupted final line so it cannot swallow the next message.
+    if (file.size() > 0)
+    {
+        if (!file.seek(file.size() - 1))
+            return;
+        if (file.read(1) != "\n")
+            record.append('\n');
+    }
+    record += QJsonDocument(obj).toJson(QJsonDocument::Compact);
+    record.append('\n');
+    if (file.write(record) != record.size())
+        qWarning() << "ChatLogStore: append failed:" << m_logPath << file.errorString();
 }
 
 /*读取全部消息（坏行跳过并告警）*/

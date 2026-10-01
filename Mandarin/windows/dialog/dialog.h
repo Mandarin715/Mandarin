@@ -16,6 +16,7 @@
 #include <QStringList>
 #include <QTimer>
 #include <atomic>
+#include <thread>
 
 class QCamera;
 class QVideoSink;
@@ -248,6 +249,7 @@ class Dialog : public QWidget
     void initSpeechRecognizer();
     void applyRecognizedText(const QString &recognizedText); // 识别结果过滤/上屏/自动发送
     std::atomic_bool m_asrBusy{false}; // 工作线程识别在途，防并发/防误删
+    std::thread m_asrWorker;
     // 语音唤醒
     WakeWordDetector *m_wakeWordDetector = nullptr;
     bool m_wakeWordEnabled = false;
@@ -267,8 +269,8 @@ class Dialog : public QWidget
     // 多模态屏幕捕获
     bool m_screenCaptureEnabled = false;
     bool m_visionInFlight = false;
+    std::thread m_screenEncodeWorker;
     QNetworkAccessManager *m_visionManager = nullptr;
-    QByteArray captureScreenToJpeg();
     void captureAndAnalyzeScreen();
     void analyzeScreenWithVision(const QByteArray &imageBase64,
                                   const QString &userMessage);

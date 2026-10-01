@@ -796,6 +796,10 @@ void Dialog::initServices()
 Dialog::~Dialog()
 {
     releaseSpeechHotkeyResources();
+    // Workers post queued results without waiting for the GUI thread. Join before
+    // destroying this receiver and its child recognizer; Qt discards queued results.
+    if (m_asrWorker.joinable()) m_asrWorker.join();
+    if (m_screenEncodeWorker.joinable()) m_screenEncodeWorker.join();
     stopWakeWord();
     if (m_presenceCamera)
     {
@@ -1505,7 +1509,7 @@ void Dialog::tryStartNextVitsRequest()
         ZcJsonLib charConfig(ReadCharacterUserConfigPath());
         const QString modelAndSpeaker = charConfig.value("vitsMasSelect").toString();
         m_cachedVitsModel = modelAndSpeaker.section(" - ", 0, 0).trimmed().toLower();
-        m_cachedVitsSpeaker = modelAndSpeaker.section(" - ", 2, 2).trimmed();
+        m_cachedVitsSpeaker = modelAndSpeaker.section(" - ", 1, 1).trimmed();
     }
     /*请求地址构建（使用缓存配置，避免每句话重复读文件）
       注意：不可用 .arg() 链拼接 URL，因为后续 .arg() 会误替换文本中已编码的 %N 字节序列。*/
@@ -1526,8 +1530,8 @@ void Dialog::tryStartNextVitsRequest()
     const quint64 vitsGen = m_vitsGeneration;
 
     // 性能日志
-    QElapsedTimer *timer = new QElapsedTimer();
-    timer->start();
+    QElapsedTimer timer;
+    timer.start();
     const QString logText = text.left(20) + (text.size() > 20 ? "..." : "");
 
     // 内存缓冲区替代磁盘临时文件
@@ -1542,14 +1546,12 @@ void Dialog::tryStartNextVitsRequest()
     QObject::connect(reply, &QNetworkReply::finished, this, [=]() {
         if (vitsGen != m_vitsGeneration) {
             audioBuffer->deleteLater();
-            m_vitsEnvelopes.remove(seq);
             reply->deleteLater();
-            delete timer;
             return;
         }
         audioBuffer->close();
         qDebug() << "[VITS] done | text:" << logText
-                 << "| elapsed:" << timer->elapsed() << "ms"
+                 << "| elapsed:" << timer.elapsed() << "ms"
                  << "| size:" << audioBuffer->size() << "bytes"
                  << "| error:" << (reply->error() != QNetworkReply::NoError ? reply->errorString() : "none");
 
@@ -1576,7 +1578,6 @@ void Dialog::tryStartNextVitsRequest()
         }
 
         reply->deleteLater();
-        delete timer;
         m_vitsInFlightReplies.removeOne(reply);
         tryStartNextVitsRequest();
 
@@ -2162,7 +2163,7 @@ bool Dialog::doSubmitCurrentInput(const QString &userInput)
     m_cachedVitsApiUrl = config.value("vits/ApiUrl").toString();
     QString modelAndSpeaker = charConfig.value("vitsMasSelect").toString();
     m_cachedVitsModel = modelAndSpeaker.section(" - ", 0, 0).trimmed().toLower();
-    m_cachedVitsSpeaker = modelAndSpeaker.section(" - ", 2, 2).trimmed();
+    m_cachedVitsSpeaker = modelAndSpeaker.section(" - ", 1, 1).trimmed();
     m_streamRawReply.clear();
     m_streamDisplayedChinese.clear();
     m_streamSynthCursor = 0;
@@ -2359,7 +2360,8 @@ void Dialog::stopSpeechRecording()
         return; // 上一次识别仍在进行，忽略本次
     const QByteArray pcm = m_capturedAudioData;
     m_capturedAudioData.clear();
-    std::thread(
+    if (m_asrWorker.joinable()) m_asrWorker.join();
+    m_asrWorker = std::thread(
         [this, pcm]()
         {
             const QString text =
@@ -2373,8 +2375,7 @@ void Dialog::stopSpeechRecording()
                     applyRecognizedText(text);
                 },
                 Qt::QueuedConnection);
-        })
-        .detach();
+        });
     return;
 }
 
@@ -2996,39 +2997,6 @@ void Dialog::doSubmitWithSearchContext(const QString &userMessage,
 }
 
 /*截取屏幕并编码为JPEG base64*/
-QByteArray Dialog::captureScreenToJpeg()
-{
-    QScreen *screen = QGuiApplication::primaryScreen();
-    if (!screen)
-    {
-        qWarning() << "Screen capture: no primary screen available";
-        return QByteArray();
-    }
-
-    QPixmap pixmap = screen->grabWindow(0);
-    if (pixmap.isNull())
-    {
-        qWarning() << "Screen capture: grabWindow returned null pixmap";
-        return QByteArray();
-    }
-
-    // 缩放至最大1920px，保持宽高比
-    QImage image = pixmap.toImage();
-    const int maxDim = 1920;
-    if (image.width() > maxDim || image.height() > maxDim)
-    {
-        image = image.scaled(maxDim, maxDim, Qt::KeepAspectRatio,
-                             Qt::SmoothTransformation);
-    }
-
-    QByteArray jpegData;
-    QBuffer buffer(&jpegData);
-    buffer.open(QIODevice::WriteOnly);
-    image.save(&buffer, "JPEG", 70);
-    buffer.close();
-
-    return jpegData;
-}
 
 /*捕获屏幕并启动分析*/
 void Dialog::captureAndAnalyzeScreen()
@@ -3062,7 +3030,8 @@ void Dialog::captureAndAnalyzeScreen()
                              Qt::SmoothTransformation);
 
     m_visionInFlight = true;
-    std::thread(
+    if (m_screenEncodeWorker.joinable()) m_screenEncodeWorker.join();
+    m_screenEncodeWorker = std::thread(
         [this, image, userMessage]()
         {
             QByteArray jpeg;
@@ -3090,8 +3059,7 @@ void Dialog::captureAndAnalyzeScreen()
                     analyzeScreenWithVision(b64, userMessage);
                 },
                 Qt::QueuedConnection);
-        })
-        .detach();
+        });
 }
 
 /*发送截图到视觉AI分析*/
