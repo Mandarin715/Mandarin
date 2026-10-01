@@ -4,6 +4,7 @@
 #include "AiProvider.h"
 #include "../../utils/AudioEnvelope.h"
 #include "../../utils/SearchProvider.h"
+#include "../../utils/ReliableReminder.h"
 #include "../../utils/FaceDetector.h"
 #include "ZcJsonLib.h"
 #include <QDateTime>
@@ -296,16 +297,17 @@ class Dialog : public QWidget
     void initClipboardMonitor();
     bool m_clipboardCooldown = false;
     // 日程提醒
-    struct Schedule {
-        QString id;
-        QDateTime time;   // 触发时间
-        QString text;     // 提醒内容
-        int repeatSec = 0; // 0=一次性，>0=循环周期（秒）
-        bool triggered = false;
-    };
+    using Schedule = ReliableReminder;
     QList<Schedule> m_schedules;
     void loadSchedules();
-    void saveSchedules() const;
+    bool commitSchedules(const QList<Schedule> &candidate);
+    QString m_activeReminderId;
+    QString m_activeReminderAttempt;
+    ReminderDeliveryGate m_reminderDelivery;
+    bool m_reminderCompletionPending = false;
+    bool m_reminderCompletionSuccess = false;
+    void finishReminderDelivery(bool success);
+    void cancelActiveReminder();
     bool tryParseSchedule(const QString &input, Schedule &out) const; // 规则解析
     void checkSchedules();                                            // 每秒轮询
     bool fireSchedule(const Schedule &s, bool missed);                // 触发提醒（返回是否发声）
@@ -313,7 +315,8 @@ class Dialog : public QWidget
     void checkProactiveWindow();
     void checkProactiveUserPresence();
     bool doProactiveSpeak(const QString &windowTitle, const QString &contextHint,
-                          bool forced = false, bool isReminder = false);
+                          bool forced = false, bool isReminder = false,
+                          const QString &reminderId = {}, const QString &attemptId = {});
 
     // 摄像头感知（v1 仅 Windows：平时摄像头关，仅"怀疑"短开验证人脸）
     FaceDetector *m_faceDetector = nullptr;

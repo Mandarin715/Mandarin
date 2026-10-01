@@ -3,6 +3,7 @@
 #include "history/history.h"
 #include "reminder/reminder.h"
 #include "../../utils/ChatLogStore.h"
+#include "../../utils/AtomicJsonStore.h"
 
 #include <QRandomGenerator>
 #include "ui_dialog.h"
@@ -584,11 +585,22 @@ void Dialog::initServices()
     // 播放错误诊断
     connect(m_vitsPlayer, &QMediaPlayer::errorOccurred, this,
             [this](QMediaPlayer::Error error, const QString &errorString) {
+                if (error != QMediaPlayer::NoError) {
+                    m_reminderDelivery.failed = true;
+                    QTimer::singleShot(0, this, &Dialog::checkVitsPipelineFinished);
+                }
                 qWarning() << "[VITS] player error:" << error << errorString
                            << "| state:" << m_vitsPlayer->playbackState()
                            << "| audio device:"
                            << (m_vitsAudioOutput ? m_vitsAudioOutput->device().description()
                                                  : QStringLiteral("null"));
+            });
+    connect(m_vitsPlayer, &QMediaPlayer::mediaStatusChanged, this,
+            [this](QMediaPlayer::MediaStatus status) {
+                if (m_activeReminderId.isEmpty()) return;
+                if (status == QMediaPlayer::EndOfMedia) m_reminderDelivery.audioEnded = true;
+                if (status == QMediaPlayer::InvalidMedia) m_reminderDelivery.failed = true;
+                QTimer::singleShot(0, this, &Dialog::checkVitsPipelineFinished);
             });
     // VITS 服务就绪检查（延迟5秒后每3秒重试，就绪后不重复）
     QTimer::singleShot(5000, this, [this]() { checkVitsServerReady(); });
@@ -884,6 +896,9 @@ void Dialog::ReloadProviderConfig()
 /*角色切换或 prompt 变更时重载 */
 void Dialog::ReloadCharacterConfig()
 {
+    cancelActiveReminder();
+    m_cachedVitsModel.clear();
+    m_cachedVitsSpeaker.clear();
     m_cachedSystemPrompt.clear();
     loadContextHistory();
     loadMemory();
@@ -1253,44 +1268,36 @@ void Dialog::refreshReminderWindow()
 /*删除一条提醒（按 id）*/
 void Dialog::deleteReminder(const QString &id)
 {
-    bool changed = false;
-    for (auto it = m_schedules.begin(); it != m_schedules.end(); ++it)
-    {
-        if (it->id == id)
-        {
-            m_schedules.erase(it);
-            changed = true;
-            break;
+    auto candidate = m_schedules;
+    for (int i = 0; i < candidate.size(); ++i) {
+        if (candidate[i].id == id) {
+            candidate.removeAt(i);
+            if (commitSchedules(candidate) && m_activeReminderId == id) cancelActiveReminder();
+            return;
         }
-    }
-    if (changed)
-    {
-        saveSchedules();
-        refreshReminderWindow();
     }
 }
 
 /*清空全部待触发提醒*/
 void Dialog::clearAllReminders()
 {
-    bool changed = false;
-    for (auto it = m_schedules.begin(); it != m_schedules.end();)
-    {
-        if (!it->triggered)
-        {
-            it = m_schedules.erase(it);
-            changed = true;
-        }
-        else
-        {
-            ++it;
-        }
+    auto candidate = m_schedules;
+    for (int i = candidate.size() - 1; i >= 0; --i)
+        if (!candidate[i].triggered) candidate.removeAt(i);
+    if (commitSchedules(candidate)) cancelActiveReminder();
+}
+
+void Dialog::cancelActiveReminder()
+{
+    if (m_activeReminderId.isEmpty()) return;
+    if (m_activeProactiveAi) {
+        ++m_proactiveGeneration;
+        m_activeProactiveAi->disconnect(this);
+        m_activeProactiveAi->deleteLater();
+        m_activeProactiveAi = nullptr;
+        m_proactiveInFlight = false;
     }
-    if (changed)
-    {
-        saveSchedules();
-        refreshReminderWindow();
-    }
+    resetVitsPipeline();
 }
 
 /*回退历史*/
@@ -1487,8 +1494,10 @@ void Dialog::tryStartNextVitsRequest()
     {
         ZcJsonLib config(JsonSettingPath);
         m_cachedVitsApiUrl = config.value("vits/ApiUrl").toString();
-        if (m_cachedVitsApiUrl.isEmpty())
+        if (m_cachedVitsApiUrl.isEmpty()) {
+            m_reminderDelivery.failed = true;
             return;
+        }
     }
     // 确保 model/speaker 已缓存（主动对话可能在用户首次发消息前触发）
     if (m_cachedVitsModel.isEmpty() || m_cachedVitsSpeaker.isEmpty())
@@ -1561,6 +1570,7 @@ void Dialog::tryStartNextVitsRequest()
             audioBuffer->deleteLater();
             m_vitsEnvelopes.remove(seq);
             // 记录失败序号并尝试推进游标，避免卡死后续播放
+            m_reminderDelivery.failed = true;
             m_vitsFailedSeqs.insert(seq);
             tryStartNextVitsPlayback();
         }
@@ -1576,6 +1586,7 @@ void Dialog::tryStartNextVitsRequest()
 /*重置整个 VITS 管线（abort 在途请求 + 清理队列）*/
 void Dialog::resetVitsPipeline()
 {
+    finishReminderDelivery(false);
     ++m_vitsGeneration;
 
     const auto replies = m_vitsInFlightReplies;
@@ -1604,11 +1615,17 @@ void Dialog::resetVitsPipeline()
 /*检查 VITS 管线是否全部完成（供统一回调）*/
 void Dialog::checkVitsPipelineFinished()
 {
+    if (m_activeChatAi || m_proactiveInFlight) return;
     if (!m_vitsPendingTexts.isEmpty()) return;
     if (!m_vitsInFlightReplies.isEmpty()) return;
     if (!m_vitsReadyFiles.isEmpty()) return;
     if (m_vitsPlayer && m_vitsPlayer->playbackState() != QMediaPlayer::StoppedState) return;
 
+    if (!m_activeReminderId.isEmpty()) {
+        const auto completion = m_reminderDelivery.completion(true);
+        if (!completion.has_value()) return;
+        finishReminderDelivery(*completion);
+    }
     if (m_vitsFinishScheduled) return;
     m_vitsFinishScheduled = true;
 
@@ -1848,12 +1865,13 @@ bool Dialog::submitCurrentInput()
         if (wantCancel) {
             const bool all = lowerInput.contains(QStringLiteral("所有")) ||
                              lowerInput.contains(QStringLiteral("全部"));
+            auto candidate = m_schedules;
             int removed = 0;
             QStringList removedTexts;
-            for (auto it = m_schedules.begin(); it != m_schedules.end();) {
+            for (auto it = candidate.begin(); it != candidate.end();) {
                 if (it->triggered) { ++it; continue; }
                 removedTexts << it->text;
-                it = m_schedules.erase(it);
+                it = candidate.erase(it);
                 ++removed;
                 if (!all)
                     break;
@@ -1866,8 +1884,10 @@ bool Dialog::submitCurrentInput()
                     : QStringLiteral("当前没有可取消的提醒");
             if (removed > 0)
             {
-                saveSchedules();
-                refreshReminderWindow();
+                if (!commitSchedules(candidate)) return true;
+                bool activeExists = false;
+                for (const auto &entry : candidate) if (entry.id == m_activeReminderId) activeExists = true;
+                if (!activeExists) cancelActiveReminder();
             }
             m_lastUserInput = userInput;
             ui->textEdit->setText(msg);
@@ -1880,9 +1900,9 @@ bool Dialog::submitCurrentInput()
 
         Schedule parsed;
         if (tryParseSchedule(userInput, parsed)) {
-            m_schedules.append(parsed);
-            saveSchedules();
-            refreshReminderWindow();
+            auto candidate = m_schedules;
+            candidate.append(parsed);
+            if (!commitSchedules(candidate)) return true;
             QString whenText = parsed.time.toString("M月d日 HH:mm");
             if (parsed.repeatSec >= 7 * 24 * 3600)
                 whenText = QStringLiteral("每周 %1").arg(parsed.time.toString("HH:mm"));
@@ -4262,45 +4282,83 @@ void Dialog::initClipboardMonitor()
 /*加载日程列表*/
 void Dialog::loadSchedules()
 {
-    m_schedules.clear();
-    QFile file(SchedulesPath);
-    if (!file.open(QIODevice::ReadOnly))
+    QJsonObject data;
+    QString error;
+    if (!AtomicJsonStore::read(SchedulesPath, data, &error)) {
+        qWarning() << "loadSchedules:" << error;
+        showTemporaryMessage(QStringLiteral("日程读取失败：%1").arg(error));
         return;
-    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
-    file.close();
-    const QJsonArray arr = doc.object().value("schedules").toArray();
-    for (const QJsonValue &v : arr) {
-        const QJsonObject o = v.toObject();
-        Schedule s;
-        s.id = o.value("id").toString();
-        s.time = QDateTime::fromString(o.value("time").toString(), Qt::ISODate);
-        s.text = o.value("text").toString();
-        s.repeatSec = o.value("repeat").toInt();
-        s.triggered = o.value("triggered").toBool();
-        if (s.time.isValid())
-            m_schedules.append(s);
     }
+    QList<Schedule> loaded;
+    if (!decodeReminders(data, loaded, &error)) {
+        showTemporaryMessage(error);
+        return;
+    }
+    QSet<QString> ids;
+    for (auto &reminder : loaded) {
+        if (reminder.id.isEmpty() || ids.contains(reminder.id))
+            reminder.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        ids.insert(reminder.id);
+    }
+    m_schedules = loaded;
+    QJsonArray normalized;
+    for (const auto &entry : loaded) normalized.append(entry.json());
+    if (normalized != data.value("schedules").toArray())
+        commitSchedules(loaded); // Persist legacy IDs and retire the previous process's attempt.
+}
+
+bool Dialog::commitSchedules(const QList<Schedule> &candidate)
+{
+    QJsonObject data;
+    QString error;
+    if (!AtomicJsonStore::read(SchedulesPath, data, &error)) {
+        showTemporaryMessage(QStringLiteral("日程保存失败：%1").arg(error));
+        return false;
+    }
+    QList<Schedule> existing;
+    if (!decodeReminders(data, existing, &error)) {
+        showTemporaryMessage(error);
+        return false;
+    }
+    QJsonArray entries;
+    for (const auto &reminder : candidate) entries.append(reminder.json());
+    data["schedules"] = entries;
+    if (!AtomicJsonStore::write(SchedulesPath, data, &error)) {
+        qWarning() << "saveSchedules:" << error;
+        showTemporaryMessage(QStringLiteral("日程保存失败：%1").arg(error));
+        return false;
+    }
+    m_schedules = candidate;
+    refreshReminderWindow();
+    return true;
+}
+
+void Dialog::finishReminderDelivery(bool success)
+{
+    if (m_activeReminderId.isEmpty()) return;
+    if (m_reminderCompletionPending) success = m_reminderCompletionSuccess;
+    m_reminderCompletionPending = true;
+    m_reminderCompletionSuccess = success;
+    auto candidate = m_schedules;
+    bool changed = false;
+    for (int i = 0; i < candidate.size(); ++i) {
+        auto &reminder = candidate[i];
+        if (reminder.id != m_activeReminderId || reminder.attemptId != m_activeReminderAttempt) continue;
+        changed = success ? reminder.deliver(m_activeReminderAttempt, QDateTime::currentDateTime())
+                          : reminder.fail(m_activeReminderAttempt, QDateTime::currentDateTime());
+        if (success && reminder.triggered) candidate.removeAt(i);
+        break;
+    }
+    if (changed && !commitSchedules(candidate)) return; // Retry the commit, never re-announce.
+    m_activeReminderId.clear();
+    m_activeReminderAttempt.clear();
+    m_reminderCompletionPending = false;
+    m_reminderDelivery.audioEnded = false;
+    m_reminderDelivery.audioExpected = false;
+    m_reminderDelivery.failed = false;
 }
 
 /*保存日程列表*/
-void Dialog::saveSchedules() const
-{
-    QJsonArray arr;
-    for (const Schedule &s : m_schedules) {
-        QJsonObject o;
-        o["id"] = s.id;
-        o["time"] = s.time.toString(Qt::ISODate);
-        o["text"] = s.text;
-        o["repeat"] = s.repeatSec;
-        o["triggered"] = s.triggered;
-        arr.append(o);
-    }
-    QJsonObject root;
-    root["schedules"] = arr;
-    QFile file(SchedulesPath);
-    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate))
-        file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
-}
 
 /*中文数字转阿拉伯数字：一→1 十二→12 二十三→23 十→10*/
 static int chineseToInt(const QString &s)
@@ -4473,102 +4531,51 @@ bool Dialog::tryParseSchedule(const QString &input, Schedule &out) const
 /*每秒轮询：到点触发 + 循环日程推后*/
 void Dialog::checkSchedules()
 {
-    const QDateTime now = QDateTime::currentDateTime();
-    bool changed = false;
-
-    for (auto it = m_schedules.begin(); it != m_schedules.end();) {
-        Schedule &s = *it;
-        if (s.triggered) { ++it; continue; }
-
-        if (now >= s.time) {
-            // 一次性：触发成功后删除；应用忙则保留，下轮重试
-            if (s.repeatSec <= 0) {
-                if (fireSchedule(s, false)) {
-                    it = m_schedules.erase(it);
-                    changed = true;
-                } else {
-                    ++it;
-                }
-                continue;
-            }
-            // 循环：触发后推到下一周期（忙则跳过本轮，下轮再推）
-            if (fireSchedule(s, false)) {
-                while (s.time <= now)
-                    s.time = s.time.addSecs(s.repeatSec);
-                changed = true;
-            }
-        }
-        ++it;
+    if (m_reminderCompletionPending) {
+        finishReminderDelivery(m_reminderCompletionSuccess);
+        return;
     }
-
-    if (changed)
-    {
-        saveSchedules();
-        refreshReminderWindow();
+    if (!m_activeReminderId.isEmpty()) return;
+    const auto now = QDateTime::currentDateTime();
+    const auto reminders = m_schedules;
+    for (const auto &reminder : reminders) {
+        if (reminder.due(now)) {
+            fireSchedule(reminder, reminder.time.secsTo(now) > 60);
+            break;
+        }
     }
 }
 
 /*触发提醒：走主动对话链路说话，返回是否真正发声（应用忙则false）*/
-bool Dialog::fireSchedule(const Schedule &s, bool missed)
+bool Dialog::fireSchedule(const Schedule &reminder, bool missed)
 {
+    if (!m_activeReminderId.isEmpty() || isChatBusy() || m_userAway ||
+        m_isSpeechRecording || m_continuousMode || !isAllVitsDone()) return false;
+    auto candidate = m_schedules;
+    QString attempt;
+    for (auto &entry : candidate) {
+        if (entry.id == reminder.id && entry.due(QDateTime::currentDateTime())) {
+            attempt = entry.claim();
+            break;
+        }
+    }
+    if (attempt.isEmpty() || !commitSchedules(candidate)) return false;
     const QString phrase = missed
-        ? QStringLiteral("你不在的时候，有件事忘了告诉你：%1")
-        : QStringLiteral("该%1了哦！")
-              .arg(s.text);
-    return doProactiveSpeak(QString(), phrase, /*forced=*/true,
-                            /*isReminder=*/true);
+        ? QStringLiteral("你不在的时候，有件事忘了告诉你：%1").arg(reminder.text)
+        : QStringLiteral("该%1了哦！").arg(reminder.text);
+    if (doProactiveSpeak({}, phrase, true, true, reminder.id, attempt)) return true;
+    m_activeReminderId = reminder.id;
+    m_activeReminderAttempt = attempt;
+    finishReminderDelivery(false);
+    return false;
 }
 
 /*启动时补触发遗漏日程（合并播报）*/
 void Dialog::catchUpMissedSchedules()
 {
-    const QDateTime now = QDateTime::currentDateTime();
-    QStringList missed;
-    bool changed = false;
-
-    for (auto it = m_schedules.begin(); it != m_schedules.end();) {
-        Schedule &s = *it;
-        if (s.triggered) { ++it; continue; }
-
-        // 一次性且已过期
-        if (s.repeatSec <= 0 && s.time < now) {
-            const qint64 secsMissed = s.time.secsTo(now);
-            if (secsMissed > 24 * 3600) {
-                // 超过24小时直接丢弃
-                it = m_schedules.erase(it);
-                changed = true;
-                continue;
-            }
-            missed.append(s.text);
-            it = m_schedules.erase(it);
-            changed = true;
-            continue;
-        }
-
-        // 循环且已过期：推到下一周期，不报遗漏
-        if (s.repeatSec > 0 && s.time < now) {
-            while (s.time <= now)
-                s.time = s.time.addSecs(s.repeatSec);
-            changed = true;
-        }
-        ++it;
-    }
-
-    if (!missed.isEmpty()) {
-        QStringList shown = missed.mid(0, 3);
-        QString msg = QStringLiteral("你不在的时候，我帮你记着：%1")
-                          .arg(shown.join(QStringLiteral("、")));
-        if (missed.size() > 3)
-            msg += QStringLiteral("，还有 %1 件。").arg(missed.size() - 3);
-        doProactiveSpeak(QString(), msg, /*forced=*/false,
-                         /*isReminder=*/true);
-    }
-
-    if (changed)
-    {
-        saveSchedules();
-        refreshReminderWindow();
-    }
+    // All overdue reminders remain queued, including those older than 24 hours.
+    // The same delivery/acknowledgement path handles startup and normal deadlines.
+    checkSchedules();
 }
 
 /*连接 AI 回调（每轮对话绑定 generation 防止旧回复）*/
@@ -4644,8 +4651,8 @@ void Dialog::connectChatCallbacks(AiProvider *provider, quint64 generation)
                     });
                 }
                 m_streamRawReply.clear(); m_streamDisplayedChinese.clear(); m_streamVitsEnabled = false; m_streamSynthCursor = 0;
-                checkVitsPipelineFinished();
                 m_activeChatAi = nullptr;
+                checkVitsPipelineFinished();
                 provider->deleteLater();
             });
 
@@ -4664,8 +4671,10 @@ void Dialog::connectChatCallbacks(AiProvider *provider, quint64 generation)
 /*执行主动对话（forced=true 用于日程提醒：跳过开关与冷却检查；isReminder 让提醒内容强制传达）*/
 bool Dialog::doProactiveSpeak(const QString &windowTitle,
                               const QString &contextHint, bool forced,
-                              bool isReminder)
+                              bool isReminder, const QString &reminderId,
+                              const QString &attemptId)
 {
+    if (!m_activeReminderId.isEmpty() || m_reminderCompletionPending) return false;
     if (!forced && !m_proactiveEnabled)
         return false;
     if (m_proactiveInFlight)
@@ -4689,6 +4698,13 @@ bool Dialog::doProactiveSpeak(const QString &windowTitle,
 
     // 在请求发出时立即进入 in-flight，避免窗口/回来/空闲触发源重入。
     m_proactiveInFlight = true;
+    if (isReminder) {
+        m_activeReminderId = reminderId;
+        m_activeReminderAttempt = attemptId;
+        m_reminderDelivery.audioEnded = false;
+        m_reminderDelivery.failed = false;
+        m_reminderDelivery.audioExpected = false;
+    }
     // 日程提醒（forced）不刷新冷却计时，避免污染主动对话的冷却周期。
     if (!forced)
     {
@@ -4739,7 +4755,7 @@ bool Dialog::doProactiveSpeak(const QString &windowTitle,
     m_activeProactiveAi = proactiveAi;
 
     connect(proactiveAi, &AiProvider::replyReceived, this,
-            [this, proactiveAi, proactiveGen, forced](const QString &reply)
+            [this, proactiveAi, proactiveGen, forced, isReminder, reminderId, attemptId](const QString &reply)
             {
                 if (proactiveGen != m_proactiveGeneration ||
                     proactiveAi != m_activeProactiveAi) {
@@ -4756,6 +4772,15 @@ bool Dialog::doProactiveSpeak(const QString &windowTitle,
                 const QString innerThought =
                     reply.section('|', 3, 3).trimmed();
 
+                if (isReminder && (chinese.isEmpty() || m_activeReminderId != reminderId ||
+                                   m_activeReminderAttempt != attemptId)) {
+                    finishReminderDelivery(false);
+                    proactiveAi->deleteLater();
+                    return;
+                }
+                ZcJsonLib speechConfig(ReadCharacterUserConfigPath());
+                const bool speak = !japanese.isEmpty() && speechConfig.value("vitsEnable").toBool();
+                m_reminderDelivery.audioExpected = isReminder && speak;
                 // 记录最近主动发言（防重复，保留最近 5 条；日程提醒不参与）
                 if (!forced)
                 {
@@ -4772,10 +4797,17 @@ bool Dialog::doProactiveSpeak(const QString &windowTitle,
                 if (!innerThought.isEmpty())
                     emit requestShowInnerThought(innerThought);
 
-                if (!japanese.isEmpty())
+                if (speak)
                 {
                     m_streamVitsEnabled = true;
+                    m_cachedVitsApiUrl.clear();
+                    m_cachedVitsModel.clear();
+                    m_cachedVitsSpeaker.clear();
                     VitsGetAndPlay(japanese);
+                }
+                else if (isReminder) {
+                    show();
+                    finishReminderDelivery(true);
                 }
 
                 appendHistoryLine(QStringLiteral("角色：") + chinese);
@@ -4794,10 +4826,25 @@ bool Dialog::doProactiveSpeak(const QString &windowTitle,
                 }
                 m_proactiveInFlight = false;
                 m_activeProactiveAi = nullptr;
+                finishReminderDelivery(false);
                 qWarning() << "Proactive AI error:" << error;
                 proactiveAi->deleteLater();
             });
 
+    if (isReminder) {
+        QTimer::singleShot(45000, this, [this, proactiveAi, proactiveGen] {
+            if (m_activeProactiveAi != proactiveAi || m_proactiveGeneration != proactiveGen) return;
+            proactiveAi->disconnect(this);
+            proactiveAi->deleteLater();
+            m_activeProactiveAi = nullptr;
+            m_proactiveInFlight = false;
+            finishReminderDelivery(false);
+        });
+        QTimer::singleShot(120000, this, [this, reminderId, attemptId] {
+            if (m_activeReminderId == reminderId && m_activeReminderAttempt == attemptId &&
+                !m_reminderCompletionPending) cancelActiveReminder();
+        });
+    }
     proactiveAi->chat(QStringLiteral("触发主动对话"));
     return true;
 }

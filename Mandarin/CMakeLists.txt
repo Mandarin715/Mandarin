@@ -553,6 +553,17 @@ if(BUILD_TESTING)
     # TTS 响度包络的解析与归一化（纯计算：不需要模型、不需要 GL、不需要音频设备）。
     # 它是"句间停顿闭嘴"这条用户诉求的**数据源头**：参考值取错（例如取最大值）时
     # 画面只是"嘴张不开"，从像素上极难反推，所以必须在这里用合成 WAV 钉死。
+    add_executable(test_reliability tests/test_reliability.cpp)
+    target_link_libraries(test_reliability PRIVATE Qt${QT_VERSION_MAJOR}::Test Qt${QT_VERSION_MAJOR}::Core)
+    set_target_properties(test_reliability PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_custom_command(TARGET test_reliability POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Test>"
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Core>"
+            "$<TARGET_FILE_DIR:test_reliability>")
+    add_test(NAME test_reliability COMMAND test_reliability)
+
     add_executable(test_audioenvelope
         tests/test_audioenvelope.cpp
         utils/AudioEnvelope.cpp
