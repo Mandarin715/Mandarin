@@ -2036,6 +2036,31 @@ bool Dialog::submitCurrentInput()
     return doSubmitCurrentInput(userInput);
 }
 
+// Both chat and proactive replies display field 2 and speak field 3.
+// Keep their translation contract identical so persona/event prompts cannot turn
+// the spoken field into a second improvised reply or the inner monologue.
+static QString replyTranslationConstraint()
+{
+    return QStringLiteral(
+        "\n\n【日语配音与中文字幕一致性：必须遵守】\n"
+        "第二段中文是本次唯一的台词原文，第三段日语仅用于朗读这段台词的忠实翻译。\n"
+        "先确定中文台词，再逐句翻译成日语；不要在日语段重新回答用户或独立发挥。\n"
+        "必须保留中文的全部含义、句子顺序、人称、否定、疑问、语气、名字、数字和事实；"
+        "可以使用自然且符合角色口吻的日语表达，但不得增添、删减或替换信息。\n"
+        "中文没有说出的解释、能力自夸、吐槽或感想，不得在日语里额外说出。"
+        "第四段内心独白没有被说出口，绝不能合并进第三段配音。\n"
+        "即使上下文主要是中文、技术术语或复制的文字，第三段也必须使用日语；"
+        "Git 等专有名词可以保留，不得整段照抄中文。\n"
+        "字数限制作用于第二段中文，日语以完整准确翻译为准，不得为了凑字数改变含义。\n"
+        "各段内容内不得包含分隔符 |；只用 | 分隔既定字段，禁止加入翻译解释或检查过程。\n"
+        "输出前在内部核对：日语译回中文是否仍是同一句话？是否混入了内心独白？"
+        "若含义不同，修正第三段后再输出完整回复。\n"
+        "对应示例：\n"
+        "好奇|分批提交？这是要我拆零件嘛！|分けてコミットするの？私に部品を分解させるつもりなの！？|其实我懂Git呢\n"
+        "上例中，日语不能改成「実はGitがわかるんだよ」，因为那是在朗读内心独白，"
+        "与中文台词不一致。\n");
+}
+
 /*构建系统提示词（含缓存逻辑）*/
 QString Dialog::buildSystemPrompt(const QString &currentChar)
 {
@@ -2095,6 +2120,7 @@ QString Dialog::buildSystemPrompt(const QString &currentChar)
                        "生气|为什么一直打扰我！|なんでずっと邪魔するの！\n"
                        "担心|还在改bug呀？|まだバグ直してるの？|其实我也有点困了");
 
+    systemPrompt += replyTranslationConstraint();
     m_cachedSystemPrompt = systemPrompt;
     m_cachedCharacterForPrompt = currentChar;
     m_memoryDirty = false;
@@ -4212,6 +4238,7 @@ static QString buildProactivePrompt(const QString &windowTitle,
         "错误示例（中文和日语位置不能互换）：\n"
         "开心|何を見てるの？|在看什么呢？  ← 这是错误的！日语和中文反了！");
 
+    prompt += replyTranslationConstraint();
     return prompt;
 }
 
