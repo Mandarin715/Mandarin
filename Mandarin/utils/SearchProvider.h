@@ -25,7 +25,7 @@ class SearchProvider : public QObject
     Q_OBJECT
 
 public:
-    explicit SearchProvider(QObject *parent = nullptr);
+    explicit SearchProvider(QObject *parent = nullptr, QNetworkAccessManager *network = nullptr);
     ~SearchProvider();
 
     /// 配置搜索 API
@@ -56,6 +56,8 @@ private:
     void requestAccessToken();
     /// 直接执行搜索（已有有效 token 或不需要 token）
     void doSearch(const QString &query);
+    void invalidateConfiguration();
+    void cancelReply(QNetworkReply *&reply);
 
     QNetworkAccessManager *m_network = nullptr;
     QString m_apiKey;
@@ -63,6 +65,8 @@ private:
     QString m_baseUrl;
     bool m_enabled = false;
     QNetworkReply *m_activeReply = nullptr;
+    QNetworkReply *m_tokenReply = nullptr;
+    quint64 m_configGeneration = 0;
 
     // OAuth token 缓存
     QString m_accessToken;

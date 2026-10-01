@@ -465,6 +465,19 @@ if(BUILD_TESTING)
             "$<TARGET_FILE_DIR:test_atomicjsonstore>")
     add_test(NAME test_atomicjsonstore COMMAND test_atomicjsonstore)
 
+    add_executable(test_searchprovider tests/test_searchprovider.cpp utils/SearchProvider.cpp)
+    target_link_libraries(test_searchprovider PRIVATE
+        Qt${QT_VERSION_MAJOR}::Test Qt${QT_VERSION_MAJOR}::Network)
+    set_target_properties(test_searchprovider PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_custom_command(TARGET test_searchprovider POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Test>"
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Core>"
+            "$<TARGET_FILE:Qt${QT_VERSION_MAJOR}::Network>"
+            "$<TARGET_FILE_DIR:test_searchprovider>")
+    add_test(NAME test_searchprovider COMMAND test_searchprovider)
+
     add_executable(test_chatlogstore
         tests/test_chatlogstore.cpp
         utils/ChatLogStore.cpp

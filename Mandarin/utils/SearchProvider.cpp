@@ -9,44 +9,66 @@
 #include <QUrl>
 #include <QUrlQuery>
 
-SearchProvider::SearchProvider(QObject *parent)
+SearchProvider::SearchProvider(QObject *parent, QNetworkAccessManager *network)
     : QObject(parent)
-    , m_network(new QNetworkAccessManager(this))
+    , m_network(network ? network : new QNetworkAccessManager(this))
 {
 }
 
 SearchProvider::~SearchProvider()
 {
-    if (m_activeReply)
-    {
-        m_activeReply->abort();
-        m_activeReply->deleteLater();
-    }
+    cancelReply(m_tokenReply);
+    cancelReply(m_activeReply);
+}
+
+void SearchProvider::cancelReply(QNetworkReply *&active)
+{
+    if (!active) return;
+    QNetworkReply *reply = active;
+    active = nullptr;
+    disconnect(reply, nullptr, this, nullptr);
+    reply->abort();
+    reply->deleteLater();
+}
+
+void SearchProvider::invalidateConfiguration()
+{
+    const bool pending = m_tokenReply || m_activeReply;
+    ++m_configGeneration;
+    cancelReply(m_tokenReply);
+    cancelReply(m_activeReply);
+    m_pendingQuery.clear();
+    m_accessToken.clear();
+    m_tokenExpiry = {};
+    if (pending) emit searchFailed(QStringLiteral("搜索配置已变化，请重新搜索"));
 }
 
 void SearchProvider::setApiKey(const QString &key)
 {
-    m_apiKey = key.trimmed();
-    // API Key 变更时使 token 失效
-    m_accessToken.clear();
-    m_tokenExpiry = QDateTime();
+    const auto value = key.trimmed();
+    if (m_apiKey == value) return;
+    m_apiKey = value;
+    invalidateConfiguration();
 }
-
 void SearchProvider::setSecretKey(const QString &key)
 {
-    m_secretKey = key.trimmed();
-    m_accessToken.clear();
-    m_tokenExpiry = QDateTime();
+    const auto value = key.trimmed();
+    if (m_secretKey == value) return;
+    m_secretKey = value;
+    invalidateConfiguration();
 }
-
 void SearchProvider::setBaseUrl(const QString &url)
 {
-    m_baseUrl = url.trimmed();
+    const auto value = url.trimmed();
+    if (m_baseUrl == value) return;
+    m_baseUrl = value;
+    invalidateConfiguration();
 }
-
 void SearchProvider::setEnabled(bool enabled)
 {
+    if (m_enabled == enabled) return;
     m_enabled = enabled;
+    invalidateConfiguration();
 }
 
 bool SearchProvider::isEnabled() const
@@ -64,30 +86,33 @@ void SearchProvider::requestAccessToken()
         return;
     }
 
+    if (m_tokenReply) return;
     QUrl url("https://aip.baidubce.com/oauth/2.0/token");
     QUrlQuery params;
     params.addQueryItem("grant_type", "client_credentials");
     params.addQueryItem("client_id", m_apiKey);
     params.addQueryItem("client_secret", m_secretKey);
-    url.setQuery(params);
 
     QNetworkRequest request(url);
     request.setHeader(QNetworkRequest::ContentTypeHeader,
                       "application/x-www-form-urlencoded");
     request.setTransferTimeout(15000); // 防止挂起时 m_searchInFlight 永久锁死
 
-    QNetworkReply *reply = m_network->post(request, url.query().toUtf8());
-
-    connect(reply, &QNetworkReply::finished, this,
-            &SearchProvider::onTokenReplyFinished);
+    m_tokenReply = m_network->post(request, params.toString(QUrl::FullyEncoded).toUtf8());
+    const auto generation = m_configGeneration;
+    connect(m_tokenReply, &QNetworkReply::finished, this, [this, generation] {
+        if (generation == m_configGeneration) onTokenReplyFinished();
+    });
 }
 
 void SearchProvider::onTokenReplyFinished()
 {
     QNetworkReply *reply = qobject_cast<QNetworkReply *>(sender());
-    if (!reply)
-        return;
+    if (!reply || reply != m_tokenReply) return;
+    m_tokenReply = nullptr;
     reply->deleteLater();
+    const QString query = m_pendingQuery;
+    m_pendingQuery.clear();
 
     if (reply->error() != QNetworkReply::NoError)
     {
@@ -106,16 +131,11 @@ void SearchProvider::onTokenReplyFinished()
     {
         // 缓存 token，提前 1 天过期以确保安全
         const int expiresIn = obj.value("expires_in").toInt(2592000);
-        m_tokenExpiry = QDateTime::currentDateTime()
-                            .addSecs(expiresIn - 86400);
+        const int margin = qMin(86400, qMax(0, expiresIn / 10));
+        m_tokenExpiry = QDateTime::currentDateTime().addSecs(qMax(1, expiresIn - margin));
 
         // token 获取成功，继续执行之前暂存的搜索
-        if (!m_pendingQuery.isEmpty())
-        {
-            const QString query = m_pendingQuery;
-            m_pendingQuery.clear();
-            doSearch(query);
-        }
+        if (!query.isEmpty()) doSearch(query);
     }
     else
     {
@@ -131,7 +151,7 @@ void SearchProvider::onTokenReplyFinished()
 
 static bool isBaiduQianfan(const QString &url)
 {
-    return url.contains("qianfan.baidubce.com");
+    return QUrl(url).host().compare("qianfan.baidubce.com", Qt::CaseInsensitive) == 0;
 }
 
 void SearchProvider::search(const QString &query)
@@ -163,6 +183,7 @@ void SearchProvider::search(const QString &query)
 
             if (tokenExpired)
             {
+                cancelReply(m_activeReply);
                 m_pendingQuery = query;
                 requestAccessToken();
                 return;
@@ -176,13 +197,7 @@ void SearchProvider::search(const QString &query)
 
 void SearchProvider::doSearch(const QString &query)
 {
-    // 取消进行中的请求
-    if (m_activeReply)
-    {
-        m_activeReply->abort();
-        m_activeReply->deleteLater();
-        m_activeReply = nullptr;
-    }
+    cancelReply(m_activeReply);
 
     if (isBaiduQianfan(m_baseUrl))
     {
@@ -239,8 +254,10 @@ void SearchProvider::doSearch(const QString &query)
         m_activeReply = m_network->get(request);
     }
 
-    connect(m_activeReply, &QNetworkReply::finished, this,
-            &SearchProvider::onSearchReplyFinished);
+    const auto generation = m_configGeneration;
+    connect(m_activeReply, &QNetworkReply::finished, this, [this, generation] {
+        if (generation == m_configGeneration) onSearchReplyFinished();
+    });
 }
 
 // ─── 搜索响应解析 ───
@@ -281,7 +298,7 @@ void SearchProvider::onSearchReplyFinished()
     // 检查百度千帆错误
     if (root.contains("code") && root.contains("message"))
     {
-        const QString errCode = root.value("code").toString();
+        const QString errCode = root.value("code").toVariant().toString();
         const QString errMsg = root.value("message").toString();
         // access_token 过期，重新获取
         if (errCode == "216003" || errCode.contains("Auth"))
